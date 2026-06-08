@@ -6,8 +6,10 @@ from fastapi import APIRouter, Depends
 
 from app.core.auth import UserContext, get_current_user
 from app.core.config import settings
+from app.core.exceptions import NotFoundError
+from app.core.host_config import resolve_host_binding
 from app.core.openapi_tags import Tags
-from app.schemas.auth import AuthConfigOut, UserContextOut
+from app.schemas.auth import AuthConfigOut, HostBindingOut, UserContextOut
 
 router = APIRouter(tags=[Tags.AUTH])
 
@@ -36,6 +38,19 @@ def auth_me(user: UserContext = Depends(get_current_user)) -> UserContextOut:
         sub=user.sub,
         username=user.username,
         email=user.email,
+        tenant_code=user.tenant_code,
         groups=user.groups,
         roles=user.roles,
     )
+
+
+@router.get(
+    "/auth/host-config",
+    response_model=HostBindingOut,
+    summary="Resolve tenant/workspace from request hostname",
+)
+def auth_host_config(host: str) -> HostBindingOut:
+    binding = resolve_host_binding(host)
+    if not binding:
+        raise NotFoundError(f"No tenant binding for host '{host}'")
+    return HostBindingOut(**binding.to_dict())

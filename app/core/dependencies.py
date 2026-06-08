@@ -10,12 +10,19 @@ from app.core.auth import (
     require_roles,
     require_router_access,
 )
+from app.core.capability_guard import require_capability
+from app.core.tenant_context import TenantContext, get_tenant_context
 from app.db.database import get_db
+from app.db.mes_core_database import get_mes_core_db
 
 __all__ = [
+    "TenantContext",
     "UserContext",
     "get_current_user",
     "get_db",
+    "get_mes_core_db",
+    "get_tenant_context",
+    "require_capability",
     "require_roles",
     "require_router_access",
 ]

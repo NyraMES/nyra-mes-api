@@ -54,9 +54,41 @@ ROUTER_ACCESS: Dict[str, Set[str]] = {
     "dashboard": ALL_MES_ROLES,
     "ontology": ALL_MES_ROLES,
     "auth": ALL_MES_ROLES,
+    # Generic multi-tenant nyra_mes_core routes under /api/*
+    "mes_core": ALL_MES_ROLES,
 }
 
 _jwks_cache: Dict[str, Any] = {"keys": None, "fetched_at": 0.0}
+
+
+def _tenant_code_from_claims(claims: Dict[str, Any]) -> Optional[str]:
+    """Cognito custom attribute ``custom:tenant_code`` scopes users to one tenant."""
+    for key in ("custom:tenant_code", "tenant_code"):
+        value = claims.get(key)
+        if value is not None and str(value).strip():
+            return str(value).strip()
+    return None
+
+
+def assert_user_may_access_tenant(user: UserContext, tenant_code: str) -> None:
+    """Phase-2 guard: JWT tenant must match the resolved request tenant."""
+    if not settings.auth_enabled:
+        return
+    expected = (user.tenant_code or "").strip()
+    requested = (tenant_code or "").strip()
+    if not expected:
+        raise ForbiddenError(
+            "Your account is not assigned to a tenant. Contact your administrator.",
+            details={"requested_tenant": requested},
+        )
+    if expected != requested:
+        raise ForbiddenError(
+            "This account belongs to a different plant. Sign in on the correct domain.",
+            details={
+                "your_tenant": expected,
+                "requested_tenant": requested,
+            },
+        )
 
 
 @dataclass(frozen=True)
@@ -64,6 +96,7 @@ class UserContext:
     sub: str
     username: str
     email: Optional[str] = None
+    tenant_code: Optional[str] = None
     groups: List[str] = field(default_factory=list)
 
     @property
@@ -163,15 +196,18 @@ def decode_cognito_token(token: str) -> UserContext:
         sub=str(claims.get("sub") or username),
         username=str(username),
         email=claims.get("email"),
+        tenant_code=_tenant_code_from_claims(claims),
         groups=[str(g) for g in groups],
     )
 
 
 def _dev_user() -> UserContext:
+    tenant = (settings.auth_dev_user_tenant_code or "").strip() or None
     return UserContext(
         sub="dev-user",
         username="dev",
         email=settings.auth_dev_user_email,
+        tenant_code=tenant,
         groups=list(settings.auth_dev_user_roles),
     )
 

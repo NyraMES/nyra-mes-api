@@ -69,6 +69,12 @@ class InternalError(DomainError):
     status_code = 500
 
 
+class ServiceUnavailableError(DomainError):
+    """Raised when an optional subsystem (e.g. nyra_mes_core) is not configured."""
+
+    status_code = 503
+
+
 def register_exception_handlers(app: FastAPI) -> None:
     """Attach JSON exception handlers for all :class:`DomainError` types."""
 

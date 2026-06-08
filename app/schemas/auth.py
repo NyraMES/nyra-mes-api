@@ -11,8 +11,16 @@ class UserContextOut(BaseModel):
     sub: str
     username: str
     email: Optional[str] = None
+    tenant_code: Optional[str] = None
     groups: List[str] = Field(default_factory=list)
     roles: List[str] = Field(default_factory=list)
+
+
+class HostBindingOut(BaseModel):
+    host: str
+    tenant_code: str
+    workspace_code: Optional[str] = None
+    industry_key: str
 
 
 class AuthConfigOut(BaseModel):

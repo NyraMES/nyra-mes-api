@@ -32,6 +32,10 @@ class Tags:
     INTELLIGENCE:   Final[str] = "Intelligence"
     ONTOLOGY:       Final[str] = "Ontology"
     AUTH:           Final[str] = "Auth"
+    MES_CORE:       Final[str] = "MES Core (Multi-Tenant)"
+    TEMPLATE:       Final[str] = "Industry Templates"
+    WORKSPACE:      Final[str] = "Workspaces"
+    ACTIVATED_CARBON: Final[str] = "Activated Carbon"
 
 
 OPENAPI_TAGS: List[dict] = [
@@ -156,5 +160,27 @@ OPENAPI_TAGS: List[dict] = [
     {
         "name": Tags.AUTH,
         "description": "Authentication and current-user profile (AWS Cognito).",
+    },
+    {
+        "name": Tags.MES_CORE,
+        "description": (
+            "Industry-agnostic multi-tenant API backed by nyra_mes_core. "
+            "Tenant context defaults to DEFAULT_TENANT_CODE until login is finalized."
+        ),
+    },
+    {
+        "name": Tags.TEMPLATE,
+        "description": "Metadata-driven industry template catalog and capabilities.",
+    },
+    {
+        "name": Tags.WORKSPACE,
+        "description": "Tenant-scoped project/plant workspaces.",
+    },
+    {
+        "name": Tags.ACTIVATED_CARBON,
+        "description": (
+            "Activated Carbon industry adapter — reuses common MES tables "
+            "with capability-guarded routes."
+        ),
     },
 ]

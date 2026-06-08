@@ -2,9 +2,9 @@
 
 from datetime import datetime
 from decimal import Decimal
-from typing import Optional
+from typing import List, Optional
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from app.schemas.common import ORMModel
 
@@ -41,6 +41,16 @@ class WorkOrderCreate(BaseModel):
     work_order_status: Optional[str] = "Released"
 
 
+class ParameterReadingInput(BaseModel):
+    parameter_code: str = Field(..., min_length=1, max_length=128)
+    reading_value: Optional[Decimal] = None
+    reading_text: Optional[str] = None
+
+
+class ParameterReadingsAppendRequest(BaseModel):
+    parameter_readings: List[ParameterReadingInput] = Field(..., min_length=1)
+
+
 class WorkOrderCompleteRequest(BaseModel):
     actual_output_quantity: Optional[Decimal] = None
     scrap_quantity: Optional[Decimal] = None
@@ -49,10 +59,14 @@ class WorkOrderCompleteRequest(BaseModel):
     machine_id: Optional[str] = None
     downtime_minutes: Optional[Decimal] = None
     remarks: Optional[str] = None
+    parameter_readings: Optional[List[ParameterReadingInput]] = None
 
 
 class WorkOrderStartRequest(BaseModel):
     operator_name: Optional[str] = None
+    machine_id: Optional[str] = None
+    labor_pool_code: Optional[str] = None
+    tool_codes: Optional[list[str]] = None
 
 
 class WorkOrderHoldRequest(BaseModel):

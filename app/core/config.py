@@ -13,7 +13,10 @@ from typing import List
 
 from dotenv import load_dotenv
 
-load_dotenv()
+load_dotenv(override=True)
+# Optional isolated demo env (see scripts/run_video_demo.ps1)
+if os.getenv("NYRA_USE_DEMO_ENV", "").lower() in ("1", "true", "yes"):
+    load_dotenv(".env.demo", override=True)
 
 
 def _split_csv(value: str) -> List[str]:
@@ -80,6 +83,44 @@ class Settings:
         default_factory=lambda: _split_csv(
             os.getenv("AUTH_DEV_USER_ROLES", "MES_Admin")
         )
+    )
+    # Dev-only tenant scope when AUTH_ENABLED=false (mirrors Cognito custom:tenant_code).
+    auth_dev_user_tenant_code: str = os.getenv("AUTH_DEV_USER_TENANT_CODE", "").strip()
+    # host=tenant[:workspace][:industry] CSV for domain → tenant routing (see host_config.py).
+    host_tenant_map: str = os.getenv("HOST_TENANT_MAP", "").strip()
+
+    # Legacy oemauto DB — disabled by default; set LEGACY_DB_ENABLED=true to reconnect.
+    legacy_db_enabled: bool = field(
+        default_factory=lambda: os.getenv("LEGACY_DB_ENABLED", "false").lower()
+        in ("1", "true", "yes")
+    )
+    legacy_db_host: str = os.getenv("DB_HOST", "").strip()
+    legacy_db_port: str = os.getenv("DB_PORT", "5432").strip()
+    legacy_db_name: str = os.getenv("DB_NAME", "").strip()
+    legacy_db_user: str = os.getenv("DB_USER", "").strip()
+    legacy_db_password: str = os.getenv("DB_PASSWORD", "")
+
+    # nyra_mes_core — sole active database when LEGACY_DB_ENABLED=false.
+    mes_core_enabled: bool = field(
+        default_factory=lambda: os.getenv("MES_CORE_ENABLED", "false").lower()
+        in ("1", "true", "yes")
+    )
+    mes_core_db_host: str = os.getenv("MES_CORE_DB_HOST", "").strip()
+    mes_core_db_port: str = os.getenv("MES_CORE_DB_PORT", "5432").strip()
+    mes_core_db_name: str = os.getenv("MES_CORE_DB_NAME", "nyra_mes_core")
+    mes_core_db_user: str = os.getenv("MES_CORE_DB_USER", "").strip()
+    mes_core_db_password: str = os.getenv("MES_CORE_DB_PASSWORD", "")
+    # Until login resolves tenant from JWT, default to the demo tenant seed.
+    default_tenant_code: str = os.getenv("DEFAULT_TENANT_CODE", "AUTO_OEM_DEMO")
+
+    # Prospect / video demo hardening (see app.core.demo_protection)
+    demo_mode: bool = field(
+        default_factory=lambda: os.getenv("DEMO_MODE", "false").lower()
+        in ("1", "true", "yes")
+    )
+    demo_read_only: bool = field(
+        default_factory=lambda: os.getenv("DEMO_READ_ONLY", "false").lower()
+        in ("1", "true", "yes")
     )
 
 

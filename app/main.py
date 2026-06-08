@@ -18,10 +18,16 @@ import app.models  # noqa: F401  - ensure all SQLAlchemy models are registered
 
 from app.core.auth import require_router_access
 from app.core.config import settings
+from app.core.demo_protection import DemoProtectionMiddleware
 from app.core.exceptions import register_exception_handlers
 from app.core.openapi_tags import OPENAPI_TAGS
+from app.core.tenant_context import TenantContextMiddleware
 
 from app.routes.auth import router as auth_router
+from app.routes.mes_core_api import router as mes_core_router
+from app.routes.template_api import router as template_router
+from app.routes.workspace_api import router as workspace_router
+from app.routes.industry.activated_carbon_api import router as activated_carbon_router
 from app.routes.customer import router as customer_router
 from app.routes.part import parts_router, router as part_router
 from app.routes.order import router as order_router
@@ -73,6 +79,9 @@ app = FastAPI(
     version=settings.app_version,
     description=settings.app_description,
     openapi_tags=OPENAPI_TAGS,
+    docs_url=None if settings.demo_mode else "/docs",
+    redoc_url=None if settings.demo_mode else "/redoc",
+    openapi_url=None if settings.demo_mode else "/openapi.json",
 )
 
 
@@ -106,30 +115,70 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# nyra_mes_core: resolves X-Tenant-Code / DEFAULT_TENANT_CODE on every request.
+# Legacy routes ignore request.state.tenant_code and use the original DB session.
+app.add_middleware(TenantContextMiddleware)
+if settings.demo_mode or settings.demo_read_only:
+    app.add_middleware(DemoProtectionMiddleware)
+
 
 register_exception_handlers(app)
 
 app.include_router(auth_router)
 
-for router, domain in DOMAIN_ROUTERS:
-    app.include_router(
-        router,
-        dependencies=[require_router_access(domain)],
-    )
+# --- nyra_mes_core: core platform + template + industry adapter routers ---
+app.include_router(
+    mes_core_router,
+    dependencies=[require_router_access("mes_core")],
+)
+app.include_router(
+    template_router,
+    dependencies=[require_router_access("mes_core")],
+)
+app.include_router(
+    workspace_router,
+    dependencies=[require_router_access("mes_core")],
+)
+app.include_router(
+    activated_carbon_router,
+    dependencies=[require_router_access("mes_core")],
+)
+
+# --- Legacy oemauto domain routers (oemauto DB; optional) ---
+# Mounted only when LEGACY_DB_ENABLED=true so nyra_mes_core-only deploys stay clean.
+# Automotive OEM workflow pages use /api/* (mesCoreApi); legacy paths remain for
+# optional oemauto DB mode without affecting default production config.
+if settings.legacy_db_enabled:
+    for router, domain in DOMAIN_ROUTERS:
+        app.include_router(
+            router,
+            dependencies=[require_router_access(domain)],
+        )
 
 
 @app.get("/", tags=["Health"], summary="Liveness check")
 def root():
-    return {
+    payload = {
         "message": f"{settings.app_name} running",
         "version": settings.app_version,
-        "docs": "/docs",
-        "redoc": "/redoc",
-        "ontology": "/ontology/graph",
         "auth_enabled": settings.auth_enabled,
+        "mes_core_enabled": settings.mes_core_enabled,
+        "legacy_db_enabled": settings.legacy_db_enabled,
+        "default_tenant_code": settings.default_tenant_code,
+        "demo_mode": settings.demo_mode,
+        "demo_read_only": settings.demo_read_only,
     }
+    if not settings.demo_mode:
+        payload["docs"] = "/docs"
+        payload["redoc"] = "/redoc"
+        payload["ontology"] = "/ontology/graph"
+    return payload
 
 
 @app.get("/health", tags=["Health"], summary="Health probe")
 def health():
-    return {"status": "ok", "auth_enabled": settings.auth_enabled}
+    return {
+        "status": "ok",
+        "auth_enabled": settings.auth_enabled,
+        "mes_core_enabled": settings.mes_core_enabled,
+    }

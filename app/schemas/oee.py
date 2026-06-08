@@ -2,7 +2,7 @@
 
 from datetime import date, datetime
 from decimal import Decimal
-from typing import Any, List, Optional
+from typing import Any, List, Optional, Union
 
 from pydantic import BaseModel
 
@@ -24,7 +24,7 @@ class OEEDailySummaryCreate(BaseModel):
 
 
 class OEEDailySummaryOut(ORMModel):
-    id: Optional[int] = None
+    id: Optional[Union[int, str]] = None
     machine_id: Optional[str] = None
     oee_date: Optional[date] = None
     planned_production_minutes: Optional[Decimal] = None
