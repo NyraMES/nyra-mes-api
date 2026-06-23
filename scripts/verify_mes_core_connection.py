@@ -3,7 +3,9 @@
 Usage (from repo root, with venv active):
     python scripts/verify_mes_core_connection.py
 
-Requires MES_CORE_DB_PASSWORD in .env (from AWS Secrets Manager for nyra-mes-core RDS).
+Credentials (pick one):
+  • MES_CORE_DB_SECRET_ID — RDS secret in AWS Secrets Manager (recommended on testbed)
+  • MES_CORE_DB_PASSWORD — direct password in .env (local dev)
 """
 
 from __future__ import annotations
@@ -11,7 +13,6 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-# Repo root on sys.path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from dotenv import load_dotenv
@@ -21,26 +22,36 @@ load_dotenv()
 from sqlalchemy import text
 
 from app.core.config import settings
+from app.core.mes_core_credentials import get_mes_core_db_credentials
 from app.db.mes_core_database import get_mes_core_engine
 
 
 def main() -> int:
     print("nyra_mes_core connection check")
-    print(f"  enabled : {settings.mes_core_enabled}")
-    print(f"  host    : {settings.mes_core_db_host}")
-    print(f"  database: {settings.mes_core_db_name}")
-    print(f"  user    : {settings.mes_core_db_user}")
+    print(f"  enabled   : {settings.mes_core_enabled}")
+    print(f"  host      : {settings.mes_core_db_host}")
+    print(f"  database  : {settings.mes_core_db_name}")
+    print(f"  user      : {settings.mes_core_db_user}")
+    print(f"  secret_id : {settings.mes_core_db_secret_id or '(not set)'}")
 
     if not settings.mes_core_enabled:
         print("\nERROR: MES_CORE_ENABLED is not true in .env")
         return 1
 
-    if not settings.mes_core_db_password:
+    if not settings.mes_core_db_secret_id and not settings.mes_core_db_password:
         print(
-            "\nERROR: MES_CORE_DB_PASSWORD is empty in .env.\n"
-            "  AWS RDS -> nyra-mes-core -> Manage in Secrets Manager -> Retrieve secret value\n"
-            "  Copy the 'password' field into MES_CORE_DB_PASSWORD in .env"
+            "\nERROR: Configure database credentials in .env:\n"
+            "  • MES_CORE_DB_SECRET_ID=rds!db-…  (AWS Secrets Manager — testbed)\n"
+            "  • or MES_CORE_DB_PASSWORD=…       (local dev)\n"
+            "  RDS console → nyra-mes-core → Configuration → Manage credentials"
         )
+        return 1
+
+    try:
+        creds = get_mes_core_db_credentials()
+        print(f"  resolved  : {creds.user}@{creds.host}/{creds.name}")
+    except Exception as exc:
+        print(f"\nERROR: Could not resolve credentials — {exc}")
         return 1
 
     engine = get_mes_core_engine()

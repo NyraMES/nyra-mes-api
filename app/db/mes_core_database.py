@@ -16,17 +16,18 @@ from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.core.config import settings
+from app.core.mes_core_credentials import get_mes_core_db_credentials
 
 _mes_core_engine: Optional[Engine] = None
 _MesCoreSessionLocal: Optional[sessionmaker] = None
 
 
 def _build_mes_core_url() -> str:
+    creds = get_mes_core_db_credentials()
     return (
-        f"postgresql+psycopg2://{quote_plus(settings.mes_core_db_user)}:"
-        f"{quote_plus(settings.mes_core_db_password)}"
-        f"@{settings.mes_core_db_host}:{settings.mes_core_db_port}/"
-        f"{settings.mes_core_db_name}"
+        f"postgresql+psycopg2://{quote_plus(creds.user)}:"
+        f"{quote_plus(creds.password)}"
+        f"@{creds.host}:{creds.port}/{creds.name}"
     )
 
 

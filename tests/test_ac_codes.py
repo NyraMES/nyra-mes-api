@@ -28,3 +28,12 @@ def test_generate_ac_business_code_format(monkeypatch):
     )
     code = generate_ac_business_code(None, "ac_customer_order")
     assert code == "ORD-AC-1002"
+
+
+def test_generate_ac_dispatch_code(monkeypatch):
+    monkeypatch.setattr(
+        "app.services.industry.activated_carbon.codes._nextval",
+        lambda db, seq: 7,
+    )
+    code = generate_ac_business_code(None, "ac_dispatch")
+    assert code == "DISP-AC-7"

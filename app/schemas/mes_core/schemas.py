@@ -7,7 +7,7 @@ from decimal import Decimal
 from typing import Any, Optional
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 class MesCoreModel(BaseModel):
@@ -147,7 +147,6 @@ class ResourceOut(MesCoreModel):
     resource_name: str
     resource_type: str
     status: str
-    headcount: Optional[int] = None
     created_at: Optional[datetime] = None
 
 
@@ -156,12 +155,6 @@ class ResourceCreate(BaseModel):
     resource_name: str = Field(..., min_length=1, max_length=256)
     resource_type: str = Field(..., min_length=1, max_length=64)
     status: str = "ACTIVE"
-    headcount: Optional[int] = Field(
-        None,
-        ge=0,
-        le=9999,
-        description="For LABOR pools: operators available in this pool (feasibility capacity).",
-    )
 
 
 class EquipmentOut(MesCoreModel):
@@ -293,6 +286,7 @@ class RoutingOperationDetailOut(MesCoreModel):
     resource_requirements: list[OperationResourceRequirementOut] = Field(
         default_factory=list
     )
+    parameters: list["RoutingOperationParameterOut"] = Field(default_factory=list)
 
 
 class ActiveRoutingOut(MesCoreModel):
@@ -345,6 +339,17 @@ class RoutingOperationParameterCreate(BaseModel):
     min_value: Optional[Decimal] = None
     max_value: Optional[Decimal] = None
     is_mandatory: bool = False
+    reading_frequency: Optional[str] = Field(None, max_length=64)
+    display_order: Optional[int] = None
+
+
+class RoutingOperationParameterUpdate(BaseModel):
+    parameter_name: Optional[str] = Field(None, min_length=1, max_length=256)
+    data_type: Optional[str] = Field(None, max_length=32)
+    unit: Optional[str] = Field(None, max_length=32)
+    min_value: Optional[Decimal] = None
+    max_value: Optional[Decimal] = None
+    is_mandatory: Optional[bool] = None
     reading_frequency: Optional[str] = Field(None, max_length=64)
     display_order: Optional[int] = None
 
@@ -442,10 +447,12 @@ class CustomerOrderOut(MesCoreModel):
     status: str
     lines: list[CustomerOrderLineOut] = Field(default_factory=list)
     created_at: Optional[datetime] = None
+    # Activated carbon raw-material inward enrichment (list_raw_material_inward)
     raw_product_code: Optional[str] = None
     inward_quantity_kg: Optional[Decimal] = None
     allocated_to_production_kg: Optional[Decimal] = None
     available_quantity_kg: Optional[Decimal] = None
+    qc_status: Optional[str] = None
 
 
 class CustomerOrderLineCreate(BaseModel):
@@ -466,7 +473,7 @@ class CustomerOrderCreate(BaseModel):
 
 
 class InwardOrderCreate(BaseModel):
-    """Raw material inward receipt — supplier required, no end customer."""
+    """Raw material inward — supplier-scoped order (no end customer)."""
 
     order_code: Optional[str] = Field(None, max_length=64)
     supplier_id: UUID
@@ -762,7 +769,6 @@ class AcPlantResourceOut(BaseModel):
     resource_name: str
     resource_type: str
     status: str
-    headcount: Optional[int] = None
     equipment_id: Optional[UUID] = None
     equipment_code: Optional[str] = None
     equipment_name: Optional[str] = None
@@ -784,55 +790,9 @@ class AcRoutingMasterOut(BaseModel):
     seed_script: str = "scripts/db/nyra_sam_carbons_demo_tenant.sql"
 
 
-class AcRawMaterialTypeOperation(BaseModel):
-    operation_sequence: int = Field(..., gt=0)
-    operation_name: str = Field(..., min_length=1, max_length=256)
-    operation_code: str = Field(..., min_length=1, max_length=64)
-    process_step: Optional[str] = None
-
-
-class AcRawMaterialTypeParameter(BaseModel):
-    key: str = Field(..., min_length=1, max_length=64)
-    label: str = Field(..., min_length=1, max_length=256)
-    unit: Optional[str] = None
-    default_value: Optional[str] = None
-    used_at: str = "feasibility"
-
-
-class AcRawMaterialTypeCreate(BaseModel):
-    product_code: Optional[str] = Field(
-        None, max_length=64, description="Auto-generated RAW-AC-* when omitted"
-    )
-    product_name: str = Field(..., min_length=1, max_length=256)
-    finished_product_code: Optional[str] = Field(
-        None, max_length=64, description="Auto-generated FG-AC-* when omitted"
-    )
-    finished_product_name: Optional[str] = None
-    routing_code: Optional[str] = Field(
-        None, max_length=64, description="Auto-generated RT-AC-* when omitted"
-    )
-    operations: list[AcRawMaterialTypeOperation] = Field(..., min_length=1)
-    process_parameters: list[AcRawMaterialTypeParameter] = Field(default_factory=list)
-
-
-class AcRawMaterialTypeOut(BaseModel):
-    product_id: UUID
-    product_code: str
-    product_name: str
-    finished_product_code: Optional[str] = None
-    finished_product_name: Optional[str] = None
-    finished_product_id: Optional[UUID] = None
-    routing_code: Optional[str] = None
-    routing_id: Optional[UUID] = None
-    operations: list[AcRawMaterialTypeOperation] = Field(default_factory=list)
-    process_parameters: list[AcRawMaterialTypeParameter] = Field(default_factory=list)
-
-
 class AcMastersOut(BaseModel):
     customers: list[CustomerOut] = Field(default_factory=list)
-    suppliers: list[SupplierOut] = Field(default_factory=list)
     raw_products: list[ProductOut] = Field(default_factory=list)
-    raw_material_types: list[AcRawMaterialTypeOut] = Field(default_factory=list)
     finished_products: list[ProductOut] = Field(default_factory=list)
     production_orders: list[ProductionOrderOut] = Field(default_factory=list)
     production_lots: list[ProductionLotOut] = Field(default_factory=list)
@@ -858,7 +818,7 @@ class AcRawMaterialInwardCreate(BaseModel):
     )
     create_production_order: bool = Field(
         default=False,
-        description="When true, also creates a legacy finished-product production order on the inward record.",
+        description="When true, creates a production order at inward time. Prefer false — PO is created on release to production.",
     )
 
 
@@ -866,58 +826,6 @@ class AcRawMaterialInwardCreateResponse(BaseModel):
     order: CustomerOrderOut
     line: CustomerOrderLineOut
     production_order: Optional[ProductionOrderOut] = None
-
-
-class AcMakeToStockCreate(BaseModel):
-    """Release supplier inward material to kiln — separate from customer sales."""
-
-    inward_order_id: Optional[UUID] = None
-    finished_product_id: Optional[UUID] = None
-    quantity: Decimal = Field(..., gt=0)
-    uom: str = "KG"
-    production_order_code: Optional[str] = Field(None, max_length=64)
-
-
-class AcMakeToStockCreateResponse(BaseModel):
-    order: CustomerOrderOut
-    line: CustomerOrderLineOut
-    production_order: ProductionOrderOut
-
-
-class AcDeliveryCommitmentOut(BaseModel):
-    finished_product_id: UUID
-    product_code: Optional[str] = None
-    quantity_kg: Decimal
-    stock_on_hand_kg: Decimal = Decimal("0")
-    can_dispatch_from_stock: bool = False
-    shortfall_kg: Decimal = Decimal("0")
-    raw_material_available_kg: Decimal = Decimal("0")
-    tentative_delivery_date: Optional[date] = None
-    manufacturing_lead_days: Optional[int] = None
-    message: str = ""
-
-
-class AcCustomerSalesOrderCreate(BaseModel):
-    customer_id: UUID
-    finished_product_id: UUID
-    quantity: Decimal = Field(..., gt=0)
-    uom: str = "KG"
-    order_code: Optional[str] = Field(None, max_length=64)
-    requested_delivery_date: Optional[date] = None
-
-
-class AcCustomerSalesOrderCreateResponse(BaseModel):
-    order: CustomerOrderOut
-    line: CustomerOrderLineOut
-    commitment: AcDeliveryCommitmentOut
-
-
-class AcFinishedGoodsStockOut(BaseModel):
-    product_id: UUID
-    product_code: str
-    product_name: str
-    quantity_kg: Decimal
-    uom: str = "KG"
 
 
 class AcRawMaterialQcOut(BaseModel):
@@ -930,6 +838,9 @@ class AcRawMaterialQcOut(BaseModel):
     moisture_pct: Optional[Decimal] = None
     ash_pct: Optional[Decimal] = None
     foreign_matter_pct: Optional[Decimal] = None
+    stones_kg: Optional[Decimal] = None
+    unburnt_kg: Optional[Decimal] = None
+    minus20_kg: Optional[Decimal] = None
     operator_remarks: Optional[str] = None
     qc_status: str = "PENDING"
     qc_at: Optional[datetime] = None
@@ -940,13 +851,17 @@ class AcRawMaterialQcCreate(BaseModel):
     moisture_pct: Optional[Decimal] = None
     ash_pct: Optional[Decimal] = None
     foreign_matter_pct: Optional[Decimal] = None
+    stones_kg: Optional[Decimal] = Field(None, ge=0)
+    unburnt_kg: Optional[Decimal] = Field(None, ge=0)
+    minus20_kg: Optional[Decimal] = Field(None, ge=0)
     operator_remarks: Optional[str] = None
     qc_status: str = Field(default="PASS", max_length=32)
 
 
 class AcKilnFeedLotCreate(BaseModel):
-    production_order_id: UUID
-    lot_quantity: Decimal = Field(..., gt=0)
+    production_order_id: Optional[UUID] = None
+    production_lot_id: Optional[UUID] = None
+    lot_quantity: Optional[Decimal] = Field(None, gt=0)
     lot_code: Optional[str] = Field(None, max_length=64)
     kiln_resource_code: Optional[str] = Field(None, max_length=64)
     status: str = "IN_PROGRESS"
@@ -973,12 +888,25 @@ class AcScreeningCreate(BaseModel):
 
 class AcQualityTestCreate(BaseModel):
     production_lot_id: UUID
-    iodine_mg_g: Optional[str] = None
-    ash_pct: Optional[str] = None
-    moisture_pct: Optional[str] = None
-    bulk_density: Optional[str] = None
+    iodine_mg_g: Optional[Decimal] = None
+    ash_pct: Optional[Decimal] = None
+    moisture_pct: Optional[Decimal] = None
+    bulk_density: Optional[Decimal] = None
     remarks: Optional[str] = None
     status: str = "OPEN"
+
+    @field_validator(
+        "iodine_mg_g",
+        "ash_pct",
+        "moisture_pct",
+        "bulk_density",
+        mode="before",
+    )
+    @classmethod
+    def _coerce_measurement(cls, value):
+        if value is None or value == "":
+            return None
+        return value
 
 
 class AcKilnStatusOut(BaseModel):
@@ -1017,16 +945,208 @@ class AcLotLineOut(BaseModel):
     is_in_progress: bool = False
 
 
-class AcActiveOrderOut(BaseModel):
-    """Shop-floor snapshot for dashboard — which lot/PO is moving now."""
+class AcOpenLotOut(BaseModel):
+    """Open production lots for feasibility, kiln feed, and routing dropdowns."""
 
+    production_lot_id: UUID
+    order_code: Optional[str] = None
+    production_order_code: Optional[str] = None
+    lot_code: str
+    lot_quantity: Decimal
+    status: Optional[str] = None
+    feasibility_status: Optional[str] = None
+    pipeline_stage: Optional[str] = None
+    routing_complete: bool = False
+
+
+class AcActiveOrderOut(BaseModel):
     lot_code: str
     production_order_code: Optional[str] = None
     order_code: Optional[str] = None
     lot_quantity: Decimal
     lot_status: Optional[str] = None
-    pipeline_stage: str
+    pipeline_stage: Optional[str] = None
     feasibility_status: Optional[str] = None
+
+
+class AcFinishedGoodsStockOut(BaseModel):
+    product_id: UUID
+    product_code: str
+    product_name: str
+    quantity_kg: Decimal
+    uom: str = "KG"
+
+
+class AcDeliveryCommitmentOut(BaseModel):
+    finished_product_id: UUID
+    product_code: str
+    quantity_kg: Decimal
+    stock_on_hand_kg: Decimal
+    can_dispatch_from_stock: bool
+    shortfall_kg: Decimal
+    raw_material_available_kg: Decimal
+    tentative_delivery_date: date
+    manufacturing_lead_days: int
+    message: str
+
+
+class AcCustomerSalesOrderCreate(BaseModel):
+    customer_id: UUID
+    finished_product_id: UUID
+    quantity: Decimal = Field(..., gt=0)
+    uom: str = "KG"
+    order_code: Optional[str] = Field(None, max_length=64)
+    requested_delivery_date: Optional[date] = None
+
+
+class AcCustomerSalesOrderCreateResponse(BaseModel):
+    order: CustomerOrderOut
+    line: CustomerOrderLineOut
+    commitment: AcDeliveryCommitmentOut
+
+
+class AcGradeStockOut(BaseModel):
+    grade_code: str
+    grade_label: str
+    product_id: Optional[UUID] = None
+    product_code: Optional[str] = None
+    quantity_kg: Decimal
+    uom: str = "KG"
+    source: str = "finished_goods"
+    stocked_lot_count: int = 0
+
+
+class AcStockedLotOut(BaseModel):
+    """Finished-goods lot ready for dispatch."""
+
+    production_lot_id: UUID
+    lot_code: str
+    lot_quantity: Decimal
+    status: str = "STOCKED"
+    product_id: Optional[UUID] = None
+    product_code: Optional[str] = None
+    product_name: Optional[str] = None
+    grade_code: Optional[str] = None
+    grade_label: Optional[str] = None
+    mesh_size: Optional[str] = None
+    order_code: Optional[str] = None
+    production_order_code: Optional[str] = None
+    stocked_at: Optional[str] = None
+
+
+class AcOpenCustomerOrderOut(BaseModel):
+    customer_order_id: UUID
+    order_code: str
+    customer_id: Optional[UUID] = None
+    customer_code: Optional[str] = None
+    customer_name: Optional[str] = None
+    product_id: UUID
+    product_code: str
+    product_name: Optional[str] = None
+    ordered_kg: Decimal
+    dispatched_kg: Decimal
+    remaining_kg: Decimal
+    stock_on_hand_kg: Decimal
+    can_dispatch_from_stock: bool
+    order_status: Optional[str] = None
+    requested_delivery_date: Optional[date] = None
+
+
+class AcRecentDispatchOut(BaseModel):
+    dispatch_id: str
+    order_code: Optional[str] = None
+    lot_code: Optional[str] = None
+    quantity_kg: Decimal = Decimal("0")
+    dispatch_date: Optional[datetime] = None
+    customer_code: Optional[str] = None
+    vehicle_number: Optional[str] = None
+
+
+class AcDispatchFromOrderCreate(BaseModel):
+    customer_order_id: UUID
+    quantity_kg: Decimal = Field(..., gt=0)
+    lot_code: Optional[str] = Field(None, max_length=64)
+    grade_code: Optional[str] = Field(None, max_length=64)
+    vehicle_number: Optional[str] = Field(None, max_length=64)
+    transporter_name: Optional[str] = Field(None, max_length=128)
+    remarks: Optional[str] = None
+
+
+class AcDispatchFromOrderResponse(BaseModel):
+    dispatch_id: str
+    order_code: str
+    lot_code: str
+    grade_code: Optional[str] = None
+    quantity_kg: Decimal
+    remaining_on_order_kg: Decimal
+    order_status: str
+    stock_on_hand_after_kg: Decimal
+
+
+class AcMakeToStockCreate(BaseModel):
+    quantity: Decimal = Field(..., gt=0)
+    uom: str = "KG"
+    inward_order_id: Optional[UUID] = None
+    finished_product_id: Optional[UUID] = None
+    production_order_code: Optional[str] = Field(None, max_length=64)
+
+
+class AcMakeToStockCreateResponse(BaseModel):
+    order: CustomerOrderOut
+    line: CustomerOrderLineOut
+    production_order: ProductionOrderOut
+    production_lot: Optional[ProductionLotOut] = None
+
+
+class AcRawMaterialTypeOperation(BaseModel):
+    operation_sequence: int = Field(..., gt=0)
+    operation_name: str = Field(..., min_length=1, max_length=256)
+    operation_code: str = Field(..., min_length=1, max_length=64)
+    process_step: str = Field(..., min_length=1, max_length=64)
+
+
+class AcRawMaterialProcessParameter(BaseModel):
+    key: str = Field(..., min_length=1, max_length=128)
+    label: str = Field(..., min_length=1, max_length=256)
+    unit: Optional[str] = Field(None, max_length=32)
+    default_value: Optional[str] = Field(None, max_length=128)
+    used_at: str = Field(default="feasibility", max_length=32)
+    process_step: Optional[str] = Field(None, max_length=64)
+    ontology_predicate: Optional[str] = Field(None, max_length=64)
+    predicate_uri: Optional[str] = Field(None, max_length=256)
+    subject_uri_template: Optional[str] = Field(None, max_length=256)
+    object_datatype: Optional[str] = Field(None, max_length=128)
+    mandatory: bool = False
+
+
+class AcRawMaterialTypeOut(BaseModel):
+    product_id: UUID
+    product_code: str
+    product_name: str
+    finished_product_code: Optional[str] = None
+    finished_product_name: Optional[str] = None
+    finished_product_id: Optional[UUID] = None
+    routing_code: Optional[str] = None
+    routing_id: Optional[UUID] = None
+    operations: list = Field(default_factory=list)
+    process_parameters: list = Field(default_factory=list)
+
+
+class AcRawMaterialTypeCreate(BaseModel):
+    product_code: Optional[str] = Field(None, max_length=64)
+    product_name: str = Field(..., min_length=1, max_length=256)
+    finished_product_code: Optional[str] = Field(None, max_length=64)
+    finished_product_name: Optional[str] = Field(None, max_length=256)
+    routing_code: Optional[str] = Field(None, max_length=64)
+    operations: list[AcRawMaterialTypeOperation] = Field(default_factory=list)
+    process_parameters: list[AcRawMaterialProcessParameter] = Field(default_factory=list)
+
+
+class AcRawMaterialTypeUpdate(BaseModel):
+    product_name: Optional[str] = Field(None, min_length=1, max_length=256)
+    finished_product_name: Optional[str] = Field(None, min_length=1, max_length=256)
+    operations: Optional[list[AcRawMaterialTypeOperation]] = None
+    process_parameters: Optional[list[AcRawMaterialProcessParameter]] = None
 
 
 class AcDashboardOut(BaseModel):
@@ -1038,4 +1158,9 @@ class AcDashboardOut(BaseModel):
     active_orders: list[AcActiveOrderOut] = Field(default_factory=list)
     quality_check_count: int = 0
     dispatch_count: int = 0
+    dispatched_kg_total: Decimal = Decimal("0")
+    finished_goods_stock_kg: Decimal = Decimal("0")
+    grade_stock: list["AcGradeStockOut"] = Field(default_factory=list)
+    open_customer_orders: list["AcOpenCustomerOrderOut"] = Field(default_factory=list)
+    recent_dispatches: list["AcRecentDispatchOut"] = Field(default_factory=list)
     kiln_parameter_definitions: list[AcKilnParameterDefinition] = Field(default_factory=list)

@@ -57,6 +57,7 @@ from app.schemas.mes_core.schemas import (
     RoutingOperationOut,
     RoutingOperationParameterCreate,
     RoutingOperationParameterOut,
+    RoutingOperationParameterUpdate,
     OperationResourceRequirementOut,
     OperationResourceRequirementsSet,
     RoutingOperationSequencePatch,
@@ -457,6 +458,39 @@ def list_routing_operation_parameters(
 ):
     return mes_core_routing_customization.list_operation_parameters(
         db, tenant, operation_id
+    )
+
+
+@router.patch(
+    "/routing-operations/{operation_id}/parameters/{parameter_id}",
+    response_model=RoutingOperationParameterOut,
+    summary="Update parameter on workspace routing operation",
+)
+def update_routing_operation_parameter(
+    operation_id: UUID,
+    parameter_id: UUID,
+    payload: RoutingOperationParameterUpdate,
+    db: Session = Depends(get_mes_core_db),
+    tenant: TenantContext = Depends(get_tenant_context),
+):
+    return mes_core_routing_customization.update_operation_parameter(
+        db, tenant, operation_id, parameter_id, payload
+    )
+
+
+@router.delete(
+    "/routing-operations/{operation_id}/parameters/{parameter_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    summary="Remove parameter from workspace routing operation",
+)
+def delete_routing_operation_parameter(
+    operation_id: UUID,
+    parameter_id: UUID,
+    db: Session = Depends(get_mes_core_db),
+    tenant: TenantContext = Depends(get_tenant_context),
+):
+    mes_core_routing_customization.delete_operation_parameter(
+        db, tenant, operation_id, parameter_id
     )
 
 

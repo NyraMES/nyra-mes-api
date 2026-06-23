@@ -10,9 +10,10 @@ from typing import List, Optional
 
 from sqlalchemy.orm import Session
 
-from app.core.exceptions import NotFoundError, ValidationError
+from app.core.exceptions import NotFoundError, ValidationError, WorkflowError
 from app.core.tenant_context import TenantContext
 from app.models.mes_core import (
+    Customer,
     CustomerOrder,
     CustomerOrderLine,
     Equipment,
@@ -31,6 +32,7 @@ from app.schemas.mes_core.schemas import (
     AcActiveOrderOut,
     AcDashboardOut,
     AcLotLineOut,
+    AcOpenLotOut,
     AcKilnFeedLotCreate,
     AcKilnCreate,
     AcKilnOut,
@@ -42,7 +44,12 @@ from app.schemas.mes_core.schemas import (
     AcQualityTestCreate,
     AcCustomerSalesOrderCreate,
     AcCustomerSalesOrderCreateResponse,
-    AcDeliveryCommitmentOut,
+    AcDispatchFromOrderCreate,
+    AcDispatchFromOrderResponse,
+    AcGradeStockOut,
+    AcOpenCustomerOrderOut,
+    AcRecentDispatchOut,
+    AcStockedLotOut,
     AcFinishedGoodsStockOut,
     AcMakeToStockCreate,
     AcMakeToStockCreateResponse,
@@ -93,6 +100,7 @@ from app.services.industry.activated_carbon import raw_material_types as ac_raw_
 from app.services.industry.activated_carbon import stock as ac_stock
 from app.schemas.traceability import TraceabilityResponse
 from app.services.mes_core import entities as mes_core_entities
+from app.services.mes_core.feasibility import is_ready_for_scheduling
 from app.services.mes_core import dispatch_workflow as mes_core_dispatch
 from app.services.mes_core import traceability_workflow as mes_core_traceability
 from app.services.mes_core.base import TenantRepository
@@ -245,7 +253,8 @@ def _production_order_eligible_for_kiln(
     if flow == "CUSTOMER_SALES":
         return False
     if flow == "MAKE_TO_STOCK":
-        return True
+        # Legacy duplicate PO from old release flow — prefer inward-linked PO.
+        return False
     if flow == "RAW_MATERIAL_INWARD":
         product = repo.get_by_pk(Product, Product.product_id, line.product_id)
         return not _is_raw_product(product)
@@ -412,6 +421,35 @@ def _order_is_raw_material_inward(
     return False
 
 
+def _require_raw_material_inward_order(
+    db: Session, tenant: TenantContext, order: CustomerOrder
+) -> CustomerOrder:
+    """Validate inward receipt; backfill metadata.flow when inferred from raw lines."""
+    repo = _repo(db, tenant)
+    products = {p.product_id: p for p in repo.query(Product).all()}
+    order_out = mes_core_entities._customer_order_out(db, tenant, order)
+    if not _order_is_raw_material_inward(order, order_out, products):
+        raise ValidationError("Order is not a raw material inward receipt")
+    meta = order.metadata_ if isinstance(order.metadata_, dict) else {}
+    if meta.get("flow") != "RAW_MATERIAL_INWARD":
+        raw_line = next(
+            (
+                line
+                for line in order_out.lines or []
+                if (products.get(line.product_id) and _is_raw_product(products[line.product_id]))
+                or (line.product_code or "").upper().startswith("RAW-")
+            ),
+            None,
+        )
+        order.metadata_ = {
+            **meta,
+            "flow": "RAW_MATERIAL_INWARD",
+            **({"raw_product_id": str(raw_line.product_id)} if raw_line else {}),
+        }
+        repo.db.flush()
+    return order
+
+
 def _customer_order_has_raw_line(order: CustomerOrderOut) -> bool:
     """Legacy helper — prefer _order_is_raw_material_inward for DB-backed checks."""
     for line in order.lines or []:
@@ -531,7 +569,12 @@ def create_customer_sales_order(
     line_code = resolve_ac_business_code(
         db, provided=None, entity="ac_customer_order_line"
     )
-    metadata: dict = {"flow": "CUSTOMER_SALES"}
+    metadata: dict = {
+        "flow": "CUSTOMER_SALES",
+        "product_id": str(payload.finished_product_id),
+        "ordered_kg": str(payload.quantity),
+        "dispatched_kg": "0",
+    }
     if payload.requested_delivery_date:
         metadata["delivery_date"] = payload.requested_delivery_date.isoformat()
 
@@ -574,28 +617,401 @@ def create_customer_sales_order(
     )
 
 
+def _grade_from_product(product: Product) -> tuple[str, str]:
+    code = product.product_code or "FG"
+    label = product.product_name or code
+    mesh = re.search(r"(\d+\s*x\s*\d+)", code, re.I)
+    if mesh:
+        grade = mesh.group(1).replace(" ", "").lower()
+        return grade, f"{label} ({grade})"
+    return code, label
+
+
+def _screening_meta_by_lot(repo: TenantRepository) -> dict:
+    out: dict = {}
+    for ex in repo.query(OperationExecution).all():
+        meta = ex.metadata_ if isinstance(ex.metadata_, dict) else {}
+        if meta.get("process_step") != "SCREENING":
+            continue
+        out[ex.production_lot_id] = meta
+    return out
+
+
+def _lot_order_codes(repo: TenantRepository) -> tuple[dict, dict]:
+    """Map production_order_id → order_code and order_line_id → order_code."""
+    line_to_order: dict = {}
+    po_by_id: dict = {}
+    for order in repo.query(CustomerOrder).all():
+        for line in repo.query(CustomerOrderLine).filter(
+            CustomerOrderLine.order_id == order.customer_order_id
+        ).all():
+            line_to_order[line.order_line_id] = order.order_code
+    for po in repo.query(ProductionOrder).all():
+        po_by_id[po.production_order_id] = po
+    po_to_order: dict = {}
+    for po_id, po in po_by_id.items():
+        po_to_order[po_id] = line_to_order.get(po.order_line_id)
+    return po_by_id, po_to_order
+
+
+def _stocked_lot_grade(
+    product: Optional[Product],
+    screening_meta: dict,
+    lot: ProductionLot,
+) -> tuple[str, str, Optional[str], Decimal]:
+    mesh = str(screening_meta.get("mesh_size") or "").strip()
+    good_kg = screening_meta.get("good_kg")
+    qty = Decimal(str(good_kg if good_kg is not None else lot.lot_quantity or 0))
+    if mesh:
+        grade_code = mesh.replace(" ", "").lower()
+        return grade_code, f"Mesh {mesh}", mesh, qty
+    if product:
+        grade_code, grade_label = _grade_from_product(product)
+        return grade_code, grade_label, None, qty
+    return "fg", "Finished goods", None, qty
+
+
+def list_stocked_lots_for_dispatch(
+    db: Session, tenant: TenantContext
+) -> list[AcStockedLotOut]:
+    ac_stock.reconcile_pending_stocked_lots(db, tenant)
+    repo = _repo(db, tenant)
+    products = {p.product_id: p for p in repo.query(Product).all()}
+    po_by_id, po_to_order = _lot_order_codes(repo)
+    screening_by_lot = _screening_meta_by_lot(repo)
+    rows: list[AcStockedLotOut] = []
+
+    lots = (
+        repo.query(ProductionLot)
+        .order_by(ProductionLot.created_at)
+        .all()
+    )
+    for lot in lots:
+        lot_meta = lot.metadata_ if isinstance(lot.metadata_, dict) else {}
+        st = (lot.status or "").upper()
+        if st in ("DISPATCHED", "SCRAPPED", "CLOSED", "CANCELLED"):
+            continue
+        if st != "STOCKED" and not lot_meta.get("fg_stocked"):
+            continue
+        product_id = ac_stock._lot_finished_product_id(db, tenant, lot)
+        product = products.get(product_id) if product_id else None
+        screening = screening_by_lot.get(lot.production_lot_id, {})
+        grade_code, grade_label, mesh, qty = _stocked_lot_grade(product, screening, lot)
+        po = po_by_id.get(lot.production_order_id)
+        rows.append(
+            AcStockedLotOut(
+                production_lot_id=lot.production_lot_id,
+                lot_code=lot.lot_code,
+                lot_quantity=qty,
+                status=lot.status or "STOCKED",
+                product_id=product_id,
+                product_code=product.product_code if product else None,
+                product_name=product.product_name if product else None,
+                grade_code=grade_code,
+                grade_label=grade_label,
+                mesh_size=mesh,
+                order_code=po_to_order.get(lot.production_order_id),
+                production_order_code=po.production_order_code if po else None,
+                stocked_at=lot_meta.get("stocked_at"),
+            )
+        )
+    return rows
+
+
+def list_grade_wise_stock(
+    db: Session, tenant: TenantContext
+) -> list[AcGradeStockOut]:
+    repo = _repo(db, tenant)
+    products = {p.product_id: p for p in repo.query(Product).all()}
+    buckets: dict[str, AcGradeStockOut] = {}
+    lot_counts: dict[str, int] = {}
+
+    for row in list_stocked_lots_for_dispatch(db, tenant):
+        key = (row.grade_code or row.product_code or "fg").upper()
+        qty = Decimal(str(row.lot_quantity or 0))
+        if qty <= 0:
+            continue
+        lot_counts[key] = lot_counts.get(key, 0) + 1
+        existing = buckets.get(key)
+        if existing:
+            buckets[key] = existing.model_copy(
+                update={
+                    "quantity_kg": existing.quantity_kg + qty,
+                    "stocked_lot_count": lot_counts[key],
+                }
+            )
+        else:
+            buckets[key] = AcGradeStockOut(
+                grade_code=row.grade_code or key.lower(),
+                grade_label=row.grade_label or row.product_code or key,
+                product_id=row.product_id,
+                product_code=row.product_code,
+                quantity_kg=qty,
+                uom="KG",
+                source="stocked_lots",
+                stocked_lot_count=1,
+            )
+
+    if buckets:
+        return sorted(buckets.values(), key=lambda row: row.grade_code)
+
+    for row in list_finished_goods_stock(db, tenant):
+        product = products.get(row.product_id)
+        grade_code, grade_label = (
+            _grade_from_product(product)
+            if product
+            else (row.product_code, row.product_name or row.product_code)
+        )
+        key = grade_code.upper()
+        qty = Decimal(str(row.quantity_kg or 0))
+        buckets[key] = AcGradeStockOut(
+            grade_code=grade_code,
+            grade_label=grade_label,
+            product_id=row.product_id,
+            product_code=row.product_code,
+            quantity_kg=qty,
+            uom=row.uom or "KG",
+            source="finished_goods",
+            stocked_lot_count=0,
+        )
+
+    return sorted(buckets.values(), key=lambda row: row.grade_code)
+
+
+def list_open_customer_sales_orders(
+    db: Session, tenant: TenantContext
+) -> list[AcOpenCustomerOrderOut]:
+    repo = _repo(db, tenant)
+    customers = {c.customer_id: c for c in repo.query(Customer).all()}
+    products = {p.product_id: p for p in repo.query(Product).all()}
+    rows: list[AcOpenCustomerOrderOut] = []
+
+    for order in repo.query(CustomerOrder).order_by(CustomerOrder.created_at.desc()).all():
+        meta = order.metadata_ if isinstance(order.metadata_, dict) else {}
+        if meta.get("flow") != "CUSTOMER_SALES":
+            continue
+        dispatched = Decimal(str(meta.get("dispatched_kg") or 0))
+        lines = (
+            repo.query(CustomerOrderLine)
+            .filter(CustomerOrderLine.order_id == order.customer_order_id)
+            .all()
+        )
+        if not lines:
+            continue
+        line = lines[0]
+        product = products.get(line.product_id)
+        if not product:
+            continue
+        ordered = Decimal(str(meta.get("ordered_kg") or line.quantity or 0))
+        remaining = max(ordered - dispatched, Decimal("0"))
+        status = (order.status or "OPEN").upper()
+        if status == "CLOSED" and remaining <= 0:
+            continue
+        stock = ac_stock.get_fg_stock_kg(db, tenant, line.product_id)
+        customer = customers.get(order.customer_id) if order.customer_id else None
+        delivery_raw = meta.get("delivery_date") or meta.get("requested_delivery_date")
+        delivery_date = None
+        if delivery_raw:
+            try:
+                delivery_date = date.fromisoformat(str(delivery_raw)[:10])
+            except ValueError:
+                delivery_date = None
+        rows.append(
+            AcOpenCustomerOrderOut(
+                customer_order_id=order.customer_order_id,
+                order_code=order.order_code,
+                customer_id=order.customer_id,
+                customer_code=customer.customer_code if customer else None,
+                customer_name=customer.customer_name if customer else None,
+                product_id=line.product_id,
+                product_code=product.product_code,
+                product_name=product.product_name,
+                ordered_kg=ordered,
+                dispatched_kg=dispatched,
+                remaining_kg=remaining,
+                stock_on_hand_kg=stock,
+                can_dispatch_from_stock=stock >= remaining and remaining > 0,
+                order_status=order.status,
+                requested_delivery_date=delivery_date,
+            )
+        )
+    return rows
+
+
+def _stocked_lot_for_product(
+    db: Session,
+    tenant: TenantContext,
+    product_id: UUID,
+    *,
+    lot_code: Optional[str] = None,
+) -> ProductionLot:
+    repo = _repo(db, tenant)
+    lots = repo.query(ProductionLot).order_by(ProductionLot.created_at).all()
+    for lot in lots:
+        lot_meta = lot.metadata_ if isinstance(lot.metadata_, dict) else {}
+        st = (lot.status or "").upper()
+        if st != "STOCKED" and not lot_meta.get("fg_stocked"):
+            continue
+        if lot_code and lot.lot_code != lot_code:
+            continue
+        lot_product = ac_stock._lot_finished_product_id(db, tenant, lot)
+        if lot_product == product_id:
+            return lot
+    if lot_code:
+        raise ValidationError(f"Stocked lot '{lot_code}' not found for this product grade")
+    raise ValidationError(
+        "No stocked lot available for this product — complete shop-floor execution first"
+    )
+
+
+def create_ac_dispatch_from_order(
+    db: Session, tenant: TenantContext, payload: AcDispatchFromOrderCreate
+) -> AcDispatchFromOrderResponse:
+    sync_ac_sequences(db, tenant.tenant_id)
+    repo = _repo(db, tenant)
+    order = repo.get_by_pk(
+        CustomerOrder, CustomerOrder.customer_order_id, payload.customer_order_id
+    )
+    meta = order.metadata_ if isinstance(order.metadata_, dict) else {}
+    if meta.get("flow") != "CUSTOMER_SALES":
+        raise ValidationError("Order is not a customer sales / purchase order")
+
+    lines = (
+        repo.query(CustomerOrderLine)
+        .filter(CustomerOrderLine.order_id == order.customer_order_id)
+        .all()
+    )
+    if not lines:
+        raise ValidationError("Customer order has no line items")
+    line = lines[0]
+    product = repo.get_by_pk(Product, Product.product_id, line.product_id)
+    grade_code, _ = _grade_from_product(product)
+
+    ordered = Decimal(str(meta.get("ordered_kg") or line.quantity or 0))
+    dispatched = Decimal(str(meta.get("dispatched_kg") or 0))
+    remaining = max(ordered - dispatched, Decimal("0"))
+    qty = Decimal(str(payload.quantity_kg))
+    if qty > remaining:
+        raise ValidationError(
+            f"Dispatch quantity {qty} KG exceeds remaining PO quantity {remaining} KG"
+        )
+
+    stock = ac_stock.get_fg_stock_kg(db, tenant, line.product_id)
+    if qty > stock:
+        commitment = evaluate_delivery_commitment(
+            db, tenant, finished_product_id=line.product_id, quantity=qty
+        )
+        raise ValidationError(
+            f"Insufficient stock for {product.product_code}: "
+            f"on hand {stock} KG, requested {qty} KG. {commitment.message}"
+        )
+
+    lot = _stocked_lot_for_product(
+        db, tenant, line.product_id, lot_code=payload.lot_code
+    )
+    ac_stock.release_lot_schedule_resources(db, tenant, lot.production_lot_id)
+    lot_qty = Decimal(str(lot.lot_quantity or 0))
+    if qty > lot_qty:
+        raise ValidationError(
+            f"Lot {lot.lot_code} has only {lot_qty} KG; requested {qty} KG"
+        )
+
+    ac_stock.deduct_fg_stock_kg(db, tenant, line.product_id, qty)
+    lot_meta = lot.metadata_ if isinstance(lot.metadata_, dict) else {}
+    now_iso = datetime.now(timezone.utc).isoformat()
+    if qty >= lot_qty:
+        lot.status = "DISPATCHED"
+        lot.metadata_ = {
+            **lot_meta,
+            "dispatched_at": now_iso,
+            "fg_stocked": False,
+            "fg_stock_kg_added": "0",
+            "last_dispatch_kg": str(qty),
+        }
+    else:
+        remaining_lot = lot_qty - qty
+        lot.lot_quantity = remaining_lot
+        lot.metadata_ = {
+            **lot_meta,
+            "fg_stock_kg_added": str(remaining_lot),
+            "last_dispatch_kg": str(qty),
+        }
+
+    customer = (
+        repo.get_by_pk(Customer, Customer.customer_id, order.customer_id)
+        if order.customer_id
+        else None
+    )
+    dispatch_code = resolve_ac_business_code(db, provided=None, entity="ac_dispatch")
+    dispatch_meta = {
+        "customer_id": customer.customer_code if customer else None,
+        "order_id": order.order_code,
+        "customer_order_id": str(order.customer_order_id),
+        "grade_code": payload.grade_code or grade_code,
+        "vehicle_number": payload.vehicle_number,
+        "transporter_name": payload.transporter_name,
+        "dispatch_status": "Shipped",
+        "dispatch_date": datetime.now(timezone.utc).isoformat(),
+        "remarks": payload.remarks,
+        "lines": [
+            {
+                "lot_id": lot.lot_code,
+                "part_id": product.product_code,
+                "dispatch_quantity": str(qty),
+                "accepted_quantity": str(qty),
+                "rejected_quantity": "0",
+            }
+        ],
+    }
+    repo.add(
+        QualityCheck(
+            check_code=dispatch_code,
+            production_lot_id=lot.production_lot_id,
+            check_type="DISPATCH",
+            status="Shipped",
+            metadata_=dispatch_meta,
+        )
+    )
+
+    dispatched += qty
+    remaining_after = max(ordered - dispatched, Decimal("0"))
+    order.status = "CLOSED" if remaining_after <= 0 else "PARTIAL"
+    order.metadata_ = {
+        **meta,
+        "dispatched_kg": str(dispatched),
+        "last_dispatch_id": dispatch_code,
+        "last_dispatch_lot": lot.lot_code,
+        "last_dispatch_kg": str(qty),
+    }
+    repo.db.commit()
+
+    stock_after = ac_stock.get_fg_stock_kg(db, tenant, line.product_id)
+    return AcDispatchFromOrderResponse(
+        dispatch_id=dispatch_code,
+        order_code=order.order_code,
+        lot_code=lot.lot_code,
+        grade_code=payload.grade_code or grade_code,
+        quantity_kg=qty,
+        remaining_on_order_kg=remaining_after,
+        order_status=order.status or "OPEN",
+        stock_on_hand_after_kg=stock_after,
+    )
+
+
 def create_make_to_stock_production_order(
     db: Session, tenant: TenantContext, payload: AcMakeToStockCreate
 ) -> AcMakeToStockCreateResponse:
     sync_ac_sequences(db, tenant.tenant_id)
     repo = _repo(db, tenant)
-    finished: Product
     source_inward_id: Optional[UUID] = payload.inward_order_id
 
     if source_inward_id is not None:
         inward = repo.get_by_pk(
             CustomerOrder, CustomerOrder.customer_order_id, source_inward_id
         )
+        inward = _require_raw_material_inward_order(db, tenant, inward)
         meta = inward.metadata_ if isinstance(inward.metadata_, dict) else {}
-        if meta.get("flow") != "RAW_MATERIAL_INWARD":
-            raise ValidationError("Order is not a raw material inward receipt")
-        raw_product_id = meta.get("raw_product_id")
-        if raw_product_id:
-            finished = _resolve_finished_product_for_raw(
-                db, tenant, UUID(str(raw_product_id))
-            )
-        else:
-            finished = _resolve_finished_product(repo)
+
         release_qty = Decimal(str(payload.quantity))
         remaining = ac_stock.allocate_raw_from_inward(
             db, tenant, source_inward_id, release_qty
@@ -605,9 +1021,63 @@ def create_make_to_stock_production_order(
             "last_release_kg": str(release_qty),
             "available_after_release_kg": str(remaining),
         }
+
+        po_out = _ensure_production_order_for_inward(
+            db,
+            tenant,
+            source_inward_id,
+            quantity=release_qty,
+            uom=payload.uom,
+            production_order_code=payload.production_order_code,
+            planned_quantity=release_qty,
+        )
+        po_row = repo.get_by_pk(
+            ProductionOrder, ProductionOrder.production_order_id, po_out.production_order_id
+        )
+        po_row.metadata_ = {
+            **(po_row.metadata_ if isinstance(po_row.metadata_, dict) else {}),
+            "flow": "RELEASED_TO_PRODUCTION",
+            "source_inward_order_id": str(source_inward_id),
+            "last_release_kg": str(release_qty),
+        }
+        meta["production_order_id"] = str(po_row.production_order_id)
+        meta["production_order_code"] = po_row.production_order_code
         inward.metadata_ = meta
-        repo.db.flush()
-    elif payload.finished_product_id is not None:
+
+        order_out = mes_core_entities._customer_order_out(db, tenant, inward)
+        products = {p.product_id: p for p in repo.query(Product).all()}
+        finished_line_out = None
+        for line in order_out.lines or []:
+            product = products.get(line.product_id)
+            if product and not _is_raw_product(product):
+                finished_line_out = line
+                break
+        if finished_line_out is None and order_out.lines:
+            finished_line_out = order_out.lines[0]
+
+        lot_code = resolve_ac_business_code(
+            db, provided=None, entity="ac_production_lot"
+        )
+        lot_out = mes_core_entities.create_production_lot(
+            db,
+            tenant,
+            ProductionLotCreate(
+                lot_code=lot_code,
+                production_order_id=po_out.production_order_id,
+                lot_quantity=release_qty,
+                status="CREATED",
+            ),
+        )
+        repo.db.commit()
+        return AcMakeToStockCreateResponse(
+            order=order_out,
+            line=finished_line_out,
+            production_order=po_out,
+            production_lot=lot_out,
+        )
+
+    finished: Product
+    if payload.finished_product_id is not None:
         finished = repo.get_by_pk(
             Product, Product.product_id, payload.finished_product_id
         )
@@ -620,7 +1090,7 @@ def create_make_to_stock_production_order(
         db,
         tenant,
         order_code=None,
-        source_inward_order_id=source_inward_id,
+        source_inward_order_id=None,
         line=CustomerOrderLineCreate(
             line_code=None,
             product_id=finished.product_id,
@@ -649,13 +1119,25 @@ def create_make_to_stock_production_order(
         **(po_row.metadata_ if isinstance(po_row.metadata_, dict) else {}),
         "flow": "MAKE_TO_STOCK",
     }
-    if source_inward_id is not None:
-        po_row.metadata_["source_inward_order_id"] = str(source_inward_id)
+    lot_code = resolve_ac_business_code(
+        db, provided=None, entity="ac_production_lot"
+    )
+    lot_out = mes_core_entities.create_production_lot(
+        db,
+        tenant,
+        ProductionLotCreate(
+            lot_code=lot_code,
+            production_order_id=po_out.production_order_id,
+            lot_quantity=payload.quantity,
+            status="CREATED",
+        ),
+    )
     repo.db.commit()
     return AcMakeToStockCreateResponse(
         order=order_resp.order,
         line=order_resp.line,
         production_order=po_out,
+        production_lot=lot_out,
     )
 
 
@@ -693,24 +1175,50 @@ def list_quality_testing(
 def compute_yield_analysis(
     db: Session, tenant: TenantContext
 ) -> ActivatedCarbonYieldSummaryOut:
+    """Plant yield = finished output kg ÷ raw material charged to production."""
     repo = _repo(db, tenant)
-    orders = repo.query(ProductionOrder).all()
     lots = repo.query(ProductionLot).all()
-    planned = sum(Decimal(str(o.planned_quantity or 0)) for o in orders)
+    production_orders = repo.query(ProductionOrder).all()
+    planned = sum(
+        Decimal(str(o.planned_quantity or 0))
+        for o in production_orders
+    )
     lot_qty = sum(Decimal(str(l.lot_quantity or 0)) for l in lots)
-    accepted = Decimal("0")
-    for row in repo.query(QualityCheck).filter(QualityCheck.check_type != "DISPATCH").all():
-        meta = row.metadata_ if isinstance(row.metadata_, dict) else {}
-        for key in ("accepted_quantity", "accepted_kg", "accepted_qty"):
-            if meta.get(key) is not None:
-                accepted += Decimal(str(meta[key]))
-                break
+
+    raw_status = _raw_material_status(db, tenant)
+    raw_charged = Decimal(str(raw_status.charged_kg or 0))
+    if raw_charged <= 0:
+        for po in production_orders:
+            po_meta = po.metadata_ if isinstance(po.metadata_, dict) else {}
+            if po_meta.get("source_inward_order_id") or po_meta.get("flow") == "RELEASED_TO_PRODUCTION":
+                raw_charged += Decimal(
+                    str(po_meta.get("last_release_kg") or po.planned_quantity or 0)
+                )
+    if raw_charged <= 0 and planned > 0:
+        raw_charged = planned
+
+    fg_output = Decimal("0")
+    for lot in lots:
+        lot_meta = lot.metadata_ if isinstance(lot.metadata_, dict) else {}
+        st = (lot.status or "").upper()
+        if st == "STOCKED":
+            fg_output += Decimal(str(lot.lot_quantity or lot_meta.get("fg_stock_kg_added") or 0))
+        elif st == "DISPATCHED":
+            fg_output += Decimal(str(lot_meta.get("last_dispatch_kg") or 0))
+
+    if fg_output <= 0:
+        for row in list_finished_goods_stock(db, tenant):
+            fg_output += Decimal(str(row.quantity_kg or 0))
+        _, dispatched_total, _ = _dispatch_dashboard_summary(db, tenant)
+        fg_output += dispatched_total
+
     avg_yield: Optional[Decimal] = None
-    if accepted > 0 and lot_qty > 0:
-        avg_yield = (accepted / lot_qty * Decimal("100")).quantize(Decimal("0.01"))
-    elif planned > 0:
-        basis = min(lot_qty, planned)
-        avg_yield = (basis / planned * Decimal("100")).quantize(Decimal("0.01"))
+    if raw_charged > 0 and fg_output > 0:
+        avg_yield = (fg_output / raw_charged * Decimal("100")).quantize(Decimal("0.01"))
+    elif raw_charged > 0 and lot_qty > 0:
+        # WIP only — no fake yield until material is stocked or dispatched.
+        avg_yield = None
+
     return ActivatedCarbonYieldSummaryOut(
         lot_count=len(lots),
         total_planned_quantity=planned,
@@ -1008,35 +1516,35 @@ def _is_raw_product(product: Product) -> bool:
 
 
 def _raw_material_status(db: Session, tenant: TenantContext) -> AcRawMaterialStatusOut:
+    """Raw material mass balance for dashboard KPIs (inward → released to production)."""
     repo = _repo(db, tenant)
     products = {p.product_id: p for p in repo.query(Product).all()}
-    raw_inward_order_ids: set = set()
     ordered = Decimal("0")
-    for line in repo.query(CustomerOrderLine).all():
-        product = products.get(line.product_id)
-        if product and _is_raw_product(product):
-            ordered += Decimal(str(line.quantity or 0))
-            raw_inward_order_ids.add(line.order_id)
+    allocated = Decimal("0")
+    raw_inward_order_ids: set = set()
+
     for order in repo.query(CustomerOrder).all():
         meta = order.metadata_ if isinstance(order.metadata_, dict) else {}
-        if meta.get("flow") == "RAW_MATERIAL_INWARD":
-            raw_inward_order_ids.add(order.customer_order_id)
-    inward_line_ids = {
-        line.order_line_id
-        for line in repo.query(CustomerOrderLine).all()
-        if line.order_id in raw_inward_order_ids
-    }
-    raw_po_ids = {
-        po.production_order_id
-        for po in repo.query(ProductionOrder).all()
-        if po.order_line_id in inward_line_ids
-    }
-    charged = sum(
-        Decimal(str(l.lot_quantity or 0))
-        for l in repo.query(ProductionLot).all()
-        if l.production_order_id in raw_po_ids
-    )
-    pending = max(Decimal("0"), ordered - charged)
+        lines = (
+            repo.query(CustomerOrderLine)
+            .filter(CustomerOrderLine.order_id == order.customer_order_id)
+            .all()
+        )
+        raw_qty = Decimal("0")
+        is_inward = meta.get("flow") == "RAW_MATERIAL_INWARD"
+        for line in lines:
+            product = products.get(line.product_id)
+            if product and _is_raw_product(product):
+                raw_qty += Decimal(str(line.quantity or 0))
+                is_inward = True
+        if not is_inward or raw_qty <= 0:
+            continue
+        raw_inward_order_ids.add(order.customer_order_id)
+        ordered += raw_qty
+        allocated += Decimal(str(meta.get("allocated_to_production_kg") or 0))
+
+    charged = allocated
+    pending = max(Decimal("0"), ordered - allocated)
     return AcRawMaterialStatusOut(
         ordered_kg=ordered,
         charged_kg=charged,
@@ -1064,12 +1572,27 @@ def _kiln_status_rows(db: Session, tenant: TenantContext) -> list[AcKilnStatusOu
                 latest = ex
                 break
         lot = lots_by_id.get(latest.production_lot_id) if latest else None
+        if lot is None:
+            for candidate in lots_by_id.values():
+                if (candidate.status or "").upper() != "IN_PROGRESS":
+                    continue
+                for ex in executions:
+                    if ex.production_lot_id != candidate.production_lot_id:
+                        continue
+                    meta = ex.metadata_ or {}
+                    if meta.get("kiln_resource_code") == code or meta.get("resource_code") == code:
+                        lot = candidate
+                        latest = ex
+                        break
+                if lot:
+                    break
         status = "IDLE"
-        if lot:
+        if lot and latest:
             lot_status = (lot.status or "").upper()
-            if lot_status in {"IN_PROGRESS", "ACTIVE", "RUNNING"}:
+            ex_status = (latest.status or "").upper()
+            if lot_status == "IN_PROGRESS" and ex_status not in ("COMPLETED", "CLOSED"):
                 status = "RUNNING"
-            elif lot_status in {"COMPLETED", "CLOSED"}:
+            elif lot_status in {"IN_PROGRESS", "COMPLETED", "QC_PENDING"} and ex_status == "COMPLETED":
                 status = "COOLING"
         rows.append(
             AcKilnStatusOut(
@@ -1100,6 +1623,9 @@ def _latest_feasibility_by_lot(db: Session, tenant: TenantContext) -> dict:
 
 
 _TERMINAL_LOT_STATUSES = frozenset({"DISPATCHED", "CLOSED", "CANCELLED"})
+_OPEN_LOT_STATUSES = frozenset(
+    {"COMPLETED", "QC_PENDING", "STOCKED", "DISPATCHED", "CLOSED", "CANCELLED"}
+)
 
 
 def _shop_floor_execution_counts(repo: TenantRepository) -> dict:
@@ -1195,6 +1721,59 @@ def _lot_line_rows(db: Session, tenant: TenantContext) -> list[AcLotLineOut]:
     return rows
 
 
+def list_open_production_lots(
+    db: Session, tenant: TenantContext
+) -> list[AcOpenLotOut]:
+    """Lots eligible for feasibility, kiln feed, and routing (server-side filter)."""
+    repo = _repo(db, tenant)
+    orders = repo.query(CustomerOrder).all()
+    line_to_order: dict = {}
+    for order in orders:
+        for line in repo.query(CustomerOrderLine).filter(
+            CustomerOrderLine.order_id == order.customer_order_id
+        ).all():
+            line_to_order[line.order_line_id] = order.order_code
+
+    po_rows = repo.query(ProductionOrder).all()
+    po_by_id = {po.production_order_id: po for po in po_rows}
+    feas_by_lot = _latest_feasibility_by_lot(db, tenant)
+    exec_counts = _shop_floor_execution_counts(repo)
+
+    lots = (
+        repo.query(ProductionLot)
+        .order_by(ProductionLot.created_at.desc())
+        .all()
+    )
+    rows: list[AcOpenLotOut] = []
+    for lot in lots:
+        st = (lot.status or "").upper()
+        done, total = exec_counts.get(lot.production_lot_id, (0, 0))
+        routing_complete = total > 0 and done >= total
+        if st in _OPEN_LOT_STATUSES or routing_complete:
+            continue
+
+        po = po_by_id.get(lot.production_order_id)
+        order_code = line_to_order.get(po.order_line_id) if po else None
+        feas = feas_by_lot.get(lot.production_lot_id)
+        stage = _lot_pipeline_stage(
+            lot.status, feas, exec_done=done, exec_total=total
+        )
+        rows.append(
+            AcOpenLotOut(
+                production_lot_id=lot.production_lot_id,
+                order_code=order_code,
+                production_order_code=po.production_order_code if po else None,
+                lot_code=lot.lot_code,
+                lot_quantity=lot.lot_quantity,
+                status=lot.status,
+                feasibility_status=feas,
+                pipeline_stage=stage,
+                routing_complete=routing_complete,
+            )
+        )
+    return rows
+
+
 def _active_orders_from_lot_lines(
     lot_lines: list[AcLotLineOut],
 ) -> list[AcActiveOrderOut]:
@@ -1237,11 +1816,30 @@ def _active_orders_from_lot_lines(
 
 def _process_step_rows(db: Session, tenant: TenantContext) -> list[AcProcessStepOut]:
     repo = _repo(db, tenant)
-    order_count = repo.query(CustomerOrder).count()
-    lot_count = repo.query(ProductionLot).count()
+    exec_counts = _shop_floor_execution_counts(repo)
+    inward_count = sum(
+        1
+        for order in repo.query(CustomerOrder).all()
+        if isinstance(order.metadata_, dict)
+        and order.metadata_.get("flow") == "RAW_MATERIAL_INWARD"
+    )
+    lot_rows = repo.query(ProductionLot).all()
+    kiln_feed_count = sum(
+        1 for lot in lot_rows if (lot.status or "").upper() == "IN_PROGRESS"
+    )
+    routing_lot_count = sum(
+        1 for lot in lot_rows if exec_counts.get(lot.production_lot_id, (0, 0))[1] > 0
+    )
+    stocked_count = sum(
+        1 for lot in lot_rows if (lot.status or "").upper() == "STOCKED"
+    )
     feasibility_count = repo.query(FeasibilityCheck).count()
-    execution_count = repo.query(OperationExecution).count()
-    routing_count = lot_count
+    execution_count = sum(
+        1
+        for ex in repo.query(OperationExecution).all()
+        if (ex.metadata_ or {}).get("is_production_schedule")
+        or (ex.metadata_ or {}).get("schedule_code")
+    )
     activation_count = (
         repo.query(OperationExecution)
         .filter(OperationExecution.metadata_.contains({"process_step": "ACTIVATION"}))
@@ -1259,7 +1857,7 @@ def _process_step_rows(db: Session, tenant: TenantContext) -> list[AcProcessStep
     )
     dispatch_count = len(mes_core_dispatch.list_dispatches(db, tenant))
     counts = {
-        "AC_RAW_MATERIAL_INWARD": order_count,
+        "AC_RAW_MATERIAL_INWARD": inward_count,
         "AC_RAW_MATERIAL_QC": sum(
             1
             for order in repo.query(CustomerOrder).all()
@@ -1267,14 +1865,15 @@ def _process_step_rows(db: Session, tenant: TenantContext) -> list[AcProcessStep
             and isinstance(order.metadata_.get("raw_material_qc"), dict)
             and order.metadata_["raw_material_qc"].get("qc_status") not in (None, "", "PENDING")
         ),
-        "AC_KILN_FEED": lot_count,
+        "AC_KILN_FEED": kiln_feed_count or routing_lot_count,
         "FEASIBILITY": feasibility_count,
         "EXECUTION": execution_count,
-        "ROUTING": routing_count,
+        "ROUTING": routing_lot_count,
         "AC_HOURLY_KILN_PARAMETERS": activation_count,
         "AC_SCREENING": screening_count,
         "AC_QUALITY_TESTING": qc_count,
-        "AC_YIELD_ANALYSIS": lot_count,
+        "AC_YIELD_ANALYSIS": len(lot_rows),
+        "FG_STOCK": stocked_count,
         "DISPATCH": dispatch_count,
     }
     caps = set(tenant.enabled_capabilities or [])
@@ -1305,6 +1904,51 @@ def _process_step_rows(db: Session, tenant: TenantContext) -> list[AcProcessStep
     return steps
 
 
+def _dispatch_dashboard_summary(
+    db: Session, tenant: TenantContext
+) -> tuple[int, Decimal, list[AcRecentDispatchOut]]:
+    repo = _repo(db, tenant)
+    lots = {lot.production_lot_id: lot for lot in repo.query(ProductionLot).all()}
+    rows = (
+        repo.query(QualityCheck)
+        .filter(QualityCheck.check_type == "DISPATCH")
+        .order_by(QualityCheck.created_at.desc())
+        .all()
+    )
+    total_kg = Decimal("0")
+    recent: list[AcRecentDispatchOut] = []
+    for row in rows:
+        meta = row.metadata_ if isinstance(row.metadata_, dict) else {}
+        line_qty = Decimal("0")
+        for line in meta.get("lines") or []:
+            if isinstance(line, dict):
+                line_qty += Decimal(str(line.get("dispatch_quantity") or 0))
+        if line_qty <= 0:
+            line_qty = Decimal(str(meta.get("last_dispatch_kg") or 0))
+        total_kg += line_qty
+        if len(recent) < 8:
+            lot = lots.get(row.production_lot_id)
+            dispatch_dt = meta.get("dispatch_date")
+            parsed_dt = None
+            if dispatch_dt:
+                try:
+                    parsed_dt = datetime.fromisoformat(str(dispatch_dt).replace("Z", "+00:00"))
+                except ValueError:
+                    parsed_dt = row.created_at
+            recent.append(
+                AcRecentDispatchOut(
+                    dispatch_id=row.check_code,
+                    order_code=meta.get("order_id"),
+                    lot_code=lot.lot_code if lot else None,
+                    quantity_kg=line_qty,
+                    dispatch_date=parsed_dt or row.created_at,
+                    customer_code=meta.get("customer_id"),
+                    vehicle_number=meta.get("vehicle_number"),
+                )
+            )
+    return len(rows), total_kg, recent
+
+
 def get_dashboard_summary(db: Session, tenant: TenantContext) -> AcDashboardOut:
     yield_summary = compute_yield_analysis(db, tenant)
     raw_material = _raw_material_status(db, tenant)
@@ -1318,7 +1962,19 @@ def get_dashboard_summary(db: Session, tenant: TenantContext) -> AcDashboardOut:
         .filter(QualityCheck.check_type != "DISPATCH")
         .count()
     )
-    dispatch_count = len(mes_core_dispatch.list_dispatches(db, tenant))
+    dispatch_count, dispatched_kg_total, recent_dispatches = _dispatch_dashboard_summary(
+        db, tenant
+    )
+    fg_stock = list_finished_goods_stock(db, tenant)
+    grade_stock = list_grade_wise_stock(db, tenant)
+    grade_stock_total = sum(Decimal(str(row.quantity_kg or 0)) for row in grade_stock)
+    product_stock_total = sum(
+        Decimal(str(row.quantity_kg or 0)) for row in fg_stock
+    )
+    finished_goods_stock_kg = (
+        grade_stock_total if grade_stock_total > 0 else product_stock_total
+    )
+    open_customer_orders = list_open_customer_sales_orders(db, tenant)
     return AcDashboardOut(
         yield_summary=yield_summary,
         raw_material=raw_material,
@@ -1328,6 +1984,11 @@ def get_dashboard_summary(db: Session, tenant: TenantContext) -> AcDashboardOut:
         active_orders=active_orders,
         quality_check_count=qc_count,
         dispatch_count=dispatch_count,
+        dispatched_kg_total=dispatched_kg_total,
+        finished_goods_stock_kg=finished_goods_stock_kg,
+        grade_stock=grade_stock,
+        open_customer_orders=open_customer_orders,
+        recent_dispatches=recent_dispatches,
         kiln_parameter_definitions=list_kiln_parameter_definitions(db, tenant),
     )
 
@@ -1400,6 +2061,7 @@ def _ensure_production_order_for_inward(
     quantity,
     uom: str = "KG",
     production_order_code: Optional[str] = None,
+    planned_quantity: Optional[Decimal] = None,
 ) -> ProductionOrderOut:
     """Ensure finished-product line + production order exist for a raw material inward order."""
     repo = _repo(db, tenant)
@@ -1423,6 +2085,7 @@ def _ensure_production_order_for_inward(
 
     line_qty = raw_line.quantity if raw_line else quantity
     line_uom = raw_line.uom if raw_line else uom
+    po_qty = planned_quantity if planned_quantity is not None else line_qty
 
     if finished_line is None:
         prod_line_code = resolve_ac_business_code(
@@ -1435,7 +2098,7 @@ def _ensure_production_order_for_inward(
             CustomerOrderLineCreate(
                 line_code=prod_line_code,
                 product_id=finished.product_id,
-                quantity=line_qty,
+                quantity=po_qty,
                 uom=line_uom,
                 status="OPEN",
             ),
@@ -1443,6 +2106,9 @@ def _ensure_production_order_for_inward(
         finished_line_id = finished_line_out.order_line_id
     else:
         finished_line_id = finished_line.order_line_id
+        if Decimal(str(finished_line.quantity)) != po_qty:
+            finished_line.quantity = po_qty
+            repo.db.flush()
 
     existing_po = (
         repo.query(ProductionOrder)
@@ -1450,6 +2116,30 @@ def _ensure_production_order_for_inward(
         .first()
     )
     if existing_po:
+        po_meta = (
+            existing_po.metadata_ if isinstance(existing_po.metadata_, dict) else {}
+        )
+        source_inward = po_meta.get("source_inward_order_id")
+        if source_inward and str(source_inward) != str(order_id):
+            existing_po = None
+    if existing_po:
+        existing_lot_total = sum(
+            Decimal(str(row.lot_quantity or 0))
+            for row in repo.query(ProductionLot)
+            .filter(ProductionLot.production_order_id == existing_po.production_order_id)
+            .all()
+        )
+        existing_po.planned_quantity = existing_lot_total + po_qty
+        po_meta = (
+            existing_po.metadata_ if isinstance(existing_po.metadata_, dict) else {}
+        )
+        existing_po.metadata_ = {
+            **po_meta,
+            "source_inward_order_id": str(order_id),
+            "last_release_kg": str(po_qty),
+        }
+        existing_po.status = "PLANNED"
+        repo.db.flush()
         return mes_core_entities.get_production_order(
             db, tenant, existing_po.production_order_id
         )
@@ -1463,7 +2153,7 @@ def _ensure_production_order_for_inward(
         ProductionOrderCreate(
             production_order_code=po_code,
             order_line_id=finished_line_id,
-            planned_quantity=line_qty,
+            planned_quantity=po_qty,
             status="PLANNED",
         ),
     )
@@ -1554,7 +2244,8 @@ def create_raw_material_inward(
         "flow": "RAW_MATERIAL_INWARD",
         "raw_product_id": str(payload.product_id),
     }
-    repo.db.flush()
+    repo.db.commit()
+    repo.db.refresh(order_row)
     po_out = None
     if payload.create_production_order:
         po_out = _ensure_production_order_for_inward(
@@ -1605,10 +2296,77 @@ def _raw_material_qc_from_order(
         moisture_pct=qc.get("moisture_pct"),
         ash_pct=qc.get("ash_pct"),
         foreign_matter_pct=qc.get("foreign_matter_pct"),
+        stones_kg=qc.get("stones_kg"),
+        unburnt_kg=qc.get("unburnt_kg"),
+        minus20_kg=qc.get("minus20_kg"),
         operator_remarks=qc.get("operator_remarks"),
         qc_status=qc.get("qc_status") or "PENDING",
         qc_at=qc.get("qc_at"),
     )
+
+
+def _stage_inward_qc_triples(
+    db: Session,
+    tenant: TenantContext,
+    order: CustomerOrder,
+    qc_payload: dict,
+) -> None:
+    """Materialize inward QC impurity capture into kg.triple_store_staging (triplet ontology)."""
+    subject = f"urn:nyra:ac:inward:{order.order_code}"
+    source_id = order.customer_order_id
+    mes_core_entities.create_triple(
+        db,
+        tenant,
+        TripleCreate(
+            subject_uri=subject,
+            predicate_uri="urn:nyra:predicate:tested_by",
+            object_uri=f"urn:nyra:ac:rawMaterialQc:{order.order_code}",
+            source_table="trn.customer_order",
+            source_id=source_id,
+        ),
+    )
+    literal_triples = (
+        ("stones_kg", "urn:nyra:hasStonesKg"),
+        ("unburnt_kg", "urn:nyra:hasUnburntKg"),
+        ("minus20_kg", "urn:nyra:hasMinus20Kg"),
+    )
+    for field, predicate in literal_triples:
+        value = qc_payload.get(field)
+        if value is None:
+            continue
+        mes_core_entities.create_triple(
+            db,
+            tenant,
+            TripleCreate(
+                subject_uri=subject,
+                predicate_uri=predicate,
+                object_literal=str(value),
+                object_datatype="http://www.w3.org/2001/XMLSchema#decimal",
+                source_table="trn.customer_order",
+                source_id=source_id,
+            ),
+        )
+    for field, param_uri in (
+        ("moisture_pct", "urn:nyra:ac:parameter:MOISTURE_PCT"),
+        ("ash_pct", "urn:nyra:ac:parameter:ASH_PCT"),
+        ("foreign_matter_pct", "urn:nyra:ac:parameter:FOREIGN_MATTER_PCT"),
+    ):
+        value = qc_payload.get(field)
+        if value is None:
+            continue
+        mes_core_entities.create_triple(
+            db,
+            tenant,
+            TripleCreate(
+                subject_uri=subject,
+                predicate_uri="urn:nyra:predicate:captures",
+                object_uri=param_uri,
+                object_literal=str(value),
+                object_datatype="http://www.w3.org/2001/XMLSchema#decimal",
+                source_table="trn.customer_order",
+                source_id=source_id,
+            ),
+        )
 
 
 def list_raw_material_qc(
@@ -1637,7 +2395,11 @@ def create_raw_material_qc(
             f"Order '{order.order_code}' has no raw material line for QC"
         )
     prior_status = str(existing.qc_status or "PENDING").upper()
-    if prior_status in ("PASS", "FAIL", "QC_PASSED", "QC_FAILED"):
+    if ac_stock.qc_status_passed(prior_status) or prior_status in (
+        "FAIL",
+        "QC_FAILED",
+        "REJECTED",
+    ):
         raise ValidationError(
             f"Order '{order.order_code}' already has QC status {prior_status} — "
             "select a pending inward order instead."
@@ -1650,23 +2412,29 @@ def create_raw_material_qc(
             return float(value)
         return value
 
-    meta["raw_material_qc"] = {
+    qc_payload = {
         k: _json_val(v)
         for k, v in {
             "moisture_pct": payload.moisture_pct,
             "ash_pct": payload.ash_pct,
             "foreign_matter_pct": payload.foreign_matter_pct,
+            "stones_kg": payload.stones_kg,
+            "unburnt_kg": payload.unburnt_kg,
+            "minus20_kg": payload.minus20_kg,
             "operator_remarks": payload.operator_remarks,
             "qc_status": (payload.qc_status or "PASS").upper(),
             "qc_at": datetime.now(timezone.utc).isoformat(),
         }.items()
         if v is not None
     }
+    meta["raw_material_qc"] = qc_payload
     order.metadata_ = meta
-    if meta["raw_material_qc"].get("qc_status") == "PASS":
+    saved_qc_status = str(meta["raw_material_qc"].get("qc_status") or "").upper()
+    if ac_stock.qc_status_passed(saved_qc_status):
         order.status = "QC_PASSED"
-    elif meta["raw_material_qc"].get("qc_status") == "FAIL":
+    elif saved_qc_status in ("FAIL", "QC_FAILED", "REJECTED"):
         order.status = "QC_FAILED"
+    _stage_inward_qc_triples(db, tenant, order, qc_payload)
     repo.db.commit()
     repo.db.refresh(order)
     row = _raw_material_qc_from_order(db, tenant, order)
@@ -1677,6 +2445,50 @@ def create_raw_material_qc(
 def create_kiln_feed_lot(
     db: Session, tenant: TenantContext, payload: AcKilnFeedLotCreate
 ) -> ProductionLotOut:
+    repo = _repo(db, tenant)
+
+    lot = None
+    if payload.production_lot_id is not None:
+        lot = repo.get_by_pk(
+            ProductionLot, ProductionLot.production_lot_id, payload.production_lot_id
+        )
+    elif payload.lot_code:
+        lot = repo.get_by_code(
+            ProductionLot, ProductionLot.lot_code, payload.lot_code.strip()
+        )
+
+    if lot is not None:
+        lot_status = (lot.status or "").upper()
+        if lot_status not in ("CREATED",):
+            raise WorkflowError(
+                f"Lot '{lot.lot_code}' is already charged or in progress (status: {lot.status})"
+            )
+        if not is_ready_for_scheduling(db, tenant, lot.lot_code):
+            raise WorkflowError(
+                "Feasibility Gate must pass before charging the kiln — "
+                f"run feasibility for lot '{lot.lot_code}' first"
+            )
+        if payload.lot_quantity is not None:
+            lot.lot_quantity = payload.lot_quantity
+        lot.status = payload.status or "IN_PROGRESS"
+        if payload.kiln_resource_code:
+            _create_process_execution(
+                db,
+                tenant,
+                lot.production_lot_id,
+                "ACTIVATION",
+                {"kiln_resource_code": payload.kiln_resource_code, "feed_recorded": True},
+            )
+        repo.db.commit()
+        repo.db.refresh(lot)
+        return mes_core_entities.get_production_lot(db, tenant, lot.production_lot_id)
+
+    if payload.production_order_id is None or payload.lot_quantity is None:
+        raise ValidationError(
+            "production_order_id and lot_quantity are required when production_lot_id "
+            "or lot_code is omitted"
+        )
+
     lot_code = resolve_ac_business_code(
         db, provided=payload.lot_code, entity="ac_production_lot"
     )
@@ -1691,6 +2503,11 @@ def create_kiln_feed_lot(
         ),
     )
     if payload.kiln_resource_code:
+        if not is_ready_for_scheduling(db, tenant, lot.lot_code):
+            raise WorkflowError(
+                "Feasibility Gate must pass before charging the kiln — "
+                f"run feasibility for lot '{lot.lot_code}' first"
+            )
         _create_process_execution(
             db,
             tenant,
@@ -1725,6 +2542,8 @@ def create_kiln_parameters(
 def create_screening_record(
     db: Session, tenant: TenantContext, payload: AcScreeningCreate
 ) -> OperationExecutionOut:
+    from app.services.industry.activated_carbon import stock as ac_stock
+
     meta = {
         k: v
         for k, v in {
@@ -1735,9 +2554,21 @@ def create_screening_record(
         }.items()
         if v is not None
     }
-    return _create_process_execution(
+    result = _create_process_execution(
         db, tenant, payload.production_lot_id, "SCREENING", meta
     )
+    repo = _repo(db, tenant)
+    lot = repo.get_by_pk(
+        ProductionLot, ProductionLot.production_lot_id, payload.production_lot_id
+    )
+    lot_meta = lot.metadata_ if isinstance(lot.metadata_, dict) else {}
+    lot.metadata_ = {
+        **lot_meta,
+        "screening_recorded_at": datetime.now(timezone.utc).isoformat(),
+    }
+    repo.db.flush()
+    ac_stock.try_stock_lot_after_pipeline(db, tenant, payload.production_lot_id)
+    return result
 
 
 def create_quality_test(
@@ -1786,6 +2617,12 @@ def create_quality_test(
         )
     repo.db.commit()
     repo.db.refresh(check_row)
-    if ac_stock.qc_status_passed(qc_status):
-        ac_stock.stock_lot_after_final_qc(db, tenant, payload.production_lot_id)
+    disposition = qc_status
+    if disposition in ("FAIL", "FAILED", "REJECT", "REJECTED", "SCRAP", "SCRAPPED", "HOLD"):
+        if disposition != "HOLD":
+            ac_stock.scrap_lot_after_qc(
+                db, tenant, payload.production_lot_id, reason=disposition
+            )
+    elif ac_stock.qc_status_passed(qc_status):
+        ac_stock.try_stock_lot_after_pipeline(db, tenant, payload.production_lot_id)
     return QualityCheckOut.model_validate(check_row)

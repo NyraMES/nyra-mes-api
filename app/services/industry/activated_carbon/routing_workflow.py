@@ -84,9 +84,12 @@ def get_lot_routing_plan(db: Session, tenant: TenantContext, lot_code: str) -> d
     )
     wo_by_op: dict = {}
     for ex in existing_rows:
-        if not _is_schedule_row(ex):
+        rid = ex.routing_operation_id
+        if rid not in wo_by_op:
+            wo_by_op[rid] = ex
             continue
-        wo_by_op[ex.routing_operation_id] = ex
+        if _is_schedule_row(ex) and not _is_schedule_row(wo_by_op[rid]):
+            wo_by_op[rid] = ex
 
     plan_ops = []
     generated_count = 0
@@ -158,9 +161,16 @@ def generate_lot_route(db: Session, tenant: TenantContext, lot_code: str) -> dic
         .filter(OperationExecution.production_lot_id == lot.production_lot_id)
         .all()
     )
-    by_op = {
-        ex.routing_operation_id: ex for ex in existing if _is_schedule_row(ex)
-    }
+    # Include kiln-feed / process captures — not only schedule-flagged rows — so we do
+    # not insert a second execution for the same routing_operation_id (e.g. ACTIVATION).
+    by_op: dict = {}
+    for ex in existing:
+        rid = ex.routing_operation_id
+        if rid not in by_op:
+            by_op[rid] = ex
+            continue
+        if _is_schedule_row(ex) and not _is_schedule_row(by_op[rid]):
+            by_op[rid] = ex
 
     created = []
     for op in operations:
@@ -199,9 +209,10 @@ def generate_lot_route(db: Session, tenant: TenantContext, lot_code: str) -> dic
         repo.db.commit()
     except Exception as exc:
         repo.db.rollback()
+        detail = str(getattr(getattr(exc, "orig", None), "pgerror", None) or exc)
         raise WorkflowError(
             f"Could not save work orders for lot '{lot_code}'",
-            details={"error": str(exc)},
+            details={"error": detail},
         ) from exc
     feasibility = run_feasibility_check(db, tenant, lot_code)
     return {

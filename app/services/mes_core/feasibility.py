@@ -37,6 +37,17 @@ _WARNING = "WARNING"
 _READY_STATUSES = frozenset({"OK", "READY", "PASSED"})
 _SCHEDULE_META_FLAG = "is_production_schedule"
 _DEFAULT_SLOT_MINUTES = 60.0
+# Lots past shop-floor routing should not hold kiln schedule slots in feasibility.
+_ROUTING_DONE_LOT_STATUSES = frozenset(
+    {
+        "QC_PENDING",
+        "STOCKED",
+        "COMPLETED",
+        "DISPATCHED",
+        "CLOSED",
+        "CANCELLED",
+    }
+)
 
 
 def is_ready_for_scheduling(db: Session, tenant: TenantContext, lot_code: str) -> bool:
@@ -132,16 +143,14 @@ def _existing_schedule_intervals(
         meta = row.metadata_ if isinstance(row.metadata_, dict) else {}
         if meta.get("resources_released"):
             continue
+        if (row.status or "").upper() == "COMPLETED":
+            continue
         lot = (
             repo.query(ProductionLot)
             .filter(ProductionLot.production_lot_id == row.production_lot_id)
             .first()
         )
-        if lot and (lot.status or "").upper() in (
-            "COMPLETED",
-            "DISPATCHED",
-            "CLOSED",
-        ):
+        if lot and (lot.status or "").upper() in _ROUTING_DONE_LOT_STATUSES:
             continue
         machine_code = (meta.get("assigned_machine_code") or "").strip()
         if not machine_code:
@@ -703,7 +712,7 @@ def run_feasibility_check(
     lot = repo.get_by_code(ProductionLot, ProductionLot.lot_code, lot_code)
     checks, summary = _run_checks(repo, lot)
 
-    overall = _BLOCKED if any(c.status == _BLOCKED for c in checks) else "READY"
+    stored_status = _BLOCKED if any(c.status == _BLOCKED for c in checks) else _OK
     blocked_parts: List[str] = []
     seen_types: set[str] = set()
     for check in checks:
@@ -738,7 +747,7 @@ def run_feasibility_check(
         FeasibilityCheck(
             check_code=code,
             production_lot_id=lot.production_lot_id,
-            overall_status=overall,
+            overall_status=stored_status,
             checked_at=checked_at,
             metadata_=metadata,
         )
@@ -747,7 +756,7 @@ def run_feasibility_check(
 
     return FeasibilityResponse(
         lot_id=lot_code,
-        overall_status=overall,
+        overall_status=stored_status,
         material_status=summary.get("material"),
         machine_status=summary.get("machine"),
         tool_status=summary.get("tool"),

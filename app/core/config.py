@@ -110,6 +110,12 @@ class Settings:
     mes_core_db_name: str = os.getenv("MES_CORE_DB_NAME", "nyra_mes_core")
     mes_core_db_user: str = os.getenv("MES_CORE_DB_USER", "").strip()
     mes_core_db_password: str = os.getenv("MES_CORE_DB_PASSWORD", "")
+    # RDS Secrets Manager secret name or ARN (preferred on testbed; see mes_core_credentials.py).
+    mes_core_db_secret_id: str = os.getenv("MES_CORE_DB_SECRET_ID", "").strip()
+    mes_core_aws_region: str = os.getenv(
+        "MES_CORE_AWS_REGION",
+        os.getenv("AWS_REGION", os.getenv("COGNITO_REGION", "eu-north-1")),
+    ).strip()
     # Until login resolves tenant from JWT, default to the demo tenant seed.
     default_tenant_code: str = os.getenv("DEFAULT_TENANT_CODE", "AUTO_OEM_DEMO")
 

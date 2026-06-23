@@ -27,16 +27,23 @@ from app.schemas.mes_core.schemas import (
     AcQualityTestCreate,
     AcCustomerSalesOrderCreate,
     AcCustomerSalesOrderCreateResponse,
+    AcDispatchFromOrderCreate,
+    AcDispatchFromOrderResponse,
+    AcGradeStockOut,
+    AcOpenCustomerOrderOut,
+    AcStockedLotOut,
     AcDeliveryCommitmentOut,
     AcFinishedGoodsStockOut,
     AcMakeToStockCreate,
     AcMakeToStockCreateResponse,
+    AcOpenLotOut,
     AcRawMaterialInwardCreate,
     AcRawMaterialInwardCreateResponse,
     AcRawMaterialQcCreate,
     AcRawMaterialQcOut,
     AcRawMaterialTypeCreate,
     AcRawMaterialTypeOut,
+    AcRawMaterialTypeUpdate,
     AcScreeningCreate,
     ActivatedCarbonYieldSummaryOut,
     CustomerCreate,
@@ -109,6 +116,18 @@ def ac_dashboard(
     tenant: TenantContext = Depends(_AC_MASTERS),
 ):
     return ac_adapter.get_dashboard_summary(db, tenant)
+
+
+@router.get(
+    "/open-lots",
+    response_model=List[AcOpenLotOut],
+    summary="Open production lots for feasibility, kiln feed, and routing",
+)
+def ac_open_lots(
+    db: Session = Depends(get_mes_core_db),
+    tenant: TenantContext = Depends(_AC_MASTERS),
+):
+    return ac_adapter.list_open_production_lots(db, tenant)
 
 
 @router.get(
@@ -292,6 +311,40 @@ def ac_create_raw_material_type(
 
 
 @router.get(
+    "/masters/raw-material-types/{product_id}",
+    response_model=AcRawMaterialTypeOut,
+    summary="Single raw material type with linked routing",
+)
+def ac_get_raw_material_type(
+    product_id: UUID,
+    db: Session = Depends(get_mes_core_db),
+    tenant: TenantContext = Depends(_AC_MASTERS),
+):
+    return ac_raw_material_types.get_raw_material_type(db, tenant, product_id)
+
+
+@router.put(
+    "/masters/raw-material-types/{product_id}",
+    response_model=AcRawMaterialTypeOut,
+    summary="Update raw material type routing and parameters",
+)
+def ac_update_raw_material_type(
+    product_id: UUID,
+    payload: AcRawMaterialTypeUpdate,
+    db: Session = Depends(get_mes_core_db),
+    tenant: TenantContext = Depends(_AC_MASTERS),
+):
+    try:
+        return ac_raw_material_types.update_raw_material_type(
+            db, tenant, product_id, payload
+        )
+    except ValidationError:
+        raise
+    except Exception as exc:
+        raise ValidationError(str(exc)) from exc
+
+
+@router.get(
     "/dispatches",
     response_model=List[DispatchOut],
     summary="Dispatch history for Activated Carbon",
@@ -431,6 +484,61 @@ def create_customer_sales_order(
     tenant: TenantContext = Depends(_AC_MASTERS),
 ):
     return ac_adapter.create_customer_sales_order(db, tenant, payload)
+
+
+@router.get(
+    "/customer-sales-orders",
+    response_model=List[AcOpenCustomerOrderOut],
+    summary="Open customer POs eligible for dispatch",
+)
+def list_open_customer_sales_orders(
+    db: Session = Depends(get_mes_core_db),
+    tenant: TenantContext = Depends(_AC_MASTERS),
+):
+    return ac_adapter.list_open_customer_sales_orders(db, tenant)
+
+
+@router.get(
+    "/grade-stock",
+    response_model=List[AcGradeStockOut],
+    summary="Grade-wise finished goods stock on hand",
+)
+def list_grade_stock(
+    db: Session = Depends(get_mes_core_db),
+    tenant: TenantContext = Depends(_AC_MASTERS),
+):
+    return ac_adapter.list_grade_wise_stock(db, tenant)
+
+
+@router.get(
+    "/stocked-lots",
+    response_model=List[AcStockedLotOut],
+    summary="Stocked production lots available for dispatch",
+)
+def list_stocked_lots(
+    db: Session = Depends(get_mes_core_db),
+    tenant: TenantContext = Depends(_AC_MASTERS),
+):
+    return ac_adapter.list_stocked_lots_for_dispatch(db, tenant)
+
+
+@router.post(
+    "/dispatch-from-order",
+    response_model=AcDispatchFromOrderResponse,
+    status_code=status.HTTP_201_CREATED,
+    summary="Ship against a customer PO from in-stock lots by grade",
+)
+def create_dispatch_from_order(
+    payload: AcDispatchFromOrderCreate,
+    db: Session = Depends(get_mes_core_db),
+    tenant: TenantContext = Depends(_AC_MASTERS),
+):
+    try:
+        return ac_adapter.create_ac_dispatch_from_order(db, tenant, payload)
+    except ValidationError:
+        raise
+    except WorkflowError as exc:
+        raise ValidationError(str(exc)) from exc
 
 
 @router.post(

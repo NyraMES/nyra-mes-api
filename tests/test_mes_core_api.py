@@ -20,7 +20,9 @@ from app.db.mes_core_database import get_mes_core_engine
 
 
 def mes_core_db_reachable() -> bool:
-    if not settings.mes_core_enabled or not settings.mes_core_db_password:
+    if not settings.mes_core_enabled:
+        return False
+    if not settings.mes_core_db_password and not settings.mes_core_db_secret_id:
         return False
     try:
         engine = get_mes_core_engine()
@@ -39,7 +41,7 @@ requires_mes_core = pytest.mark.skipif(
     not mes_core_db_reachable(),
     reason=(
         "nyra_mes_core unreachable — set MES_CORE_ENABLED=true and "
-        "MES_CORE_DB_PASSWORD in .env"
+        "MES_CORE_DB_SECRET_ID or MES_CORE_DB_PASSWORD in .env"
     ),
 )
 

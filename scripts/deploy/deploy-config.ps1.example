@@ -1,0 +1,11 @@
+# Copy to deploy-config.ps1 and set paths for your machine.
+# deploy-config.ps1 is gitignored — do not commit keys or host overrides.
+
+$TestbedHost = "51.20.17.160"
+$TestbedUser = "ubuntu"
+$SshKeyPath = "D:\path\to\nyraservices.pem"
+
+# Remote paths on testbed EC2
+$RemoteApiDir = "/home/ubuntu/nyra-mes-api"
+$RemoteUiDir = "/var/www/nyraservices-testbed/mes"
+$RemoteApiService = "nyra-mes-api"

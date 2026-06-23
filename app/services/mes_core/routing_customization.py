@@ -27,6 +27,7 @@ from app.schemas.mes_core.schemas import (
     RoutingOperationDetailOut,
     RoutingOperationParameterCreate,
     RoutingOperationParameterOut,
+    RoutingOperationParameterUpdate,
     RoutingOperationSequencePatch,
     RoutingOperationUpdateRequest,
 )
@@ -126,9 +127,32 @@ def _requirements_by_operation(
     return grouped
 
 
+def _parameters_by_operation(
+    repo: TenantRepository, operation_ids: list
+) -> dict:
+    if not operation_ids:
+        return {}
+    rows = (
+        repo.query_workspace_strict(RoutingOperationParameter)
+        .filter(
+            RoutingOperationParameter.routing_operation_id.in_(operation_ids),
+            RoutingOperationParameter.is_active.is_(True),
+        )
+        .order_by(RoutingOperationParameter.display_order.nulls_last())
+        .all()
+    )
+    grouped: dict = {}
+    for row in rows:
+        grouped.setdefault(row.routing_operation_id, []).append(
+            RoutingOperationParameterOut.model_validate(row)
+        )
+    return grouped
+
+
 def _operation_detail(
     row: RoutingOperation,
     requirements: Optional[list[OperationResourceRequirementOut]] = None,
+    parameters: Optional[list[RoutingOperationParameterOut]] = None,
 ) -> RoutingOperationDetailOut:
     seq = row.operation_seq if row.operation_seq is not None else row.operation_sequence
     meta = row.metadata_ if isinstance(row.metadata_, dict) else {}
@@ -150,6 +174,7 @@ def _operation_detail(
         source_template_operation_code=row.source_template_operation_code,
         process_id=meta.get("process_step") or meta.get("process_id"),
         resource_requirements=requirements or [],
+        parameters=parameters or [],
     )
 
 
@@ -171,9 +196,9 @@ def _routing_detail(
         .order_by(RoutingOperation.operation_sequence)
         .all()
     )
-    req_map = _requirements_by_operation(
-        repo, [o.routing_operation_id for o in ops]
-    )
+    op_ids = [o.routing_operation_id for o in ops]
+    req_map = _requirements_by_operation(repo, op_ids)
+    param_map = _parameters_by_operation(repo, op_ids)
     return ActiveRoutingOut(
         routing_id=routing.routing_id,
         tenant_id=routing.tenant_id,
@@ -189,7 +214,12 @@ def _routing_detail(
         is_template_copy=bool(routing.is_template_copy),
         is_customized=bool(routing.is_customized),
         operations=[
-            _operation_detail(o, req_map.get(o.routing_operation_id, [])) for o in ops
+            _operation_detail(
+                o,
+                req_map.get(o.routing_operation_id, []),
+                param_map.get(o.routing_operation_id, []),
+            )
+            for o in ops
         ],
     )
 
@@ -535,6 +565,79 @@ def add_operation_parameter(
     repo.db.commit()
     repo.db.refresh(row)
     return RoutingOperationParameterOut.model_validate(row)
+
+
+def update_operation_parameter(
+    db: Session,
+    tenant: TenantContext,
+    operation_id: UUID,
+    parameter_id: UUID,
+    payload: RoutingOperationParameterUpdate,
+) -> RoutingOperationParameterOut:
+    _ensure_routing_customization_allowed(tenant)
+    op, routing = _get_mutable_operation(db, tenant, operation_id)
+    repo = _repo(db, tenant)
+    row = (
+        repo.query_workspace_strict(RoutingOperationParameter)
+        .filter(
+            RoutingOperationParameter.id == parameter_id,
+            RoutingOperationParameter.routing_operation_id == operation_id,
+            RoutingOperationParameter.is_active.is_(True),
+        )
+        .first()
+    )
+    if not row:
+        raise NotFoundError(f"Parameter '{parameter_id}' not found on operation '{operation_id}'")
+
+    if payload.parameter_name is not None:
+        row.parameter_name = payload.parameter_name
+    if payload.data_type is not None:
+        row.data_type = payload.data_type
+    if payload.unit is not None:
+        row.unit = payload.unit
+    if payload.min_value is not None:
+        row.min_value = payload.min_value
+    if payload.max_value is not None:
+        row.max_value = payload.max_value
+    if payload.is_mandatory is not None:
+        row.is_mandatory = payload.is_mandatory
+    if payload.reading_frequency is not None:
+        row.reading_frequency = payload.reading_frequency
+    if payload.display_order is not None:
+        row.display_order = payload.display_order
+
+    op.is_customized = True
+    routing.is_customized = True
+    repo.db.commit()
+    repo.db.refresh(row)
+    return RoutingOperationParameterOut.model_validate(row)
+
+
+def delete_operation_parameter(
+    db: Session,
+    tenant: TenantContext,
+    operation_id: UUID,
+    parameter_id: UUID,
+) -> None:
+    _ensure_routing_customization_allowed(tenant)
+    op, routing = _get_mutable_operation(db, tenant, operation_id)
+    repo = _repo(db, tenant)
+    row = (
+        repo.query_workspace_strict(RoutingOperationParameter)
+        .filter(
+            RoutingOperationParameter.id == parameter_id,
+            RoutingOperationParameter.routing_operation_id == operation_id,
+            RoutingOperationParameter.is_active.is_(True),
+        )
+        .first()
+    )
+    if not row:
+        raise NotFoundError(f"Parameter '{parameter_id}' not found on operation '{operation_id}'")
+
+    row.is_active = False
+    op.is_customized = True
+    routing.is_customized = True
+    repo.db.commit()
 
 
 def list_operation_parameters(

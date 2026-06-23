@@ -24,8 +24,8 @@ KILN_PARAMETER_DEFINITIONS: list[AcKilnParameterDefinition] = [
 AC_PROCESS_FLOW: list[tuple[int, str, str, str | None]] = [
     (1, "Raw Material Inward", "raw-material-inward", "AC_RAW_MATERIAL_INWARD"),
     (2, "Raw Material QC", "raw-material-qc", "AC_RAW_MATERIAL_QC"),
-    (3, "Kiln Feed", "kiln-feed", "AC_KILN_FEED"),
-    (4, "Feasibility Gate", "feasibility", None),
+    (3, "Feasibility Gate", "feasibility", None),
+    (4, "Kiln Feed", "kiln-feed", "AC_KILN_FEED"),
     (5, "Lot Routing", "routing", None),
     (6, "Execution", "execution", None),
     (7, "Kiln Parameters", "kiln-parameters", "AC_HOURLY_KILN_PARAMETERS"),

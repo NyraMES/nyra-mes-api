@@ -74,7 +74,12 @@ def _param_from_process_def(defn: dict) -> dict[str, Any]:
     code = key
     default = defn.get("default_value")
     data_type = "number"
-    if default is not None and str(default).strip():
+    object_datatype = defn.get("object_datatype") or ""
+    if "string" in object_datatype:
+        data_type = "text"
+    elif "boolean" in object_datatype:
+        data_type = "boolean"
+    elif default is not None and str(default).strip():
         try:
             float(str(default))
         except ValueError:
@@ -88,6 +93,10 @@ def _param_from_process_def(defn: dict) -> dict[str, Any]:
         "default_value": default,
         "display_order": defn.get("display_order"),
         "source": "raw_material_type",
+        "subject_uri_template": defn.get("subject_uri_template"),
+        "predicate_uri": defn.get("predicate_uri"),
+        "object_datatype": defn.get("object_datatype"),
+        "ontology_predicate": defn.get("ontology_predicate"),
     }
 
 

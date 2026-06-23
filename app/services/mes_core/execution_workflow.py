@@ -277,11 +277,13 @@ def lot_execution_summary(
         CustomerOrder.customer_order_id,
         line.order_id,
     )
-    customer = repo.get_by_pk(
-        Customer,
-        Customer.customer_id,
-        order.customer_id,
-    )
+    customer = None
+    if order.customer_id is not None:
+        customer = repo.get_by_pk(
+            Customer,
+            Customer.customer_id,
+            order.customer_id,
+        )
 
     executions = (
         repo.query(OperationExecution)
@@ -379,7 +381,7 @@ def lot_execution_summary(
         "lot_quantity": float(lot.lot_quantity),
         "production_order_id": po.production_order_code,
         "customer_order_id": order.order_code,
-        "customer_id": customer.customer_code,
+        "customer_id": customer.customer_code if customer else None,
         "part_id": product.product_code,
         "part_name": product.product_name,
         "operations_total": total,

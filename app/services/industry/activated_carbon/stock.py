@@ -17,6 +17,7 @@ from app.models.mes_core import (
     Product,
     ProductionLot,
     ProductionOrder,
+    QualityCheck,
     Routing,
     RoutingOperation,
 )
@@ -64,6 +65,30 @@ def add_fg_stock_kg(
     return updated
 
 
+def deduct_fg_stock_kg(
+    db: Session, tenant: TenantContext, product_id: UUID, qty_kg: Decimal
+) -> Decimal:
+    from app.core.exceptions import ValidationError
+
+    repo = _repo(db, tenant)
+    product = repo.get_by_pk(Product, Product.product_id, product_id)
+    meta = dict(_product_meta(product))
+    current = Decimal(str(meta.get(FG_STOCK_KEY) or 0))
+    qty = Decimal(str(qty_kg))
+    if qty <= 0:
+        raise ValidationError("Dispatch quantity must be greater than zero")
+    if qty > current:
+        raise ValidationError(
+            f"Insufficient finished-goods stock for {product.product_code}: "
+            f"available {current} KG, requested {qty} KG"
+        )
+    updated = current - qty
+    meta[FG_STOCK_KEY] = str(updated)
+    product.metadata_ = meta
+    repo.db.flush()
+    return updated
+
+
 def _lot_finished_product_id(
     db: Session, tenant: TenantContext, lot: ProductionLot
 ) -> Optional[UUID]:
@@ -78,16 +103,135 @@ def _lot_finished_product_id(
 
 
 def _lot_executions_complete(db: Session, tenant: TenantContext, lot_id: UUID) -> bool:
+    repo = _repo(db, tenant)
+    lot = repo.get_by_pk(ProductionLot, ProductionLot.production_lot_id, lot_id)
+    lot_meta = lot.metadata_ if isinstance(lot.metadata_, dict) else {}
+    if lot_meta.get("routing_complete_at"):
+        return True
+
+    rows = (
+        repo.query(OperationExecution)
+        .filter(OperationExecution.production_lot_id == lot_id)
+        .all()
+    )
+    work_orders = [r for r in rows if _is_schedule_row(r)]
+    if not work_orders:
+        st = (lot.status or "").upper()
+        return st in ("QC_PENDING", "COMPLETED", "STOCKED")
+    return all((r.status or "").upper() == "COMPLETED" for r in work_orders)
+
+
+def lot_routing_complete(db: Session, tenant: TenantContext, lot_id: UUID) -> bool:
+    """True when shop-floor routing is done (schedule ops and/or lot metadata)."""
+    return _lot_executions_complete(db, tenant, lot_id)
+
+
+def _execution_meta(row: OperationExecution) -> dict:
+    return row.metadata_ if isinstance(row.metadata_, dict) else {}
+
+
+def lot_has_screening(db: Session, tenant: TenantContext, lot_id: UUID) -> bool:
     rows = (
         _repo(db, tenant)
         .query(OperationExecution)
         .filter(OperationExecution.production_lot_id == lot_id)
         .all()
     )
-    work_orders = [r for r in rows if _is_schedule_row(r)]
-    if not work_orders:
-        return False
-    return all((r.status or "").upper() == "COMPLETED" for r in work_orders)
+    return any(_execution_meta(row).get("process_step") == "SCREENING" for row in rows)
+
+
+def lot_has_passed_final_qc(db: Session, tenant: TenantContext, lot_id: UUID) -> bool:
+    checks = (
+        _repo(db, tenant)
+        .query(QualityCheck)
+        .filter(QualityCheck.production_lot_id == lot_id)
+        .all()
+    )
+    return any(qc_status_passed(check.status) for check in checks)
+
+
+def try_stock_lot_after_pipeline(
+    db: Session, tenant: TenantContext, production_lot_id: UUID
+) -> Optional[Decimal]:
+    """Move lot to finished-goods stock once routing, screening, and final QC are complete."""
+    repo = _repo(db, tenant)
+    lot = repo.get_by_pk(ProductionLot, ProductionLot.production_lot_id, production_lot_id)
+    lot_meta = lot.metadata_ if isinstance(lot.metadata_, dict) else {}
+    if lot_meta.get("fg_stocked") or (lot.status or "").upper() == "STOCKED":
+        return Decimal(str(lot_meta.get("fg_stock_kg_added") or 0))
+
+    if not lot_routing_complete(db, tenant, production_lot_id):
+        return None
+    if not lot_has_screening(db, tenant, production_lot_id):
+        return None
+    if not lot_has_passed_final_qc(db, tenant, production_lot_id):
+        return None
+    return stock_lot_after_final_qc(db, tenant, production_lot_id)
+
+
+def reconcile_pending_stocked_lots(db: Session, tenant: TenantContext) -> int:
+    """Release lots that passed QC + screening but were never stocked (e.g. pipeline fix)."""
+    repo = _repo(db, tenant)
+    released = 0
+    for lot in repo.query(ProductionLot).all():
+        st = (lot.status or "").upper()
+        if st in ("STOCKED", "DISPATCHED", "SCRAPPED", "CLOSED", "CANCELLED"):
+            continue
+        lot_meta = lot.metadata_ if isinstance(lot.metadata_, dict) else {}
+        if lot_meta.get("fg_stocked"):
+            continue
+        if not lot_has_passed_final_qc(db, tenant, lot.production_lot_id):
+            continue
+        if not lot_has_screening(db, tenant, lot.production_lot_id):
+            continue
+        if not lot_routing_complete(db, tenant, lot.production_lot_id):
+            continue
+        if try_stock_lot_after_pipeline(db, tenant, lot.production_lot_id) is not None:
+            released += 1
+    return released
+
+
+def scrap_lot_after_qc(
+    db: Session, tenant: TenantContext, production_lot_id: UUID, *, reason: Optional[str] = None
+) -> None:
+    repo = _repo(db, tenant)
+    lot = repo.get_by_pk(ProductionLot, ProductionLot.production_lot_id, production_lot_id)
+    lot_meta = lot.metadata_ if isinstance(lot.metadata_, dict) else {}
+    now = datetime.now(timezone.utc).isoformat()
+    release_lot_schedule_resources(db, tenant, production_lot_id)
+    lot.status = "SCRAPPED"
+    lot.metadata_ = {
+        **lot_meta,
+        "scrapped_at": now,
+        "scrap_reason": reason or "final_qc_reject",
+    }
+    repo.db.commit()
+
+
+def release_lot_to_stock(
+    db: Session, tenant: TenantContext, production_lot_id: UUID
+) -> Decimal:
+    """Explicit release after final QC — validates pipeline gates."""
+    from app.core.exceptions import ValidationError
+
+    if not lot_routing_complete(db, tenant, production_lot_id):
+        raise ValidationError(
+            "Shop-floor execution is not complete — finish all routing steps first."
+        )
+    if not lot_has_screening(db, tenant, production_lot_id):
+        raise ValidationError("Screening is not recorded for this lot.")
+    if not lot_has_passed_final_qc(db, tenant, production_lot_id):
+        raise ValidationError("Final quality check must pass before release to stock.")
+    qty = try_stock_lot_after_pipeline(db, tenant, production_lot_id)
+    if qty is None:
+        lot = _repo(db, tenant).get_by_pk(
+            ProductionLot, ProductionLot.production_lot_id, production_lot_id
+        )
+        lot_meta = lot.metadata_ if isinstance(lot.metadata_, dict) else {}
+        if lot_meta.get("fg_stocked"):
+            return Decimal(str(lot_meta.get("fg_stock_kg_added") or 0))
+        raise ValidationError("Lot could not be released to stock.")
+    return qty
 
 
 def after_execution_completed(
@@ -114,12 +258,16 @@ def after_execution_completed(
 
     if _lot_executions_complete(db, tenant, lot.production_lot_id):
         lot_meta = lot.metadata_ if isinstance(lot.metadata_, dict) else {}
-        lot.status = "QC_PENDING"
         lot.metadata_ = {
             **lot_meta,
             "routing_complete_at": datetime.now(timezone.utc).isoformat(),
         }
+        lot.status = "QC_PENDING"
         release_lot_schedule_resources(db, tenant, lot.production_lot_id)
+        try_stock_lot_after_pipeline(db, tenant, lot.production_lot_id)
+        repo.db.commit()
+        return
+
     repo.db.commit()
 
 
@@ -141,12 +289,18 @@ def stock_lot_after_final_qc(
     *,
     quantity_kg: Optional[Decimal] = None,
 ) -> Optional[Decimal]:
-    """Move a QC-passed lot into finished-goods stock (once per lot)."""
+    """Move a QC-passed lot into finished-goods stock (once per lot).
+
+    Clears kiln/labor schedule holds so the lot is dispatch-ready and resources
+    can be booked for the next production run.
+    """
     repo = _repo(db, tenant)
     lot = repo.get_by_pk(ProductionLot, ProductionLot.production_lot_id, production_lot_id)
     lot_meta = lot.metadata_ if isinstance(lot.metadata_, dict) else {}
     if lot_meta.get("fg_stocked"):
         return Decimal(str(lot_meta.get("fg_stock_kg_added") or 0))
+
+    release_lot_schedule_resources(db, tenant, production_lot_id)
 
     product_id = _lot_finished_product_id(db, tenant, lot)
     if not product_id:
@@ -262,9 +416,8 @@ def available_raw_material_kg(db: Session, tenant: TenantContext) -> Decimal:
         if meta.get("flow") != "RAW_MATERIAL_INWARD":
             continue
         qc = meta.get("raw_material_qc") if isinstance(meta.get("raw_material_qc"), dict) else {}
-        qc_ok = (order.status or "").upper() == "QC_PASSED" or qc.get("qc_status") in (
-            "PASS",
-            "PASSED",
+        qc_ok = (order.status or "").upper() == "QC_PASSED" or qc_status_passed(
+            qc.get("qc_status")
         )
         if not qc_ok:
             continue
@@ -338,6 +491,10 @@ def enrich_inward_order_stock(
         raw_code = line.product_code
 
     available = max(qty - allocated, Decimal("0"))
+    qc = meta.get("raw_material_qc") if isinstance(meta.get("raw_material_qc"), dict) else {}
+    qc_status = qc.get("qc_status")
+    if not qc_status and (order_row.status or "").upper() == "QC_PASSED":
+        qc_status = "QC_PASSED"
     if not isinstance(order_out, CustomerOrderOut):
         return order_out
     return order_out.model_copy(
@@ -346,6 +503,7 @@ def enrich_inward_order_stock(
             "inward_quantity_kg": qty,
             "allocated_to_production_kg": allocated,
             "available_quantity_kg": available,
+            "qc_status": qc_status or "PENDING",
         }
     )
 

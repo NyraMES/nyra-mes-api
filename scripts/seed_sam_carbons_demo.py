@@ -47,36 +47,29 @@ from sqlalchemy.orm import Session
 from app.core.exceptions import NotFoundError
 from app.core.tenant_context import resolve_tenant
 from app.db.mes_core_database import get_mes_core_engine
-from app.models.mes_core import Customer, CustomerOrder, Product, Resource, Supplier
+from app.models.mes_core import Customer, CustomerOrder, Product, ProductionLot, Resource, Supplier
 from app.schemas.mes_core.schemas import (
     AcKilnCreate,
+    AcMakeToStockCreate,
     CustomerCreate,
-    ProductionLotCreate,
-    ScheduleCreate,
-    TripleCreate,
     AcKilnFeedLotCreate,
     AcRawMaterialInwardCreate,
     AcRawMaterialQcCreate,
     SupplierCreate,
 )
-from app.schemas.quality import InspectionResultCreate
-from app.schemas.schedule import WorkOrderCompleteRequest, WorkOrderStartRequest
 from app.services.industry.activated_carbon import adapter as ac_adapter
 from app.services.industry.activated_carbon.codes import (
     reset_ac_sequences_empty,
-    reset_ac_sequences_to_seed,
-    resolve_ac_business_code,
     sync_ac_sequences,
 )
-from app.services.mes_core import entities as mes_core_entities
-from app.services.mes_core import execution_workflow as mes_core_execution
 from app.services.mes_core import feasibility as mes_core_feasibility
-from app.services.mes_core import quality_workflow as mes_core_quality
-from app.services.mes_core import scheduling as mes_core_scheduling
 from app.services.mes_core.base import TenantRepository
 
 TENANT_CODE = os.getenv("AC_TENANT_CODE", "SAM_CARBONS")
 WORKSPACE_CODE = os.getenv("AC_WORKSPACE_CODE", "SAM_CARBONS_ACTIVATED_CARBON")
+
+# Testbed Cognito users typically bind to SAM_CARBONS_DEMO — wipe both on full reset.
+AC_TENANT_PREFIX = "SAM_CARBONS"
 
 MASTER_CUSTOMER_CODE = "CUST-AC-001"
 RAW_PRODUCT_CODE = "RAW-COCO-SHELL"
@@ -150,7 +143,7 @@ def install_master_sql() -> None:
 
 
 def reset_transactional(db: Session, tenant) -> None:
-    tid = str(tenant.tenant_id)
+    tid = str(tenant.tenant_id if hasattr(tenant, "tenant_id") else tenant)
     for stmt in [
         "DELETE FROM qms.quality_result WHERE tenant_id = :tid",
         "DELETE FROM qms.quality_check WHERE tenant_id = :tid",
@@ -166,6 +159,29 @@ def reset_transactional(db: Session, tenant) -> None:
     ]:
         db.execute(text(stmt), {"tid": tid})
     db.commit()
+
+
+def list_ac_tenant_codes(db: Session) -> list[str]:
+    rows = db.execute(
+        text(
+            "SELECT tenant_code FROM core.tenant "
+            "WHERE tenant_code LIKE :prefix ORDER BY tenant_code"
+        ),
+        {"prefix": f"{AC_TENANT_PREFIX}%"},
+    ).fetchall()
+    return [str(row[0]) for row in rows]
+
+
+def reset_transactional_all_ac_tenants(db: Session) -> None:
+    """Delete transactional data for every SAM_CARBONS* tenant (shared sequences)."""
+    codes = list_ac_tenant_codes(db)
+    if not codes:
+        print(f"WARN: No tenants matching {AC_TENANT_PREFIX}%")
+        return
+    for code in codes:
+        tenant = resolve_tenant(db, code, None)
+        reset_transactional(db, tenant)
+        print(f"OK: Reset transactional data for {code}")
 
 
 def reset_all_for_tenant(db: Session, tenant) -> None:
@@ -244,15 +260,11 @@ def seed_story(db: Session, tenant) -> dict:
             product_id=raw_product.product_id,
             quantity=Decimal("7500"),
             uom="KG",
-            create_production_order=True,
+            create_production_order=False,
         ),
     )
-    if not inward.production_order:
-        raise RuntimeError("Seed requires production order from raw material inward")
 
     order_code = inward.order.order_code
-    po_code = inward.production_order.production_order_code
-    po_id = inward.production_order.production_order_id
 
     ac_adapter.create_raw_material_qc(
         db,
@@ -262,134 +274,47 @@ def seed_story(db: Session, tenant) -> dict:
             moisture_pct=Decimal("10.5"),
             ash_pct=Decimal("2.1"),
             foreign_matter_pct=Decimal("0.3"),
+            stones_kg=Decimal("42"),
+            unburnt_kg=Decimal("28"),
+            minus20_kg=Decimal("289"),
             operator_remarks="Seed — feedstock accepted for demo lots",
             qc_status="PASS",
         ),
     )
 
+    release = ac_adapter.create_make_to_stock_production_order(
+        db,
+        tenant,
+        AcMakeToStockCreate(
+            inward_order_id=inward.order.customer_order_id,
+            quantity=Decimal("7500"),
+            uom="KG",
+        ),
+    )
+    if not release.production_order or not release.production_lot:
+        raise RuntimeError("Seed requires PO + planned lot from release to production")
+
+    po_code = release.production_order.production_order_code
+    po_id = release.production_order.production_order_id
+    lot_act_code = release.production_lot.lot_code
+
+    activation_lot = repo.get_by_code(ProductionLot, ProductionLot.lot_code, lot_act_code)
+    activation_lot.lot_quantity = Decimal("4000")
+    db.flush()
+
+    mes_core_feasibility.run_feasibility_check(db, tenant, lot_act_code)
+
     lot_activation = ac_adapter.create_kiln_feed_lot(
         db,
         tenant,
         AcKilnFeedLotCreate(
-            production_order_id=po_id,
+            production_lot_id=release.production_lot.production_lot_id,
             lot_quantity=Decimal("4000"),
             status="IN_PROGRESS",
             kiln_resource_code=kiln_code,
         ),
     )
-    lot_complete_code = resolve_ac_business_code(
-        db, provided=None, entity="ac_production_lot"
-    )
-    lot_complete = mes_core_entities.create_production_lot(
-        db,
-        tenant,
-        ProductionLotCreate(
-            lot_code=lot_complete_code,
-            production_order_id=po_id,
-            lot_quantity=Decimal("3500"),
-            status="CREATED",
-        ),
-    )
-
     lot_act_code = lot_activation.lot_code
-    lot_cmp_code = lot_complete.lot_code
-
-    mes_core_feasibility.run_feasibility_check(db, tenant, lot_act_code)
-    mes_core_feasibility.run_feasibility_check(db, tenant, lot_cmp_code)
-
-    from app.services.industry.activated_carbon.routing_workflow import generate_lot_route
-
-    try:
-        generate_lot_route(db, tenant, lot_act_code)
-    except Exception:
-        pass
-
-    plan = mes_core_scheduling.get_schedule_plan(db, tenant, lot_cmp_code)
-    work_orders: list[str] = []
-    now = _utcnow()
-    process_steps = ["PYROLYSIS", "ACTIVATION", "SCREENING", "QC"]
-
-    for index, op in enumerate(plan.operations):
-        start = now + timedelta(hours=index * 3)
-        end = start + timedelta(minutes=op.estimated_duration_minutes or 60)
-        mes_core_scheduling.create_schedule(
-            db,
-            tenant,
-            ScheduleCreate(
-                lot_id=lot_cmp_code,
-                operation_id=op.operation_id,
-                planned_start_time=start,
-                planned_end_time=end,
-                assigned_machine_id=op.suggested_machine_id,
-                assigned_work_center_id=op.suggested_work_center_id,
-                schedule_status="Scheduled",
-            ),
-        )
-        summary = mes_core_execution.lot_execution_summary(db, tenant, lot_cmp_code)
-        wo_row = next(o for o in summary["operations"] if o["operation_id"] == op.operation_id)
-        wo_id = wo_row["work_order_id"]
-        mes_core_execution.start_execution(
-            db, tenant, wo_id, WorkOrderStartRequest(operator_name="Kiln Operator A")
-        )
-        mes_core_execution.complete_execution(
-            db,
-            tenant,
-            wo_id,
-            WorkOrderCompleteRequest(
-                actual_output_quantity=Decimal("3500"),
-                operator_name="Kiln Operator A",
-                machine_id=op.suggested_machine_id,
-                downtime_minutes=Decimal("15") if index == 1 else Decimal("0"),
-            ),
-        )
-        work_orders.append(wo_id)
-
-        if index < len(process_steps):
-            from app.models.mes_core import OperationExecution
-
-            exec_row = (
-                repo.query(OperationExecution)
-                .filter(OperationExecution.execution_code == wo_id)
-                .first()
-            )
-            if exec_row:
-                meta = dict(exec_row.metadata_ or {})
-                meta["process_step"] = process_steps[index]
-                meta["industry_template_code"] = tenant.industry_template_code
-                if process_steps[index] == "ACTIVATION":
-                    meta["kiln_temp_c"] = 920
-                    meta["steam_flow_kg_h"] = 450
-                exec_row.metadata_ = meta
-
-    db.commit()
-
-    inspection = mes_core_quality.create_inspection_result(
-        db,
-        tenant,
-        InspectionResultCreate(
-            lot_id=lot_cmp_code,
-            work_order_id=work_orders[-1] if work_orders else None,
-            inspected_quantity=Decimal("3500"),
-            accepted_quantity=Decimal("3500"),
-            rejected_quantity=Decimal("0"),
-            inspection_status="Passed",
-            inspected_at=_utcnow(),
-        ),
-    )
-
-    mes_core_entities.create_triple(
-        db,
-        tenant,
-        TripleCreate(
-            subject_uri=f"urn:nyra:lot:{lot_cmp_code}",
-            predicate_uri="urn:nyra:hasIodineValue",
-            object_literal="980",
-            object_datatype="http://www.w3.org/2001/XMLSchema#decimal",
-            source_table="trn.production_lot",
-        ),
-    )
-
-    db.commit()
 
     return {
         "tenant_code": TENANT_CODE,
@@ -401,8 +326,6 @@ def seed_story(db: Session, tenant) -> dict:
         "order": order_code,
         "production_order": po_code,
         "lot_activation": lot_act_code,
-        "lot_complete": lot_cmp_code,
-        "inspection": inspection.inspection_status,
         "ui_url": "http://127.0.0.1:5173/activated-carbon/dashboard",
         "api_context": (
             "GET http://127.0.0.1:8000/api/context "
@@ -419,6 +342,11 @@ def main() -> int:
         "--reset-all",
         action="store_true",
         help="Delete transactional + tenant master data (then use --install-master)",
+    )
+    parser.add_argument(
+        "--reset-all-ac-tenants",
+        action="store_true",
+        help="Delete transactional data for all SAM_CARBONS* tenants (testbed reset)",
     )
     parser.add_argument(
         "--reset-sequences",
@@ -444,11 +372,13 @@ def main() -> int:
         print("Run migrations 003 + 004 first (tenant + workspace + template route)")
         return 1
 
-    if args.reset_all:
+    if args.reset_all_ac_tenants:
+        reset_transactional_all_ac_tenants(db)
+    elif args.reset_all:
         reset_all_for_tenant(db, tenant)
         print(f"OK: Reset all tenant data for {TENANT_CODE} (masters + transactions)")
 
-    if args.reset and not args.reset_all:
+    if args.reset and not args.reset_all and not args.reset_all_ac_tenants:
         reset_transactional(db, tenant)
         print(f"OK: Reset transactional data for {TENANT_CODE}")
 
@@ -469,8 +399,12 @@ def main() -> int:
     result = seed_story(db, tenant)
     normalize_ac_display_names(db, tenant)
 
-    reset_ac_sequences_to_seed(db, tenant.tenant_id)
-    print("OK: Synced AC business code sequences from tenant data")
+    if args.reset_all_ac_tenants or args.reset_sequences:
+        sync_ac_sequences(db, tenant.tenant_id)
+        print(f"OK: Synced AC business code sequences for {TENANT_CODE}")
+    else:
+        reset_ac_sequences_to_seed(db, tenant.tenant_id)
+        print("OK: Synced AC business code sequences from tenant data")
     print("OK: Activated Carbon validation data seeded")
     for key, val in result.items():
         print(f"  {key}: {val}")
