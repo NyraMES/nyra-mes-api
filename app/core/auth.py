@@ -17,6 +17,7 @@ from app.core.exceptions import ForbiddenError, UnauthorizedError
 _bearer = HTTPBearer(auto_error=False)
 
 # Cognito groups mapped to MES application roles.
+MES_SUPER_ADMIN = "MES_SuperAdmin"
 MES_ADMIN = "MES_Admin"
 MES_PLANNER = "MES_Planner"
 MES_OPERATOR = "MES_Operator"
@@ -24,12 +25,16 @@ MES_QUALITY = "MES_Quality"
 MES_VIEWER = "MES_Viewer"
 
 ALL_MES_ROLES: Set[str] = {
+    MES_SUPER_ADMIN,
     MES_ADMIN,
     MES_PLANNER,
     MES_OPERATOR,
     MES_QUALITY,
     MES_VIEWER,
 }
+
+# Tenant administrators (supplier, customer, plant resources, etc.)
+TENANT_ADMIN_ROLES: Set[str] = {MES_SUPER_ADMIN, MES_ADMIN}
 
 # Which Cognito groups may access each API domain router.
 ROUTER_ACCESS: Dict[str, Set[str]] = {
@@ -106,8 +111,14 @@ class UserContext:
             return known
         return list(self.groups)
 
+    def is_super_admin(self) -> bool:
+        return MES_SUPER_ADMIN in self.groups
+
+    def is_tenant_admin(self) -> bool:
+        return bool(set(self.groups) & TENANT_ADMIN_ROLES)
+
     def has_any_role(self, allowed: Set[str]) -> bool:
-        if MES_ADMIN in self.groups:
+        if self.is_super_admin() or MES_ADMIN in self.groups:
             return True
         return bool(set(self.groups) & allowed)
 
@@ -250,6 +261,38 @@ def require_roles(*roles: str):
             raise ForbiddenError(
                 "You do not have permission to perform this action",
                 details={"required_roles": sorted(allowed), "your_roles": user.roles},
+            )
+        return user
+
+    return Depends(_dependency)
+
+
+def require_super_admin():
+    """Raw material types and process routing — Super Administrator only."""
+
+    def _dependency(user: UserContext = Depends(get_current_user)) -> UserContext:
+        if not settings.auth_enabled:
+            return user
+        if not user.is_super_admin():
+            raise ForbiddenError(
+                "Only a Super Administrator may add or change raw materials and process routing.",
+                details={"required_roles": [MES_SUPER_ADMIN], "your_roles": user.roles},
+            )
+        return user
+
+    return Depends(_dependency)
+
+
+def require_tenant_admin():
+    """Day-to-day master data — Administrator or Super Administrator."""
+
+    def _dependency(user: UserContext = Depends(get_current_user)) -> UserContext:
+        if not settings.auth_enabled:
+            return user
+        if not user.is_tenant_admin():
+            raise ForbiddenError(
+                "You do not have permission to manage master data.",
+                details={"required_roles": sorted(TENANT_ADMIN_ROLES), "your_roles": user.roles},
             )
         return user
 

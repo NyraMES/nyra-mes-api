@@ -119,6 +119,7 @@ def get_lot_routing_plan(db: Session, tenant: TenantContext, lot_code: str) -> d
                 "operation_name": op.operation_name,
                 "process_id": process_step,
                 "process_name": process_step.replace("_", " ").title() if process_step else None,
+                "is_mandatory": meta.get("is_mandatory", True),
                 "work_order_id": wo.execution_code if wo else None,
                 "work_order_generated": wo is not None,
                 "status": ui_status or ("Pending" if not wo else "Ready"),
@@ -191,6 +192,7 @@ def generate_lot_route(db: Session, tenant: TenantContext, lot_code: str) -> dic
                     "released_at": _utcnow_iso(),
                     "source": "ac_routing_generate",
                     "process_step": op_meta.get("process_step"),
+                    "is_mandatory": op_meta.get("is_mandatory", True),
                     "industry_template_code": tenant.industry_template_code,
                 },
             )

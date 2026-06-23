@@ -51,11 +51,13 @@ def _operation_process_step(row: RoutingOperation) -> str:
 
 
 def _operation_dict(row: RoutingOperation) -> dict:
+    meta = row.metadata_ if isinstance(row.metadata_, dict) else {}
     return {
         "operation_sequence": row.operation_sequence,
         "operation_name": row.operation_name,
         "operation_code": row.operation_code,
         "process_step": _operation_process_step(row) or row.operation_code.replace("OP-", "", 1),
+        "is_mandatory": meta.get("is_mandatory", True),
     }
 
 
@@ -72,13 +74,14 @@ def _operations_from_routing(
     return [_operation_dict(row) for row in rows]
 
 
-def _apply_process_metadata(meta: dict, process_step: str) -> dict:
+def _apply_process_metadata(meta: dict, process_step: str, is_mandatory: bool = True) -> dict:
     step = (process_step or "").strip()
     return {
         **meta,
         "process_step": step,
         "process_code": step,
         "process_type": step,
+        "is_mandatory": is_mandatory,
     }
 
 
@@ -113,6 +116,7 @@ def _sync_routing_operations(
             )
         keep_codes.add(code)
         step = (op_in.process_step or "").strip()
+        mandatory = getattr(op_in, "is_mandatory", True)
         if code in by_code:
             row = by_code[code]
             row.operation_sequence = op_in.operation_sequence
@@ -120,6 +124,7 @@ def _sync_routing_operations(
             row.metadata_ = _apply_process_metadata(
                 row.metadata_ if isinstance(row.metadata_, dict) else {},
                 step,
+                mandatory,
             )
             continue
 
@@ -130,7 +135,7 @@ def _sync_routing_operations(
                 operation_code=op_code,
                 operation_sequence=op_in.operation_sequence,
                 operation_name=op_in.operation_name.strip(),
-                metadata_=_apply_process_metadata({}, step),
+                metadata_=_apply_process_metadata({}, step, mandatory),
             )
         )
 

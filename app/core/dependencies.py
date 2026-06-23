@@ -9,6 +9,8 @@ from app.core.auth import (
     get_current_user,
     require_roles,
     require_router_access,
+    require_super_admin,
+    require_tenant_admin,
 )
 from app.core.capability_guard import require_capability
 from app.core.tenant_context import TenantContext, get_tenant_context
@@ -25,4 +27,6 @@ __all__ = [
     "require_capability",
     "require_roles",
     "require_router_access",
+    "require_super_admin",
+    "require_tenant_admin",
 ]

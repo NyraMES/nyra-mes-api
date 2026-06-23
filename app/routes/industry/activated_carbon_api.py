@@ -10,7 +10,12 @@ from fastapi import APIRouter, Depends, Query, status
 from sqlalchemy.orm import Session
 
 from app.core.capability_guard import require_any_capability, require_capability
-from app.core.dependencies import get_mes_core_db, get_tenant_context
+from app.core.dependencies import (
+    get_mes_core_db,
+    get_tenant_context,
+    require_super_admin,
+    require_tenant_admin,
+)
 from app.core.exceptions import ConflictError, ValidationError, WorkflowError
 from app.core.openapi_tags import Tags
 from app.core.tenant_context import TenantContext
@@ -70,6 +75,8 @@ from app.services.industry.activated_carbon import raw_material_types as ac_raw_
 from app.services.industry.activated_carbon import routing_workflow as ac_routing
 from app.services.mes_core import dispatch_workflow as mes_core_dispatch
 from app.services.mes_core import entities as mes_core_entities
+from app.services.mes_core import feasibility as mes_core_feasibility
+from app.services.mes_core.feasibility import is_ready_for_scheduling
 from app.services.mes_core import trn_dispatch as mes_core_trn_dispatch
 
 router = APIRouter(prefix="/api/activated-carbon", tags=[Tags.ACTIVATED_CARBON])
@@ -124,10 +131,16 @@ def ac_dashboard(
     summary="Open production lots for feasibility, kiln feed, and routing",
 )
 def ac_open_lots(
+    include_routing_complete: bool = Query(
+        False,
+        description="Include lots whose shop-floor routing is fully complete (still excludes dispatched/closed)",
+    ),
     db: Session = Depends(get_mes_core_db),
     tenant: TenantContext = Depends(_AC_MASTERS),
 ):
-    return ac_adapter.list_open_production_lots(db, tenant)
+    return ac_adapter.list_open_production_lots(
+        db, tenant, include_routing_complete=include_routing_complete
+    )
 
 
 @router.get(
@@ -152,6 +165,7 @@ def ac_add_kiln_parameter(
     payload: AcKilnParameterDefinitionCreate,
     db: Session = Depends(get_mes_core_db),
     tenant: TenantContext = Depends(_AC_MASTERS),
+    _user=require_tenant_admin(),
 ):
     try:
         return ac_kiln_catalog.add_kiln_parameter_definition(db, tenant, payload)
@@ -169,6 +183,7 @@ def ac_create_kiln(
     payload: AcKilnCreate,
     db: Session = Depends(get_mes_core_db),
     tenant: TenantContext = Depends(_AC_MASTERS),
+    _user=require_tenant_admin(),
 ):
     try:
         return ac_adapter.create_kiln(db, tenant, payload)
@@ -188,6 +203,7 @@ def ac_create_resource(
     payload: ResourceCreate,
     db: Session = Depends(get_mes_core_db),
     tenant: TenantContext = Depends(_AC_MASTERS),
+    _user=require_tenant_admin(),
 ):
     try:
         return ac_adapter.create_plant_resource(db, tenant, payload)
@@ -227,6 +243,30 @@ def ac_generate_lot_route(
         raise ValidationError(str(exc)) from exc
 
 
+@router.post(
+    "/lots/{lot_code}/feasibility/run",
+    summary="Run feasibility check and auto-generate shop-floor route when the lot passes",
+)
+def ac_run_feasibility_and_prepare_execution(
+    lot_code: str,
+    db: Session = Depends(get_mes_core_db),
+    tenant: TenantContext = Depends(_AC_MASTERS),
+):
+    """Persist feasibility results; materialise routing work orders when the gate opens."""
+    result = mes_core_feasibility.run_feasibility_check(db, tenant, lot_code)
+    route_payload = None
+    if is_ready_for_scheduling(db, tenant, lot_code):
+        try:
+            route_payload = ac_routing.generate_lot_route(db, tenant, lot_code)
+        except WorkflowError:
+            route_payload = None
+    out = result.model_dump()
+    out["route_generated"] = route_payload is not None
+    if route_payload:
+        out["route"] = route_payload
+    return out
+
+
 @router.get(
     "/customers",
     response_model=List[CustomerOut],
@@ -249,6 +289,7 @@ def ac_create_customer(
     payload: CustomerCreate,
     db: Session = Depends(get_mes_core_db),
     tenant: TenantContext = Depends(_AC_MASTERS),
+    _user=require_tenant_admin(),
 ):
     return ac_adapter.create_ac_customer(db, tenant, payload)
 
@@ -275,6 +316,7 @@ def ac_create_supplier(
     payload: SupplierCreate,
     db: Session = Depends(get_mes_core_db),
     tenant: TenantContext = Depends(_AC_MASTERS),
+    _user=require_tenant_admin(),
 ):
     return ac_adapter.create_ac_supplier(db, tenant, payload)
 
@@ -301,6 +343,7 @@ def ac_create_raw_material_type(
     payload: AcRawMaterialTypeCreate,
     db: Session = Depends(get_mes_core_db),
     tenant: TenantContext = Depends(_AC_MASTERS),
+    _user=require_super_admin(),
 ):
     try:
         return ac_raw_material_types.create_raw_material_type(db, tenant, payload)
@@ -333,6 +376,7 @@ def ac_update_raw_material_type(
     payload: AcRawMaterialTypeUpdate,
     db: Session = Depends(get_mes_core_db),
     tenant: TenantContext = Depends(_AC_MASTERS),
+    _user=require_super_admin(),
 ):
     try:
         return ac_raw_material_types.update_raw_material_type(

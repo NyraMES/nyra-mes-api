@@ -15,7 +15,7 @@ from sqlalchemy.orm import Session
 
 from app.core.config import settings
 from app.core.demo_protection import demo_watermark_text, effective_demo_mode, effective_demo_read_only
-from app.core.dependencies import get_mes_core_db, get_tenant_context
+from app.core.dependencies import get_mes_core_db, get_tenant_context, require_tenant_admin
 from app.core.openapi_tags import Tags
 from app.core.tenant_context import TenantContext
 from app.schemas.feasibility import FeasibilityResponse
@@ -174,6 +174,7 @@ def create_customer(
     payload: CustomerCreate,
     db: Session = Depends(get_mes_core_db),
     tenant: TenantContext = Depends(get_tenant_context),
+    _user=require_tenant_admin(),
 ):
     return mes_core_service.create_customer(db, tenant, payload)
 

@@ -1103,6 +1103,7 @@ class AcRawMaterialTypeOperation(BaseModel):
     operation_name: str = Field(..., min_length=1, max_length=256)
     operation_code: str = Field(..., min_length=1, max_length=64)
     process_step: str = Field(..., min_length=1, max_length=64)
+    is_mandatory: bool = True
 
 
 class AcRawMaterialProcessParameter(BaseModel):

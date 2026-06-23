@@ -1722,7 +1722,7 @@ def _lot_line_rows(db: Session, tenant: TenantContext) -> list[AcLotLineOut]:
 
 
 def list_open_production_lots(
-    db: Session, tenant: TenantContext
+    db: Session, tenant: TenantContext, *, include_routing_complete: bool = False
 ) -> list[AcOpenLotOut]:
     """Lots eligible for feasibility, kiln feed, and routing (server-side filter)."""
     repo = _repo(db, tenant)
@@ -1749,7 +1749,9 @@ def list_open_production_lots(
         st = (lot.status or "").upper()
         done, total = exec_counts.get(lot.production_lot_id, (0, 0))
         routing_complete = total > 0 and done >= total
-        if st in _OPEN_LOT_STATUSES or routing_complete:
+        if st in _OPEN_LOT_STATUSES:
+            continue
+        if routing_complete and not include_routing_complete:
             continue
 
         po = po_by_id.get(lot.production_order_id)
