@@ -7,5 +7,10 @@ $SshKeyPath = "D:\path\to\nyraservices.pem"
 
 # Remote paths on testbed EC2
 $RemoteApiDir = "/home/ubuntu/nyra-mes-api"
-$RemoteUiDir = "/var/www/nyraservices-testbed/mes"
+$RemoteUiDir = "/home/ubuntu/testbed/tenants/mes"
 $RemoteApiService = "nyra-mes-api"
+$RemoteApiPort = "8010"
+
+# RDS Secrets Manager — password fetched at runtime (no stale copy in server .env).
+# Leave empty to auto-discover from RDS describe-db-instances on the EC2 host.
+$MesCoreDbSecretId = ""

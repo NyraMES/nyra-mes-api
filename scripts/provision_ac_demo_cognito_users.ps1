@@ -1,4 +1,4 @@
-# Create one Activated Carbon demo user per MES group (same pattern as Auto OEM).
+﻿# Create one Activated Carbon demo user per MES group (same pattern as Auto OEM).
 # All users get custom:tenant_code=SAM_CARBONS_DEMO for testbed / AC demo tenant.
 #
 # Prerequisites: AWS CLI configured, tenant_code custom attribute on the user pool.
@@ -24,7 +24,8 @@ $Groups = @(
     "MES_Planner",
     "MES_Operator",
     "MES_Quality",
-    "MES_Viewer"
+    "MES_Viewer",
+    "MES_Demo"
 )
 
 function GroupSlug($Group) {
@@ -66,4 +67,5 @@ foreach ($row in $results) {
     Write-Host ("{0,-14} {1}" -f $row.Group, $row.Email)
 }
 Write-Host "`nPasswords were printed above for each user (or use your -SharedPassword).`n"
+Write-Host "Demo viewer (Dashboard + Feasibility only): ac-demo-demo@nyra.local`n"
 Write-Host "Testbed login: https://nyraservices-testbed.net/mes/ -> Activated Carbon -> sign in.`n"

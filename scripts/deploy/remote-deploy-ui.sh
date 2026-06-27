@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-UI_DIR="${1:-/var/www/nyraservices-testbed/mes}"
+UI_DIR="${1:-/home/ubuntu/testbed/tenants/mes}"
 STAGING="${2:-/tmp/nyra-mes-ui-dist}"
 
 if [[ ! -d "$STAGING" ]]; then
@@ -9,7 +9,7 @@ if [[ ! -d "$STAGING" ]]; then
   exit 1
 fi
 
-sudo mkdir -p "$UI_DIR"
-sudo rsync -a --delete "$STAGING"/ "$UI_DIR"/
+mkdir -p "$UI_DIR"
+rsync -a --delete "$STAGING"/ "$UI_DIR"/
 echo "UI synced to $UI_DIR"
 ls -la "$UI_DIR" | head -n 10

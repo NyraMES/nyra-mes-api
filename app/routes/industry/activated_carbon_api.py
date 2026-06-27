@@ -131,16 +131,10 @@ def ac_dashboard(
     summary="Open production lots for feasibility, kiln feed, and routing",
 )
 def ac_open_lots(
-    include_routing_complete: bool = Query(
-        False,
-        description="Include lots whose shop-floor routing is fully complete (still excludes dispatched/closed)",
-    ),
     db: Session = Depends(get_mes_core_db),
     tenant: TenantContext = Depends(_AC_MASTERS),
 ):
-    return ac_adapter.list_open_production_lots(
-        db, tenant, include_routing_complete=include_routing_complete
-    )
+    return ac_adapter.list_open_production_lots(db, tenant)
 
 
 @router.get(

@@ -27,6 +27,10 @@ if (-not (Test-Path $ConfigPath)) {
 }
 . $ConfigPath
 
+if (-not (Test-Path variable:RemoteApiPort) -or [string]::IsNullOrWhiteSpace($RemoteApiPort)) {
+    $RemoteApiPort = "8010"
+}
+
 if (-not (Test-Path $SshKeyPath)) {
     Write-Host "ERROR: SSH key not found: $SshKeyPath" -ForegroundColor Red
     exit 1
@@ -37,8 +41,9 @@ $SshArgs = @("-i", $SshKeyPath, "-o", "StrictHostKeyChecking=accept-new")
 $ScpArgs = @("-i", $SshKeyPath, "-o", "StrictHostKeyChecking=accept-new")
 
 function Invoke-Ssh([string[]]$RemoteCommand) {
-    & ssh @SshArgs $SshTarget ($RemoteCommand -join " ")
-    if ($LASTEXITCODE -ne 0) { throw "SSH failed: $($RemoteCommand -join ' ')" }
+    $script = ($RemoteCommand -join "; ")
+    & ssh @SshArgs $SshTarget $script
+    if ($LASTEXITCODE -ne 0) { throw "SSH failed: $script" }
 }
 
 function Invoke-Scp([string]$LocalPath, [string]$RemotePath) {
@@ -66,15 +71,15 @@ if (-not $UiOnly) {
 
     Write-Host "`n=== Upload API ===" -ForegroundColor Cyan
     Invoke-Scp $ApiTar "/tmp/nyra-mes-api-deploy.tar.gz"
-    Invoke-Scp (Join-Path $DeployDir "remote-deploy-api.sh") "/tmp/remote-deploy-api.sh"
 
     Write-Host "`n=== Install API on server ===" -ForegroundColor Cyan
     Invoke-Ssh @(
         "set -e",
         "mkdir -p $RemoteApiDir",
         "tar -xzf /tmp/nyra-mes-api-deploy.tar.gz -C $RemoteApiDir",
-        "chmod +x /tmp/remote-deploy-api.sh",
-        "bash /tmp/remote-deploy-api.sh $RemoteApiDir $RemoteApiService"
+        "chmod +x $RemoteApiDir/scripts/deploy/remote-deploy-api.sh",
+        "chmod +x $RemoteApiDir/scripts/deploy/sync_testbed_db_env.sh",
+        "bash $RemoteApiDir/scripts/deploy/remote-deploy-api.sh $RemoteApiDir $RemoteApiService $RemoteApiPort"
     )
 }
 
@@ -96,7 +101,7 @@ if (-not $ApiOnly) {
 
     $DistDir = Join-Path $UiRoot "dist"
     if (-not (Test-Path $DistDir)) {
-        Write-Host "ERROR: dist/ missing — run npm run build -- --mode production" -ForegroundColor Red
+        Write-Host "ERROR: dist/ missing - run npm run build -- --mode production" -ForegroundColor Red
         exit 1
     }
 
@@ -113,7 +118,8 @@ if (-not $ApiOnly) {
     Invoke-Scp (Join-Path $DeployDir "remote-deploy-ui.sh") "/tmp/remote-deploy-ui.sh"
     Invoke-Ssh @(
         "set -e",
-        "rm -rf /tmp/nyra-mes-ui-dist && mkdir -p /tmp/nyra-mes-ui-dist",
+        "rm -rf /tmp/nyra-mes-ui-dist",
+        "mkdir -p /tmp/nyra-mes-ui-dist",
         "tar -xzf /tmp/nyra-mes-ui-dist.tar.gz -C /tmp/nyra-mes-ui-dist",
         "chmod +x /tmp/remote-deploy-ui.sh",
         "bash /tmp/remote-deploy-ui.sh $RemoteUiDir /tmp/nyra-mes-ui-dist"

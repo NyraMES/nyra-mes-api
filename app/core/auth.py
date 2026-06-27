@@ -23,6 +23,7 @@ MES_PLANNER = "MES_Planner"
 MES_OPERATOR = "MES_Operator"
 MES_QUALITY = "MES_Quality"
 MES_VIEWER = "MES_Viewer"
+MES_DEMO = "MES_Demo"
 
 ALL_MES_ROLES: Set[str] = {
     MES_SUPER_ADMIN,
@@ -31,6 +32,7 @@ ALL_MES_ROLES: Set[str] = {
     MES_OPERATOR,
     MES_QUALITY,
     MES_VIEWER,
+    MES_DEMO,
 }
 
 # Tenant administrators (supplier, customer, plant resources, etc.)
@@ -45,7 +47,7 @@ ROUTER_ACCESS: Dict[str, Set[str]] = {
     "lot": {MES_ADMIN, MES_PLANNER, MES_OPERATOR, MES_VIEWER},
     "routing": {MES_ADMIN, MES_PLANNER, MES_VIEWER},
     "resource": {MES_ADMIN, MES_PLANNER, MES_VIEWER},
-    "feasibility": {MES_ADMIN, MES_PLANNER, MES_VIEWER},
+    "feasibility": {MES_ADMIN, MES_PLANNER, MES_VIEWER, MES_DEMO},
     "schedule": {MES_ADMIN, MES_PLANNER, MES_VIEWER},
     "workorder": {MES_ADMIN, MES_PLANNER, MES_OPERATOR, MES_VIEWER},
     "process": {MES_ADMIN, MES_PLANNER, MES_VIEWER},

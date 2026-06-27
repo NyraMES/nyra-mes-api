@@ -63,7 +63,7 @@ try {
         --username $Email `
         --region $Region 2>$null | Out-Null
     $userExists = $true
-    Write-Host "User already exists — updating tenant and password." -ForegroundColor Yellow
+    Write-Host "User already exists - updating tenant and password." -ForegroundColor Yellow
 } catch {
     $userExists = $false
 }
