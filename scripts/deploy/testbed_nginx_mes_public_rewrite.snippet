@@ -1,0 +1,5 @@
+# Add inside location /mes/api/ { ... } in testbed nginx (after auth rewrite):
+#   rewrite ^/mes/api/public/(.*)$ /public/$1 break;
+#
+# Without this, POST /mes/api/public/contact-enquiry is rewritten to /api/public/...
+# but FastAPI serves the route at /public/contact-enquiry (same pattern as /auth/).

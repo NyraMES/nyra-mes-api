@@ -1120,6 +1120,14 @@ class AcRawMaterialProcessParameter(BaseModel):
     mandatory: bool = False
 
 
+class AcRawMaterialTypeUsageOut(BaseModel):
+    inward_receipt_count: int = 0
+    production_lot_count: int = 0
+    kiln_process_started: bool = False
+    dispatch_completed: bool = False
+    locked: bool = False
+
+
 class AcRawMaterialTypeOut(BaseModel):
     product_id: UUID
     product_code: str
@@ -1131,6 +1139,9 @@ class AcRawMaterialTypeOut(BaseModel):
     routing_id: Optional[UUID] = None
     operations: list = Field(default_factory=list)
     process_parameters: list = Field(default_factory=list)
+    status: str = "ACTIVE"
+    is_obsolete: bool = False
+    usage: Optional[AcRawMaterialTypeUsageOut] = None
 
 
 class AcRawMaterialTypeCreate(BaseModel):
@@ -1165,3 +1176,67 @@ class AcDashboardOut(BaseModel):
     open_customer_orders: list["AcOpenCustomerOrderOut"] = Field(default_factory=list)
     recent_dispatches: list["AcRecentDispatchOut"] = Field(default_factory=list)
     kiln_parameter_definitions: list[AcKilnParameterDefinition] = Field(default_factory=list)
+
+
+class ChemReactorParameterDefinition(BaseModel):
+    key: str
+    label: str
+    unit: str = ""
+
+
+class ChemBatchSummaryOut(BaseModel):
+    lot_count: int
+    total_planned_quantity: Decimal
+    total_lot_quantity: Decimal
+    average_yield_pct: Optional[Decimal] = None
+    industry_template_code: str
+
+
+class ChemReactorStatusOut(BaseModel):
+    resource_code: str
+    resource_name: str
+    status: str
+    active_lot_code: Optional[str] = None
+    active_lot_kg: Optional[Decimal] = None
+    last_reading_at: Optional[datetime] = None
+
+
+class ChemRawMaterialStatusOut(BaseModel):
+    ordered_kg: Decimal
+    charged_kg: Decimal
+    pending_kg: Decimal
+    open_order_count: int
+
+
+class ChemProcessStepOut(BaseModel):
+    step_order: int
+    label: str
+    path: str
+    capability_code: Optional[str] = None
+    record_count: int = 0
+    status: str = "pending"
+
+
+class ChemLotLineOut(BaseModel):
+    order_code: Optional[str] = None
+    production_order_code: Optional[str] = None
+    lot_code: str
+    lot_quantity: Decimal
+    status: Optional[str] = None
+    feasibility_status: Optional[str] = None
+    pipeline_stage: Optional[str] = None
+    is_in_progress: bool = False
+
+
+class ChemDashboardOut(BaseModel):
+    batch_summary: ChemBatchSummaryOut
+    raw_material: ChemRawMaterialStatusOut
+    reactors: list[ChemReactorStatusOut] = Field(default_factory=list)
+    process_steps: list[ChemProcessStepOut] = Field(default_factory=list)
+    lot_lines: list[ChemLotLineOut] = Field(default_factory=list)
+    quality_check_count: int = 0
+    dispatch_count: int = 0
+    finished_goods_stock_kg: Decimal = Decimal("0")
+    reactor_parameter_definitions: list[ChemReactorParameterDefinition] = Field(
+        default_factory=list
+    )

@@ -129,5 +129,23 @@ class Settings:
         in ("1", "true", "yes")
     )
 
+    # Landing-page contact form (POST /public/contact-enquiry — no mail client)
+    contact_enquiry_enabled: bool = field(
+        default_factory=lambda: os.getenv("CONTACT_ENQUIRY_ENABLED", "true").lower()
+        in ("1", "true", "yes")
+    )
+    contact_to_email: str = os.getenv("CONTACT_TO_EMAIL", "sudhasankaran@nyraias.com").strip()
+    contact_from_email: str = os.getenv(
+        "CONTACT_FROM_EMAIL", "sudhasankaran@nyraias.com"
+    ).strip()
+    contact_aws_region: str = os.getenv(
+        "CONTACT_AWS_REGION",
+        os.getenv("AWS_REGION", os.getenv("COGNITO_REGION", "eu-north-1")),
+    ).strip()
+    contact_enquiry_dry_run: bool = field(
+        default_factory=lambda: os.getenv("CONTACT_ENQUIRY_DRY_RUN", "false").lower()
+        in ("1", "true", "yes")
+    )
+
 
 settings = Settings()

@@ -39,6 +39,19 @@ def test_assert_user_may_access_tenant_blocks_mismatch(monkeypatch):
     assert "different plant" in exc.value.message
 
 
+def test_assert_user_may_access_tenant_allows_ac_demo_playground(monkeypatch):
+    monkeypatch.setattr(
+        "app.core.auth.settings", replace(settings, auth_enabled=True)
+    )
+    user = UserContext(
+        sub="1",
+        username="admin1",
+        tenant_code="AUTO_OEM_DEMO",
+        groups=["MES_Admin"],
+    )
+    assert_user_may_access_tenant(user, "SAM_CARBONS_DEMO")
+
+
 def test_assert_user_may_access_tenant_blocks_missing_claim(monkeypatch):
     monkeypatch.setattr(
         "app.core.auth.settings", replace(settings, auth_enabled=True)

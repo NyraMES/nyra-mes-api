@@ -1,0 +1,1 @@
+"""Chemical Processing industry adapter."""

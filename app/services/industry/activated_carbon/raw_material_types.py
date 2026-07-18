@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from typing import List, Optional
 from uuid import UUID
 
@@ -9,16 +10,19 @@ from sqlalchemy.orm import Session
 
 from app.core.exceptions import NotFoundError, ValidationError
 from app.core.tenant_context import TenantContext
+from app.models.mes_core.execution import OperationExecution
 from app.models.mes_core.master import Product, Routing, RoutingOperation
 from app.schemas.mes_core.schemas import (
     AcRawMaterialTypeCreate,
     AcRawMaterialTypeOperation,
     AcRawMaterialTypeOut,
     AcRawMaterialTypeUpdate,
+    AcRawMaterialTypeUsageOut,
     ProductCreate,
     RoutingOperationCreate,
     RoutingWithOperationsCreate,
 )
+from app.services.industry.activated_carbon.raw_material_usage import raw_material_usage
 from app.services.industry.activated_carbon.codes import (
     resolve_ac_business_code,
     sync_ac_sequences,
@@ -141,13 +145,39 @@ def _sync_routing_operations(
 
     for row in existing:
         if row.operation_code not in keep_codes:
+            exec_count = (
+                repo.query(OperationExecution)
+                .filter(OperationExecution.routing_operation_id == row.routing_operation_id)
+                .count()
+            )
+            if exec_count:
+                step = _operation_process_step(row)
+                raise ValidationError(
+                    "Cannot remove or replace process step "
+                    f"'{row.operation_name}' ({step or row.operation_code}) — "
+                    f"{exec_count} shop-floor execution(s) already reference it. "
+                    "Mark the raw material obsolete instead of changing steps that "
+                    "have production history."
+                )
             repo.db.delete(row)
 
     repo.db.flush()
 
 
+def _product_is_obsolete(product: Product) -> bool:
+    status = (product.status or "").upper()
+    if status == "OBSOLETE":
+        return True
+    meta = product.metadata_ if isinstance(product.metadata_, dict) else {}
+    return bool(meta.get("obsolete") or meta.get("is_obsolete"))
+
+
 def _type_from_product(
-    db: Session, tenant: TenantContext, product: Product
+    db: Session,
+    tenant: TenantContext,
+    product: Product,
+    *,
+    include_usage: bool = True,
 ) -> Optional[AcRawMaterialTypeOut]:
     meta = product.metadata_ if isinstance(product.metadata_, dict) else {}
     if not meta.get("ac_raw_material_type"):
@@ -157,6 +187,14 @@ def _type_from_product(
     operations = meta.get("operations") or []
     if routing_id and not operations:
         operations = _operations_from_routing(db, tenant, routing_id)
+
+    usage_out = None
+    if include_usage:
+        usage = raw_material_usage(db, tenant, product.product_id)
+        usage_out = AcRawMaterialTypeUsageOut(**usage)
+
+    is_obsolete = _product_is_obsolete(product)
+    status = "OBSOLETE" if is_obsolete else (product.status or "ACTIVE")
 
     return AcRawMaterialTypeOut(
         product_id=product.product_id,
@@ -169,32 +207,56 @@ def _type_from_product(
         routing_id=routing_id,
         operations=operations,
         process_parameters=meta.get("process_parameters") or [],
+        status=status,
+        is_obsolete=is_obsolete,
+        usage=usage_out,
+    )
+
+
+def _legacy_type_out(
+    db: Session, tenant: TenantContext, row: Product, *, include_usage: bool = True
+) -> AcRawMaterialTypeOut:
+    usage_out = None
+    if include_usage:
+        usage = raw_material_usage(db, tenant, row.product_id)
+        usage_out = AcRawMaterialTypeUsageOut(**usage)
+    is_obsolete = _product_is_obsolete(row)
+    return AcRawMaterialTypeOut(
+        product_id=row.product_id,
+        product_code=row.product_code,
+        product_name=row.product_name,
+        finished_product_code=None,
+        operations=[],
+        process_parameters=[],
+        status="OBSOLETE" if is_obsolete else (row.status or "ACTIVE"),
+        is_obsolete=is_obsolete,
+        usage=usage_out,
     )
 
 
 def list_raw_material_types(
-    db: Session, tenant: TenantContext
+    db: Session,
+    tenant: TenantContext,
+    *,
+    active_only: bool = False,
+    include_usage: bool = True,
 ) -> List[AcRawMaterialTypeOut]:
     rows = _repo(db, tenant).query(Product).order_by(Product.product_code).all()
     out: list[AcRawMaterialTypeOut] = []
     for row in rows:
-        typed = _type_from_product(db, tenant, row)
+        typed = _type_from_product(db, tenant, row, include_usage=include_usage)
         if typed:
+            if active_only and typed.is_obsolete:
+                continue
             out.append(typed)
             continue
         ptype = (row.product_type or "").upper()
         code = (row.product_code or "").upper()
         if ptype in ("RAW_MATERIAL", "RAW") or code.startswith("RAW-"):
-            out.append(
-                AcRawMaterialTypeOut(
-                    product_id=row.product_id,
-                    product_code=row.product_code,
-                    product_name=row.product_name,
-                    finished_product_code=None,
-                    operations=[],
-                    process_parameters=[],
-                )
-            )
+            legacy = _legacy_type_out(db, tenant, row, include_usage=include_usage)
+            if active_only and legacy.is_obsolete:
+                continue
+            out.append(legacy)
     return out
 
 
@@ -208,16 +270,48 @@ def get_raw_material_type(
         ptype = (product.product_type or "").upper()
         code = (product.product_code or "").upper()
         if ptype in ("RAW_MATERIAL", "RAW") or code.startswith("RAW-"):
-            return AcRawMaterialTypeOut(
-                product_id=product.product_id,
-                product_code=product.product_code,
-                product_name=product.product_name,
-                finished_product_code=None,
-                operations=[],
-                process_parameters=[],
-            )
+            return _legacy_type_out(db, tenant, product)
         raise NotFoundError(f"Raw material type {product_id} not found")
     return typed
+
+
+def mark_raw_material_type_obsolete(
+    db: Session, tenant: TenantContext, product_id: UUID
+) -> AcRawMaterialTypeOut:
+    repo = _repo(db, tenant)
+    raw = repo.get_by_pk(Product, Product.product_id, product_id)
+    typed = get_raw_material_type(db, tenant, product_id)
+
+    if _product_is_obsolete(raw):
+        return typed
+
+    raw.status = "OBSOLETE"
+    meta = raw.metadata_ if isinstance(raw.metadata_, dict) else {}
+    meta = {
+        **meta,
+        "ac_raw_material_type": True,
+        "obsolete": True,
+        "obsolete_at": meta.get("obsolete_at") or datetime.now(timezone.utc).isoformat(),
+    }
+    raw.metadata_ = meta
+    raw.product_type = "RAW_MATERIAL"
+    repo.db.commit()
+    repo.db.refresh(raw)
+
+    updated = _type_from_product(db, tenant, raw)
+    if updated is None:
+        raise ValidationError("Failed to mark raw material type obsolete")
+    return updated
+
+
+def assert_raw_material_active_for_inward(db: Session, tenant: TenantContext, product_id: UUID) -> None:
+    repo = _repo(db, tenant)
+    product = repo.get_by_pk(Product, Product.product_id, product_id)
+    if _product_is_obsolete(product):
+        raise ValidationError(
+            f"Raw material '{product.product_name}' ({product.product_code}) is obsolete "
+            "and cannot be used for new inward receipts. Add or select an active raw material type."
+        )
 
 
 def create_raw_material_type(
@@ -332,6 +426,14 @@ def update_raw_material_type(
     raw = repo.get_by_pk(Product, Product.product_id, product_id)
     meta = raw.metadata_ if isinstance(raw.metadata_, dict) else {}
 
+    if _product_is_obsolete(raw):
+        raise ValidationError(
+            f"Raw material '{raw.product_name}' is obsolete and cannot be edited. "
+            "Add a new raw material type for future production."
+        )
+
+    usage = raw_material_usage(db, tenant, product_id)
+
     if payload.product_name:
         raw.product_name = payload.product_name.strip()
 
@@ -342,6 +444,12 @@ def update_raw_material_type(
         meta["finished_product_name"] = finished.product_name
 
     if payload.operations is not None:
+        if usage.get("kiln_process_started"):
+            raise ValidationError(
+                "This raw material has batches that entered the kiln process. "
+                "Process steps cannot be changed — mark the material obsolete and "
+                "create a new raw material type for future inward."
+            )
         routing_id = _uuid_or_none(meta.get("routing_id"))
         if not routing_id:
             raise ValidationError(
@@ -351,6 +459,10 @@ def update_raw_material_type(
         meta["operations"] = [op.model_dump() for op in payload.operations]
 
     if payload.process_parameters is not None:
+        if usage.get("kiln_process_started"):
+            raise ValidationError(
+                "Process parameters cannot be changed after kiln production has started."
+            )
         meta["process_parameters"] = [p.model_dump() for p in payload.process_parameters]
 
     if meta.get("ac_raw_material_type") or (raw.product_type or "").upper() in (

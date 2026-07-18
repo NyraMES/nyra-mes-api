@@ -1252,11 +1252,18 @@ def get_masters(db: Session, tenant: TenantContext) -> AcMastersOut:
     suppliers = mes_core_entities.list_suppliers(db, tenant)
     products = mes_core_entities.list_products(db, tenant)
     raw_material_types = ac_raw_material_types.list_raw_material_types(db, tenant)
+    obsolete_product_ids = {
+        t.product_id for t in raw_material_types if t.is_obsolete
+    }
     raw_products = [
         p
         for p in products
-        if (p.product_type or "").upper() == "RAW_MATERIAL"
-        or (p.product_code or "").upper().startswith("RAW-")
+        if (
+            (p.product_type or "").upper() == "RAW_MATERIAL"
+            or (p.product_code or "").upper().startswith("RAW-")
+        )
+        and (p.status or "").upper() != "OBSOLETE"
+        and p.product_id not in obsolete_product_ids
     ]
     if not raw_products:
         raw_products = products
@@ -2213,6 +2220,9 @@ def create_raw_material_inward(
     db: Session, tenant: TenantContext, payload: AcRawMaterialInwardCreate
 ) -> AcRawMaterialInwardCreateResponse:
     sync_ac_sequences(db, tenant.tenant_id)
+    ac_raw_material_types.assert_raw_material_active_for_inward(
+        db, tenant, payload.product_id
+    )
     order_code = resolve_ac_business_code(
         db, provided=payload.order_code, entity="ac_customer_order"
     )

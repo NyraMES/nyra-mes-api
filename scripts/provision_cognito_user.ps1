@@ -9,6 +9,7 @@
 
 param(
     [string]$Email = "",
+    [string]$Username = "",
     [string]$Password = "",
     [string]$Group = "MES_Planner",
     [Parameter(Mandatory = $true)]
@@ -33,7 +34,7 @@ if (-not $PoolId -or -not $Region) {
     exit 1
 }
 
-if (-not $Email) {
+if (-not $Email -and -not $Username) {
     switch ($TenantCode) {
         "SAM_CARBONS_DEMO" {
             $role = ($Group -replace "^MES_", "").ToLower()
@@ -48,6 +49,8 @@ if (-not $Email) {
     }
 }
 
+$CognitoUsername = if ($Username) { $Username } else { $Email }
+
 if (-not $Password) {
     $Password = -join ((48..57) + (65..90) + (97..122) | Get-Random -Count 16 | ForEach-Object { [char]$_ })
     $Password = "Nyra!" + $Password
@@ -55,12 +58,13 @@ if (-not $Password) {
 
 Write-Host "Provisioning Cognito user for tenant $TenantCode" -ForegroundColor Cyan
 Write-Host "  Email: $Email" -ForegroundColor Cyan
+Write-Host "  Username: $CognitoUsername" -ForegroundColor Cyan
 
 $userExists = $false
 try {
     aws cognito-idp admin-get-user `
         --user-pool-id $PoolId `
-        --username $Email `
+        --username $CognitoUsername `
         --region $Region 2>$null | Out-Null
     $userExists = $true
     Write-Host "User already exists - updating tenant and password." -ForegroundColor Yellow
@@ -68,10 +72,14 @@ try {
     $userExists = $false
 }
 
+if (-not $Email -and $Username) {
+    $Email = "$Username@nyra.local"
+}
+
 if (-not $userExists) {
     aws cognito-idp admin-create-user `
         --user-pool-id $PoolId `
-        --username $Email `
+        --username $CognitoUsername `
         --user-attributes `
             Name=email,Value=$Email `
             Name=email_verified,Value=true `
@@ -82,7 +90,7 @@ if (-not $userExists) {
 } else {
     aws cognito-idp admin-update-user-attributes `
         --user-pool-id $PoolId `
-        --username $Email `
+        --username $CognitoUsername `
         --user-attributes Name=custom:tenant_code,Value=$TenantCode `
         --region $Region
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
@@ -90,7 +98,7 @@ if (-not $userExists) {
 
 aws cognito-idp admin-set-user-password `
     --user-pool-id $PoolId `
-    --username $Email `
+    --username $CognitoUsername `
     --password $Password `
     --permanent `
     --region $Region
@@ -107,7 +115,7 @@ if ($LASTEXITCODE -ne 0) {
 
 aws cognito-idp admin-add-user-to-group `
     --user-pool-id $PoolId `
-    --username $Email `
+    --username $CognitoUsername `
     --group-name $Group `
     --region $Region
 
@@ -115,6 +123,7 @@ Write-Host @"
 
 OK: Tenant-scoped Cognito user ready.
 
+  Username    : $CognitoUsername
   Email       : $Email
   Password    : $Password
   Group       : $Group

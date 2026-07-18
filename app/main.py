@@ -24,10 +24,12 @@ from app.core.openapi_tags import OPENAPI_TAGS
 from app.core.tenant_context import TenantContextMiddleware
 
 from app.routes.auth import router as auth_router
+from app.routes.contact import router as contact_router
 from app.routes.mes_core_api import router as mes_core_router
 from app.routes.template_api import router as template_router
 from app.routes.workspace_api import router as workspace_router
 from app.routes.industry.activated_carbon_api import router as activated_carbon_router
+from app.routes.industry.chemical_api import router as chemical_router
 from app.routes.customer import router as customer_router
 from app.routes.part import parts_router, router as part_router
 from app.routes.order import router as order_router
@@ -125,6 +127,7 @@ if settings.demo_mode or settings.demo_read_only:
 register_exception_handlers(app)
 
 app.include_router(auth_router)
+app.include_router(contact_router)
 
 # --- nyra_mes_core: core platform + template + industry adapter routers ---
 app.include_router(
@@ -141,6 +144,10 @@ app.include_router(
 )
 app.include_router(
     activated_carbon_router,
+    dependencies=[require_router_access("mes_core")],
+)
+app.include_router(
+    chemical_router,
     dependencies=[require_router_access("mes_core")],
 )
 

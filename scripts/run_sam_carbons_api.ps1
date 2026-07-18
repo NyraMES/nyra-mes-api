@@ -19,6 +19,7 @@ Remove-Item Env:NYRA_USE_DEMO_ENV -ErrorAction SilentlyContinue
 $env:DEMO_MODE = "false"
 $env:DEMO_READ_ONLY = "false"
 $env:AUTH_ENABLED = "false"
+$env:AUTH_DEV_USER_ROLES = "MES_SuperAdmin"
 $env:DEFAULT_TENANT_CODE = "SAM_CARBONS"
 $env:AC_TENANT_CODE = "SAM_CARBONS"
 $env:AC_WORKSPACE_CODE = "SAM_CARBONS_ACTIVATED_CARBON"

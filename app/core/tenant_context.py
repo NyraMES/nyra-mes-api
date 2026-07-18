@@ -123,6 +123,18 @@ def resolve_tenant(db: Session, tenant_code: str, workspace_code: Optional[str] 
             raise NotFoundError(
                 f"Workspace '{workspace_code}' not found for tenant '{tenant_code}'"
             )
+    else:
+        active_workspaces = (
+            db.query(ProjectWorkspace)
+            .filter(
+                ProjectWorkspace.tenant_id == tenant.tenant_id,
+                ProjectWorkspace.status == "ACTIVE",
+            )
+            .order_by(ProjectWorkspace.workspace_code)
+            .all()
+        )
+        if len(active_workspaces) == 1:
+            workspace = active_workspaces[0]
 
     enabled = _load_enabled_capabilities(db, template.industry_template_id)
 

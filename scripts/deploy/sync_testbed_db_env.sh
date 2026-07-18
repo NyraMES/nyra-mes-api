@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Sync nyra_mes_core DB config on testbed â€” prefer Secrets Manager over stale .env password.
+# Sync nyra_mes_core DB config on testbed — prefer Secrets Manager over stale .env password.
 set -euo pipefail
 
 API_DIR="${1:-/home/ubuntu/nyra-mes-api}"
@@ -9,10 +9,11 @@ API_PORT="${4:-8010}"
 
 cd "$API_DIR"
 ENV_FILE="$API_DIR/.env"
+PYTHON="${API_DIR}/venv/bin/python"
 
 if [[ -z "$SECRET_ID" ]]; then
   if [[ -f "$API_DIR/scripts/deploy/discover_rds_secret.py" ]]; then
-    DISCOVER_OUT="$("$API_DIR/venv/bin/python" "$API_DIR/scripts/deploy/discover_rds_secret.py" 2>&1)" || true
+    DISCOVER_OUT="$("$PYTHON" "$API_DIR/scripts/deploy/discover_rds_secret.py" 2>&1)" || true
     SECRET_ID="$(echo "$DISCOVER_OUT" | grep '^MES_CORE_DB_SECRET_ID=' | cut -d= -f2- || true)"
     if [[ -z "$SECRET_ID" ]]; then
       echo "$DISCOVER_OUT" >&2
@@ -29,7 +30,8 @@ fi
 
 echo "Using MES_CORE_DB_SECRET_ID (length ${#SECRET_ID})"
 
-python3 <<'PY' "$ENV_FILE" "$SECRET_ID"
+# Args before heredoc — placing them after <<PY wrongly runs .env as a Python script.
+"$PYTHON" - "$ENV_FILE" "$SECRET_ID" <<'PY'
 import sys
 from pathlib import Path
 
@@ -57,11 +59,10 @@ for key, val in updates.items():
     if key not in seen:
         out.append(f"{key}={val}")
 path.write_text("\n".join(out) + "\n", encoding="utf-8")
-print(f"Updated {path} â€” password cleared, secret id set.")
+print(f"Updated {path} — password cleared, secret id set.")
 PY
 
-source venv/bin/activate
-python scripts/resolve_mes_core_secret.py || {
+"$PYTHON" "$API_DIR/scripts/resolve_mes_core_secret.py" || {
   echo "ERROR: DB connection failed after secret sync." >&2
   exit 1
 }

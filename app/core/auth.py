@@ -77,6 +77,10 @@ def _tenant_code_from_claims(claims: Dict[str, Any]) -> Optional[str]:
     return None
 
 
+# Demo playground tenants — any authenticated MES user may open these for industry previews.
+_DEMO_PLAYGROUND_TENANTS: frozenset[str] = frozenset({"SAM_CARBONS_DEMO"})
+
+
 def assert_user_may_access_tenant(user: UserContext, tenant_code: str) -> None:
     """Phase-2 guard: JWT tenant must match the resolved request tenant."""
     if not settings.auth_enabled:
@@ -89,6 +93,8 @@ def assert_user_may_access_tenant(user: UserContext, tenant_code: str) -> None:
             details={"requested_tenant": requested},
         )
     if expected != requested:
+        if requested in _DEMO_PLAYGROUND_TENANTS and user.has_any_role(ALL_MES_ROLES):
+            return
         raise ForbiddenError(
             "This account belongs to a different plant. Sign in on the correct domain.",
             details={

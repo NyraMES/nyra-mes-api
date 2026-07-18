@@ -12,5 +12,5 @@ $RemoteApiService = "nyra-mes-api"
 $RemoteApiPort = "8010"
 
 # RDS Secrets Manager — password fetched at runtime (no stale copy in server .env).
-# Leave empty to auto-discover from RDS describe-db-instances on the EC2 host.
-$MesCoreDbSecretId = ""
+# nyra-mes-core master secret (eu-north-1). EC2 needs scripts/iam/ec2-mes-core-secret-read.json.
+$MesCoreDbSecretId = "rds!db-36663457-9b38-40d7-a4e7-bb4b65ac1f79"

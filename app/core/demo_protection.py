@@ -22,6 +22,8 @@ _DEMO_EXEMPT_TENANT_CODES: FrozenSet[str] = frozenset({"SAM_CARBONS_DEMO", "SAM_
 _READ_ONLY_POST_ALLOW: FrozenSet[str] = frozenset(
     {
         "/api/ask",
+        "/public/contact-enquiry",
+        "/api/public/contact-enquiry",
     }
 )
 

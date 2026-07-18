@@ -321,10 +321,13 @@ def ac_create_supplier(
     summary="Raw material types with linked routing",
 )
 def ac_list_raw_material_types(
+    active_only: bool = False,
     db: Session = Depends(get_mes_core_db),
     tenant: TenantContext = Depends(_AC_MASTERS),
 ):
-    return ac_raw_material_types.list_raw_material_types(db, tenant)
+    return ac_raw_material_types.list_raw_material_types(
+        db, tenant, active_only=active_only
+    )
 
 
 @router.post(
@@ -375,6 +378,27 @@ def ac_update_raw_material_type(
     try:
         return ac_raw_material_types.update_raw_material_type(
             db, tenant, product_id, payload
+        )
+    except ValidationError:
+        raise
+    except Exception as exc:
+        raise ValidationError(str(exc)) from exc
+
+
+@router.post(
+    "/masters/raw-material-types/{product_id}/obsolete",
+    response_model=AcRawMaterialTypeOut,
+    summary="Mark raw material type obsolete (preserves history, blocks new inward)",
+)
+def ac_mark_raw_material_type_obsolete(
+    product_id: UUID,
+    db: Session = Depends(get_mes_core_db),
+    tenant: TenantContext = Depends(_AC_MASTERS),
+    _user=require_super_admin(),
+):
+    try:
+        return ac_raw_material_types.mark_raw_material_type_obsolete(
+            db, tenant, product_id
         )
     except ValidationError:
         raise

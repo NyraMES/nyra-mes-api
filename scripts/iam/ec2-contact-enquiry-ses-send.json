@@ -1,0 +1,13 @@
+# SES send permission for nyra-mes-api contact form on testbed EC2.
+#
+# 1. Verify the sender in SES (eu-north-1) — run once:
+#      aws ses verify-email-identity --email-address sudhasankaran@nyraias.com --region eu-north-1
+#    Click the link in the verification email AWS sends to that inbox.
+#
+# 2. Attach this policy to the EC2 instance role (testbed_ec2_role):
+#      aws iam put-role-policy \
+#        --role-name testbed_ec2_role \
+#        --policy-name ContactEnquirySesSend \
+#        --policy-document file://scripts/iam/ec2-contact-enquiry-ses-send.policy.json
+#
+# SES is in sandbox mode: only verified addresses can receive mail until production access is granted.

@@ -36,6 +36,7 @@ class Tags:
     TEMPLATE:       Final[str] = "Industry Templates"
     WORKSPACE:      Final[str] = "Workspaces"
     ACTIVATED_CARBON: Final[str] = "Activated Carbon"
+    CHEMICAL: Final[str] = "Chemical Processing"
 
 
 OPENAPI_TAGS: List[dict] = [
@@ -181,6 +182,13 @@ OPENAPI_TAGS: List[dict] = [
         "description": (
             "Activated Carbon industry adapter — reuses common MES tables "
             "with capability-guarded routes."
+        ),
+    },
+    {
+        "name": Tags.CHEMICAL,
+        "description": (
+            "Chemical Processing industry adapter — batch reactor workflows "
+            "over common MES tables with capability-guarded routes."
         ),
     },
 ]
