@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from typing import Dict, Optional, Tuple
 
 from app.core.config import settings
+from app.core.tenant_aliases import canonical_tenant_code, canonical_workspace_code
 
 # Built-in dev bindings; production client tenants come from HOST_TENANT_MAP env.
 # ac.localhost is industry-only — tenant defaults to the generic AC demo tenant.
@@ -56,8 +57,10 @@ def _parse_host_tenant_map(raw: str) -> Dict[str, Tuple[str, Optional[str], str]
         segments = [segment.strip() for segment in value_part.split(":") if segment.strip()]
         if not segments:
             continue
-        tenant_code = segments[0]
-        workspace_code = segments[1] if len(segments) > 1 else None
+        tenant_code = canonical_tenant_code(segments[0]) or segments[0]
+        workspace_code = (
+            canonical_workspace_code(segments[1]) if len(segments) > 1 else None
+        )
         industry_key = segments[2] if len(segments) > 2 else _industry_key_for_tenant(tenant_code)
         parsed[host] = (tenant_code, workspace_code, industry_key)
     return parsed

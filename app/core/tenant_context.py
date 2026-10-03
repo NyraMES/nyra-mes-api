@@ -22,6 +22,7 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from app.core.auth import UserContext, assert_user_may_access_tenant, get_current_user
 from app.core.config import settings
 from app.core.exceptions import NotFoundError
+from app.core.tenant_aliases import canonical_tenant_code, canonical_workspace_code
 from app.db.mes_core_database import get_mes_core_db
 from app.models.mes_core.platform import (
     Capability,
@@ -71,8 +72,8 @@ class TenantContextMiddleware(BaseHTTPMiddleware):
             or request.query_params.get("workspace_code")
             or ""
         ).strip()
-        request.state.tenant_code = tenant_code
-        request.state.workspace_code = workspace_code or None
+        request.state.tenant_code = canonical_tenant_code(tenant_code) or tenant_code
+        request.state.workspace_code = canonical_workspace_code(workspace_code or None)
         return await call_next(request)
 
 
@@ -96,6 +97,8 @@ def _load_enabled_capabilities(db: Session, template_id: UUID) -> Tuple[str, ...
 
 def resolve_tenant(db: Session, tenant_code: str, workspace_code: Optional[str] = None) -> TenantContext:
     """Load tenant, workspace, industry template metadata, and enabled capabilities."""
+    tenant_code = canonical_tenant_code(tenant_code) or tenant_code
+    workspace_code = canonical_workspace_code(workspace_code)
     row = (
         db.query(Tenant, IndustryTemplate)
         .join(

@@ -453,6 +453,18 @@ class CustomerOrderOut(MesCoreModel):
     allocated_to_production_kg: Optional[Decimal] = None
     available_quantity_kg: Optional[Decimal] = None
     qc_status: Optional[str] = None
+    dc_number: Optional[str] = None
+    supplier_weight_kg: Optional[Decimal] = None
+    our_weight_kg: Optional[Decimal] = None
+    supplier_value_inr: Optional[Decimal] = None
+    lab_status: Optional[str] = None
+    lab_at: Optional[datetime] = None
+    rms_inward_status: Optional[str] = None
+    rms_inward_at: Optional[datetime] = None
+    rm_outward_status: Optional[str] = None
+    rm_outward_at: Optional[datetime] = None
+    released_to_production_status: Optional[str] = None
+    released_to_production_at: Optional[datetime] = None
 
 
 class CustomerOrderLineCreate(BaseModel):
@@ -793,6 +805,7 @@ class AcRoutingMasterOut(BaseModel):
 class AcMastersOut(BaseModel):
     customers: list[CustomerOut] = Field(default_factory=list)
     raw_products: list[ProductOut] = Field(default_factory=list)
+    raw_material_types: list["AcRawMaterialTypeOut"] = Field(default_factory=list)
     finished_products: list[ProductOut] = Field(default_factory=list)
     production_orders: list[ProductionOrderOut] = Field(default_factory=list)
     production_lots: list[ProductionLotOut] = Field(default_factory=list)
@@ -810,6 +823,31 @@ class AcRawMaterialInwardCreate(BaseModel):
     product_id: UUID
     quantity: Decimal = Field(..., gt=0)
     uom: str = "KG"
+    dc_number: Optional[str] = Field(
+        None,
+        max_length=64,
+        description="Supplier delivery challan (DC) number at inward receipt.",
+    )
+    supplier_weight_kg: Optional[Decimal] = Field(
+        None,
+        gt=0,
+        description="Weight declared by supplier on DC (kg).",
+    )
+    our_weight_kg: Optional[Decimal] = Field(
+        None,
+        gt=0,
+        description="Plant-weighed quantity at gate (kg). Used as received quantity when set.",
+    )
+    supplier_value_inr: Optional[Decimal] = Field(
+        None,
+        ge=0,
+        description="Supplier invoice / declared value in INR.",
+    )
+    our_value_inr: Optional[Decimal] = Field(
+        None,
+        ge=0,
+        description="Internal assessed value in INR at gate receipt.",
+    )
     order_code: Optional[str] = Field(None, max_length=64)
     production_order_code: Optional[str] = Field(
         None,
@@ -835,6 +873,7 @@ class AcRawMaterialQcOut(BaseModel):
     product_name: Optional[str] = None
     quantity: Optional[Decimal] = None
     uom: Optional[str] = None
+    our_weight_kg: Optional[Decimal] = None
     moisture_pct: Optional[Decimal] = None
     ash_pct: Optional[Decimal] = None
     foreign_matter_pct: Optional[Decimal] = None
@@ -844,6 +883,55 @@ class AcRawMaterialQcOut(BaseModel):
     operator_remarks: Optional[str] = None
     qc_status: str = "PENDING"
     qc_at: Optional[datetime] = None
+    crush_status: str = "PENDING"
+    crush_at: Optional[datetime] = None
+    raw_material_type_id: Optional[UUID] = None
+    inbound_steps: list["AcInboundStepStatusOut"] = Field(default_factory=list)
+    inbound_prep_complete: bool = False
+    next_inbound_step: Optional[str] = None
+    next_inbound_operation_code: Optional[str] = None
+
+
+class AcInboundStepStatusOut(BaseModel):
+    process_step: str
+    operation_name: str
+    operation_code: Optional[str] = None
+    is_mandatory: bool = True
+    status: str = "PENDING"
+    completed_at: Optional[datetime] = None
+
+
+class AcInboundStepCompleteCreate(BaseModel):
+    customer_order_id: UUID
+    process_step: str = Field(..., min_length=1, max_length=64)
+    operation_code: Optional[str] = Field(
+        None,
+        max_length=64,
+        description="Inbound prep operation code (required when multiple steps share a process_step).",
+    )
+    parameters: dict = Field(default_factory=dict)
+
+
+class AcInboundExecutionOut(AcRawMaterialQcOut):
+    """Inward order with configurable inbound prep step status."""
+
+
+class AcRawMaterialCrushCreate(BaseModel):
+    customer_order_id: UUID
+    input_lump_size_mm: Optional[Decimal] = Field(None, ge=0)
+    target_output_size_mm: Optional[Decimal] = Field(None, ge=0)
+    throughput_kg_h: Optional[Decimal] = Field(None, ge=0)
+    crush_output_kg: Decimal = Field(..., gt=0)
+    crush_yield_pct: Optional[Decimal] = Field(None, ge=0, le=100)
+    moisture_before_pct: Optional[Decimal] = Field(None, ge=0, le=100)
+    moisture_after_pct: Optional[Decimal] = Field(None, ge=0, le=100)
+    dust_generation_pct: Optional[Decimal] = Field(None, ge=0, le=100)
+    crusher_id: Optional[str] = Field(None, max_length=64)
+    operator_remarks: Optional[str] = None
+
+
+class AcRawMaterialCrushOut(AcRawMaterialQcOut):
+    """Same inward row shape as QC list, with crushing fields from order metadata."""
 
 
 class AcRawMaterialQcCreate(BaseModel):
@@ -856,6 +944,149 @@ class AcRawMaterialQcCreate(BaseModel):
     minus20_kg: Optional[Decimal] = Field(None, ge=0)
     operator_remarks: Optional[str] = None
     qc_status: str = Field(default="PASS", max_length=32)
+
+
+class AcInitialQcCreate(BaseModel):
+    customer_order_id: UUID
+    moisture_pct: Decimal = Field(..., ge=0, le=100, description="Moisture content (%)")
+    dust_pct: Decimal = Field(..., ge=0, le=100, description="Dust content (%)")
+    ad_value: Decimal = Field(..., ge=0, description="Apparent density / AD lab reading (not KG)")
+    qc_status: str = Field(default="PASS", max_length=32)
+
+
+class AcInboundWorkflowOut(BaseModel):
+    customer_order_id: UUID
+    order_code: str
+    product_code: Optional[str] = None
+    product_name: Optional[str] = None
+    quantity: Optional[Decimal] = None
+    uom: Optional[str] = None
+    initial_qc_status: str = "PENDING"
+    initial_qc_at: Optional[str] = None
+    moisture_pct: Optional[Decimal] = Field(None, description="Initial QC moisture (%)")
+    dust_pct: Optional[Decimal] = Field(None, description="Initial QC dust (%)")
+    ad_value: Optional[Decimal] = Field(None, description="Initial QC AD lab reading")
+    received_kg: Optional[Decimal] = None
+    supplier_weight_kg: Optional[Decimal] = None
+    weight_to_crusher_kg: Optional[Decimal] = None
+    weight_reconciled: bool = False
+    variance_comment: Optional[str] = None
+    bag_count: int = 0
+    bags_total_kg: Optional[Decimal] = None
+    bags_reconciled: bool = False
+    bag_variance_comment: Optional[str] = None
+    crusher_complete: bool = False
+    crusher_at: Optional[str] = None
+    rotary: Optional[str] = None
+    crusher_grades: list["AcCrusherGradeOut"] = Field(default_factory=list)
+    crusher_scrap: list["AcCrusherGradeOut"] = Field(default_factory=list)
+    scrap_total_kg: Optional[Decimal] = None
+    remaining_kg: Optional[Decimal] = None
+    separation_complete: bool = False
+
+
+class AcCrusherGradeOut(BaseModel):
+    grade_label: str
+    parameter_key: str
+    quantity_kg: Decimal = Field(default=Decimal("0"))
+
+
+class AcInitialQcOut(AcInboundWorkflowOut):
+    pass
+
+
+class AcCrusherOutputOut(AcInboundWorkflowOut):
+    pass
+
+
+class AcInwardBagCreate(BaseModel):
+    customer_order_id: UUID
+    grade: Optional[str] = Field(None, max_length=128)
+    weight_kg: Decimal = Field(..., gt=0)
+    label: Optional[str] = Field(None, max_length=128)
+
+
+class AcInwardBagOut(BaseModel):
+    bag_id: UUID
+    bag_code: str
+    customer_order_id: UUID
+    order_code: str
+    grade: Optional[str] = None
+    weight_kg: Decimal
+    label: Optional[str] = None
+    status: str = "REGISTERED"
+    created_at: Optional[str] = None
+    fed_at: Optional[str] = None
+
+
+class AcInwardBagReconcileCreate(BaseModel):
+    customer_order_id: UUID
+    variance_comment: Optional[str] = Field(None, max_length=2000)
+
+
+class AcInwardGradeSplitRow(BaseModel):
+    grade_label: str = Field(..., min_length=1, max_length=128)
+    quantity_kg: Decimal = Field(..., gt=0)
+
+
+class AcInwardGradeSeparationCreate(BaseModel):
+    customer_order_id: UUID
+    grade_splits: list[AcInwardGradeSplitRow] = Field(..., min_length=1)
+
+
+class AcWeightToCrusherCreate(BaseModel):
+    customer_order_id: UUID
+    weight_to_crusher_kg: Decimal = Field(..., gt=0)
+    variance_comment: Optional[str] = Field(None, max_length=2000)
+
+
+class AcInboundAdminRotary(BaseModel):
+    code: str = Field("", max_length=64)
+    name: str = Field(..., min_length=1, max_length=128)
+
+
+class AcInboundAdminSplit(BaseModel):
+    key: str = Field("", max_length=64)
+    label: str = Field(..., min_length=1, max_length=128)
+
+
+class AcInboundAdminOut(BaseModel):
+    rotaries: list[AcInboundAdminRotary] = Field(default_factory=list)
+    outward_splits: list[AcInboundAdminSplit] = Field(default_factory=list)
+
+
+class AcInboundAdminUpdate(BaseModel):
+    rotaries: list[AcInboundAdminRotary] = Field(default_factory=list)
+    outward_splits: list[AcInboundAdminSplit] = Field(default_factory=list)
+
+
+class AcInwardBagFeedCreate(BaseModel):
+    customer_order_id: UUID
+    bag_id: UUID
+
+
+class AcCrusherOutputCreate(BaseModel):
+    customer_order_id: UUID
+    rotary: str = Field(..., min_length=1, max_length=64)
+    crusher_grade: Optional[str] = Field(None, max_length=128)
+    mesh_plus_2_kg: Optional[Decimal] = Field(None, ge=0, description="Scrap mesh +2 weight (KG)")
+    mesh_2_3_kg: Optional[Decimal] = Field(None, ge=0, description="Scrap mesh 2/3 weight (KG)")
+    mesh_3_4_kg: Optional[Decimal] = Field(None, ge=0, description="Scrap mesh 3/4 weight (KG)")
+    mesh_4_6_kg: Optional[Decimal] = Field(None, ge=0, description="Scrap mesh 4/6 weight (KG)")
+    mesh_6_10_kg: Optional[Decimal] = Field(None, ge=0, description="Scrap mesh 6/10 weight (KG)")
+    mesh_10_12_kg: Optional[Decimal] = Field(None, ge=0, description="Scrap mesh 10/12 weight (KG)")
+    mesh_12_14_kg: Optional[Decimal] = Field(None, ge=0, description="Scrap mesh 12/14 weight (KG)")
+    mesh_minus_14_kg: Optional[Decimal] = Field(None, ge=0, description="Scrap mesh -14 weight (KG)")
+    mesh_plus_2_pct: Optional[Decimal] = Field(None, ge=0, le=100, description="Mesh +2 share (%)")
+    mesh_2_3_pct: Optional[Decimal] = Field(None, ge=0, le=100, description="Mesh 2/3 share (%)")
+    mesh_3_4_pct: Optional[Decimal] = Field(None, ge=0, le=100, description="Mesh 3/4 share (%)")
+    mesh_4_6_pct: Optional[Decimal] = Field(None, ge=0, le=100, description="Mesh 4/6 share (%)")
+    mesh_6_10_pct: Optional[Decimal] = Field(None, ge=0, le=100, description="Mesh 6/10 share (%)")
+    mesh_10_12_pct: Optional[Decimal] = Field(None, ge=0, le=100, description="Mesh 10/12 share (%)")
+    mesh_12_14_pct: Optional[Decimal] = Field(None, ge=0, le=100, description="Mesh 12/14 share (%)")
+    mesh_minus_14_pct: Optional[Decimal] = Field(None, ge=0, le=100, description="Mesh -14 share (%)")
+    moisture_pct: Optional[Decimal] = Field(None, ge=0, le=100, description="Moisture after crush (%)")
+    dust_pct: Optional[Decimal] = Field(None, ge=0, le=100, description="Dust / fines (%)")
 
 
 class AcKilnFeedLotCreate(BaseModel):
@@ -884,6 +1115,15 @@ class AcScreeningCreate(BaseModel):
     overs_kg: Optional[float] = None
     fines_kg: Optional[float] = None
     good_kg: Optional[float] = None
+
+
+class AcGradeSeparationCreate(BaseModel):
+    production_lot_id: UUID
+    grade_code: str = Field(..., min_length=1, max_length=64)
+    separated_kg: Optional[float] = Field(None, ge=0)
+    grade_yield_pct: Optional[float] = Field(None, ge=0, le=100)
+    overs_grade_kg: Optional[float] = Field(None, ge=0)
+    fines_grade_kg: Optional[float] = Field(None, ge=0)
 
 
 class AcQualityTestCreate(BaseModel):
@@ -1089,6 +1329,21 @@ class AcMakeToStockCreate(BaseModel):
     inward_order_id: Optional[UUID] = None
     finished_product_id: Optional[UUID] = None
     production_order_code: Optional[str] = Field(None, max_length=64)
+    lot_quantities: Optional[list[Decimal]] = Field(
+        None,
+        min_length=1,
+        description="Split release into multiple kiln-feed lots; must sum to quantity.",
+    )
+    lot_splits: Optional[list["AcGradeLotSplit"]] = Field(
+        None,
+        min_length=1,
+        description="Grade-labelled lot splits from crusher output; must sum to quantity.",
+    )
+
+
+class AcGradeLotSplit(BaseModel):
+    grade_label: str = Field(..., min_length=1, max_length=64)
+    quantity_kg: Decimal = Field(..., gt=0)
 
 
 class AcMakeToStockCreateResponse(BaseModel):
@@ -1096,6 +1351,7 @@ class AcMakeToStockCreateResponse(BaseModel):
     line: CustomerOrderLineOut
     production_order: ProductionOrderOut
     production_lot: Optional[ProductionLotOut] = None
+    production_lots: list[ProductionLotOut] = Field(default_factory=list)
 
 
 class AcRawMaterialTypeOperation(BaseModel):
@@ -1113,6 +1369,11 @@ class AcRawMaterialProcessParameter(BaseModel):
     default_value: Optional[str] = Field(None, max_length=128)
     used_at: str = Field(default="feasibility", max_length=32)
     process_step: Optional[str] = Field(None, max_length=64)
+    operation_code: Optional[str] = Field(
+        None,
+        max_length=64,
+        description="When set, parameter applies only to this routing operation code.",
+    )
     ontology_predicate: Optional[str] = Field(None, max_length=64)
     predicate_uri: Optional[str] = Field(None, max_length=256)
     subject_uri_template: Optional[str] = Field(None, max_length=256)
@@ -1138,10 +1399,14 @@ class AcRawMaterialTypeOut(BaseModel):
     routing_code: Optional[str] = None
     routing_id: Optional[UUID] = None
     operations: list = Field(default_factory=list)
+    inbound_operations: list = Field(default_factory=list)
     process_parameters: list = Field(default_factory=list)
     status: str = "ACTIVE"
     is_obsolete: bool = False
     usage: Optional[AcRawMaterialTypeUsageOut] = None
+
+
+AcMastersOut.model_rebuild()
 
 
 class AcRawMaterialTypeCreate(BaseModel):
@@ -1151,6 +1416,7 @@ class AcRawMaterialTypeCreate(BaseModel):
     finished_product_name: Optional[str] = Field(None, max_length=256)
     routing_code: Optional[str] = Field(None, max_length=64)
     operations: list[AcRawMaterialTypeOperation] = Field(default_factory=list)
+    inbound_operations: list[AcRawMaterialTypeOperation] = Field(default_factory=list)
     process_parameters: list[AcRawMaterialProcessParameter] = Field(default_factory=list)
 
 
@@ -1158,6 +1424,7 @@ class AcRawMaterialTypeUpdate(BaseModel):
     product_name: Optional[str] = Field(None, min_length=1, max_length=256)
     finished_product_name: Optional[str] = Field(None, min_length=1, max_length=256)
     operations: Optional[list[AcRawMaterialTypeOperation]] = None
+    inbound_operations: Optional[list[AcRawMaterialTypeOperation]] = None
     process_parameters: Optional[list[AcRawMaterialProcessParameter]] = None
 
 

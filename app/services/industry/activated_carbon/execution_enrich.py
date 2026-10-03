@@ -35,36 +35,11 @@ def _uuid_or_none(value) -> Optional[UUID]:
 def _resolve_raw_material_type(
     db: Session, tenant: TenantContext, lot: ProductionLot
 ) -> Optional[Any]:
-    repo = _repo(db, tenant)
-    po = repo.get_by_pk(
-        ProductionOrder, ProductionOrder.production_order_id, lot.production_order_id
+    from app.services.industry.activated_carbon.lot_routing import (
+        resolve_raw_material_type_for_lot,
     )
-    po_meta = po.metadata_ if isinstance(po.metadata_, dict) else {}
-    inward_id = _uuid_or_none(po_meta.get("source_inward_order_id"))
-    raw_product_id: Optional[UUID] = None
 
-    if inward_id:
-        inward = repo.get_by_pk(
-            CustomerOrder, CustomerOrder.customer_order_id, inward_id
-        )
-        imeta = inward.metadata_ if isinstance(inward.metadata_, dict) else {}
-        raw_product_id = _uuid_or_none(imeta.get("raw_product_id"))
-
-    types = ac_raw_material_types.list_raw_material_types(db, tenant)
-    if raw_product_id:
-        for typed in types:
-            if typed.product_id == raw_product_id:
-                return typed
-
-    line = repo.get_by_pk(
-        CustomerOrderLine, CustomerOrderLine.order_line_id, po.order_line_id
-    )
-    finished = repo.get_by_pk(Product, Product.product_id, line.product_id)
-    fg_code = (finished.product_code or "").upper()
-    for typed in types:
-        if (typed.finished_product_code or "").upper() == fg_code:
-            return typed
-    return types[0] if types else None
+    return resolve_raw_material_type_for_lot(db, tenant, lot)
 
 
 def _param_from_process_def(defn: dict) -> dict[str, Any]:
@@ -101,6 +76,9 @@ def _param_from_process_def(defn: dict) -> dict[str, Any]:
 
 
 def _process_step_for_op(op: dict) -> str:
+    explicit = (op.get("process_step") or op.get("process_id") or "").upper()
+    if explicit:
+        return explicit
     code = (op.get("operation_code") or op.get("operation_id") or "").upper()
     if "PYROLYSIS" in code or "CARBON" in code:
         return "PYROLYSIS"
@@ -110,7 +88,7 @@ def _process_step_for_op(op: dict) -> str:
         return "SCREENING"
     if "QC" in code or "QUALITY" in code:
         return "QC"
-    return (op.get("process_step") or op.get("process_id") or "").upper()
+    return code.replace("OP-", "", 1)
 
 
 def _merge_parameters(
@@ -158,10 +136,14 @@ def enrich_lot_execution_summary(
     enriched_ops = []
     for op in operations:
         step = _process_step_for_op(op)
+        op_code = (op.get("operation_code") or op.get("operation_id") or "").upper()
         step_defs = []
         for raw in exec_params:
             ps = (raw.get("process_step") or "").upper()
             if ps and ps != step:
+                continue
+            bound = (raw.get("operation_code") or "").upper()
+            if bound and op_code and bound != op_code:
                 continue
             if not ps and step not in ("PYROLYSIS", "ACTIVATION", "SCREENING", "QC"):
                 continue
@@ -195,10 +177,14 @@ def enrich_routing_plan_operations(
     out = []
     for op in operations:
         step = _process_step_for_op(op)
+        op_code = (op.get("operation_code") or op.get("operation_id") or "").upper()
         step_defs = []
         for raw in exec_params:
             ps = (raw.get("process_step") or "").upper()
             if ps and ps != step:
+                continue
+            bound = (raw.get("operation_code") or "").upper()
+            if bound and op_code and bound != op_code:
                 continue
             if not ps and step not in ("PYROLYSIS", "ACTIVATION", "SCREENING", "QC"):
                 continue

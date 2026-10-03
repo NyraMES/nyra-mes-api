@@ -16,7 +16,9 @@ _DEMO_WATERMARK = "Nyra Demo - Confidential - Fictional data only"
 _DEMO_HARDENED_TENANT_CODES: FrozenSet[str] = frozenset({"NYRA_VIDEO_DEMO"})
 
 # Local validation tenants — never inherit video-demo hardening.
-_DEMO_EXEMPT_TENANT_CODES: FrozenSet[str] = frozenset({"SAM_CARBONS_DEMO", "SAM_CARBONS"})
+_DEMO_EXEMPT_TENANT_CODES: FrozenSet[str] = frozenset(
+    {"SAM_CARBONS_DEMO", "GR_CARBONS", "SAM_CARBONS"}
+)
 
 # Mutations allowed in read-only demo (prospect-safe showcase).
 _READ_ONLY_POST_ALLOW: FrozenSet[str] = frozenset(

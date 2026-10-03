@@ -834,8 +834,14 @@ def start_execution(
     db: Session = Depends(get_mes_core_db),
     tenant: TenantContext = Depends(get_tenant_context),
 ):
-    out = mes_core_execution.start_execution(db, tenant, execution_code, payload)
     template = (tenant.industry_template_code or "").upper()
+    if "ACTIVATED" in template or template == "ACTIVATED_CARBON":
+        from app.services.industry.activated_carbon import stock as ac_stock
+
+        ac_stock.validate_resources_for_execution_start(
+            db, tenant, execution_code, payload
+        )
+    out = mes_core_execution.start_execution(db, tenant, execution_code, payload)
     if "ACTIVATED" in template or template == "ACTIVATED_CARBON":
         from app.services.industry.activated_carbon import stock as ac_stock
 
@@ -854,7 +860,13 @@ def hold_execution(
     db: Session = Depends(get_mes_core_db),
     tenant: TenantContext = Depends(get_tenant_context),
 ):
-    return mes_core_execution.hold_execution(db, tenant, execution_code, payload)
+    out = mes_core_execution.hold_execution(db, tenant, execution_code, payload)
+    template = (tenant.industry_template_code or "").upper()
+    if "ACTIVATED" in template or template == "ACTIVATED_CARBON":
+        from app.services.industry.activated_carbon import stock as ac_stock
+
+        ac_stock.on_execution_held(db, tenant, execution_code)
+    return out
 
 
 @router.put(
@@ -867,7 +879,13 @@ def resume_execution(
     db: Session = Depends(get_mes_core_db),
     tenant: TenantContext = Depends(get_tenant_context),
 ):
-    return mes_core_execution.resume_execution(db, tenant, execution_code)
+    out = mes_core_execution.resume_execution(db, tenant, execution_code)
+    template = (tenant.industry_template_code or "").upper()
+    if "ACTIVATED" in template or template == "ACTIVATED_CARBON":
+        from app.services.industry.activated_carbon import stock as ac_stock
+
+        ac_stock.on_execution_resumed(db, tenant, execution_code)
+    return out
 
 
 @router.put(
@@ -887,7 +905,9 @@ def complete_execution(
     template = (tenant.industry_template_code or "").upper()
     if "ACTIVATED" in template or template == "ACTIVATED_CARBON":
         from app.services.industry.activated_carbon import stock as ac_stock
+        from app.services.industry.activated_carbon import triplet_capture as ac_triplets
 
+        ac_triplets.stage_execution_parameter_triples(db, tenant, execution_code)
         ac_stock.after_work_order_completed(db, tenant, execution_code)
     return out
 
@@ -903,9 +923,15 @@ def append_execution_parameter_readings(
     db: Session = Depends(get_mes_core_db),
     tenant: TenantContext = Depends(get_tenant_context),
 ):
-    return mes_core_execution.append_execution_parameter_readings(
+    out = mes_core_execution.append_execution_parameter_readings(
         db, tenant, execution_code, payload.parameter_readings
     )
+    template = (tenant.industry_template_code or "").upper()
+    if "ACTIVATED" in template or template == "ACTIVATED_CARBON":
+        from app.services.industry.activated_carbon import triplet_capture as ac_triplets
+
+        ac_triplets.stage_execution_parameter_triples(db, tenant, execution_code)
+    return out
 
 
 # --- Execution (CRUD) ---

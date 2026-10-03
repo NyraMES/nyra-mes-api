@@ -7,6 +7,7 @@ from typing import List, Optional
 from uuid import UUID
 
 from sqlalchemy.orm import Session
+from sqlalchemy.orm.attributes import flag_modified
 
 from app.core.exceptions import NotFoundError, ValidationError
 from app.core.tenant_context import TenantContext
@@ -33,6 +34,21 @@ from app.services.mes_core.base import TenantRepository
 
 def _repo(db: Session, tenant: TenantContext) -> TenantRepository:
     return TenantRepository(db, tenant)
+
+
+def _product_meta(product: Product) -> dict:
+    raw = product.metadata_
+    return dict(raw) if isinstance(raw, dict) else {}
+
+
+def _set_product_metadata(product: Product, meta: dict) -> None:
+    product.metadata_ = dict(meta)
+    flag_modified(product, "metadata_")
+
+
+def _set_operation_metadata(row: RoutingOperation, meta: dict) -> None:
+    row.metadata_ = dict(meta)
+    flag_modified(row, "metadata_")
 
 
 def _uuid_or_none(value) -> Optional[UUID]:
@@ -89,6 +105,25 @@ def _apply_process_metadata(meta: dict, process_step: str, is_mandatory: bool = 
     }
 
 
+def _set_row_sequence(row: RoutingOperation, sequence: int) -> None:
+    row.operation_sequence = sequence
+    if hasattr(row, "operation_seq"):
+        row.operation_seq = sequence
+
+
+def rebase_operation_sequences(rows) -> None:
+    """Park sequences above 1..n so a later assign can swap freely."""
+    for index, row in enumerate(rows):
+        _set_row_sequence(row, 10_000 + index)
+
+
+def assign_operation_sequences(rows_by_code: dict[str, RoutingOperation], desired: dict[str, int]) -> None:
+    for code, sequence in desired.items():
+        row = rows_by_code.get(code)
+        if row is not None:
+            _set_row_sequence(row, sequence)
+
+
 def _sync_routing_operations(
     db: Session,
     tenant: TenantContext,
@@ -111,6 +146,7 @@ def _sync_routing_operations(
     )
     by_code = {row.operation_code: row for row in existing}
     keep_codes: set[str] = set()
+    desired_sequences: dict[str, int] = {}
 
     for op_in in sorted(operations, key=lambda o: o.operation_sequence):
         code = (op_in.operation_code or "").strip()
@@ -119,29 +155,44 @@ def _sync_routing_operations(
                 db, provided=None, entity="routing_operation"
             )
         keep_codes.add(code)
+        desired_sequences[code] = op_in.operation_sequence
         step = (op_in.process_step or "").strip()
         mandatory = getattr(op_in, "is_mandatory", True)
         if code in by_code:
             row = by_code[code]
-            row.operation_sequence = op_in.operation_sequence
             row.operation_name = op_in.operation_name.strip()
-            row.metadata_ = _apply_process_metadata(
-                row.metadata_ if isinstance(row.metadata_, dict) else {},
-                step,
-                mandatory,
+            _set_operation_metadata(
+                row,
+                _apply_process_metadata(
+                    row.metadata_ if isinstance(row.metadata_, dict) else {},
+                    step,
+                    mandatory,
+                ),
             )
             continue
 
         op_code = resolve_ac_business_code(db, provided=code, entity="routing_operation")
-        repo.add(
+        row = repo.add(
             RoutingOperation(
                 routing_id=routing_id,
                 operation_code=op_code,
-                operation_sequence=op_in.operation_sequence,
+                operation_sequence=op_in.operation_sequence + 10_000,
                 operation_name=op_in.operation_name.strip(),
                 metadata_=_apply_process_metadata({}, step, mandatory),
             )
         )
+        if hasattr(row, "operation_seq"):
+            row.operation_seq = op_in.operation_sequence + 10_000
+        by_code[op_code] = row
+        if op_code != code:
+            desired_sequences[op_code] = desired_sequences.pop(code)
+            keep_codes.discard(code)
+            keep_codes.add(op_code)
+
+    rebase_operation_sequences(by_code.values())
+    repo.db.flush()
+    assign_operation_sequences(by_code, desired_sequences)
+    repo.db.flush()
 
     for row in existing:
         if row.operation_code not in keep_codes:
@@ -164,6 +215,86 @@ def _sync_routing_operations(
     repo.db.flush()
 
 
+def _bootstrap_routing_for_legacy_type(
+    db: Session,
+    tenant: TenantContext,
+    raw: Product,
+    meta: dict,
+    operations: list[AcRawMaterialTypeOperation],
+    *,
+    finished_product_name: Optional[str] = None,
+) -> tuple[UUID, str, Product]:
+    """Create FG product + routing for legacy raw materials missing a linked route."""
+    if not operations:
+        raise ValidationError("At least one routing operation is required.")
+
+    sync_ac_sequences(db, tenant.tenant_id)
+    repo = _repo(db, tenant)
+
+    finished_id = _uuid_or_none(meta.get("finished_product_id"))
+    fg_code = (meta.get("finished_product_code") or "").strip()
+    fg_name = (finished_product_name or meta.get("finished_product_name") or raw.product_name).strip()
+    if not fg_name:
+        raise ValidationError("Finished product name is required")
+
+    finished: Optional[Product] = None
+    if finished_id:
+        try:
+            finished = repo.get_by_pk(Product, Product.product_id, finished_id)
+        except NotFoundError:
+            finished = None
+    if finished is None and fg_code:
+        try:
+            finished = repo.get_by_code(Product, Product.product_code, fg_code)
+        except NotFoundError:
+            finished = None
+    if finished is None:
+        fg_code = resolve_ac_business_code(
+            db, provided=fg_code or None, entity="ac_finished_product", tenant_id=tenant.tenant_id
+        )
+        finished_out = mes_core_entities.create_product(
+            db,
+            tenant,
+            ProductCreate(
+                product_code=fg_code,
+                product_name=fg_name,
+                product_type="FINISHED_GOOD",
+                uom="KG",
+            ),
+        )
+        finished = repo.get_by_pk(Product, Product.product_id, finished_out.product_id)
+
+    routing_code = resolve_ac_business_code(
+        db,
+        provided=meta.get("routing_code") or None,
+        entity="ac_routing",
+        tenant_id=tenant.tenant_id,
+    )
+    routing_out = mes_core_entities.create_routing_with_operations(
+        db,
+        tenant,
+        RoutingWithOperationsCreate(
+            routing_code=routing_code,
+            product_id=finished.product_id,
+            routing_version="1",
+            process_family="ACTIVATED_CARBON",
+            operations=[
+                RoutingOperationCreate(
+                    operation_code=op.operation_code,
+                    operation_sequence=op.operation_sequence,
+                    operation_name=op.operation_name,
+                    process_code=op.process_step,
+                    process_type=op.process_step,
+                )
+                for op in operations
+            ],
+        ),
+    )
+    routing_id = routing_out.routing.routing_id
+    _sync_routing_operations(db, tenant, routing_id, operations)
+    return routing_id, routing_out.routing.routing_code, finished
+
+
 def _product_is_obsolete(product: Product) -> bool:
     status = (product.status or "").upper()
     if status == "OBSOLETE":
@@ -179,14 +310,15 @@ def _type_from_product(
     *,
     include_usage: bool = True,
 ) -> Optional[AcRawMaterialTypeOut]:
-    meta = product.metadata_ if isinstance(product.metadata_, dict) else {}
+    meta = _product_meta(product)
     if not meta.get("ac_raw_material_type"):
         return None
 
     routing_id = _uuid_or_none(meta.get("routing_id"))
-    operations = meta.get("operations") or []
-    if routing_id and not operations:
+    if routing_id:
         operations = _operations_from_routing(db, tenant, routing_id)
+    else:
+        operations = meta.get("operations") or []
 
     usage_out = None
     if include_usage:
@@ -206,6 +338,7 @@ def _type_from_product(
         routing_code=meta.get("routing_code"),
         routing_id=routing_id,
         operations=operations,
+        inbound_operations=meta.get("inbound_operations") or [],
         process_parameters=meta.get("process_parameters") or [],
         status=status,
         is_obsolete=is_obsolete,
@@ -227,6 +360,7 @@ def _legacy_type_out(
         product_name=row.product_name,
         finished_product_code=None,
         operations=[],
+        inbound_operations=[],
         process_parameters=[],
         status="OBSOLETE" if is_obsolete else (row.status or "ACTIVE"),
         is_obsolete=is_obsolete,
@@ -286,14 +420,14 @@ def mark_raw_material_type_obsolete(
         return typed
 
     raw.status = "OBSOLETE"
-    meta = raw.metadata_ if isinstance(raw.metadata_, dict) else {}
+    meta = _product_meta(raw)
     meta = {
         **meta,
         "ac_raw_material_type": True,
         "obsolete": True,
         "obsolete_at": meta.get("obsolete_at") or datetime.now(timezone.utc).isoformat(),
     }
-    raw.metadata_ = meta
+    _set_product_metadata(raw, meta)
     raw.product_type = "RAW_MATERIAL"
     repo.db.commit()
     repo.db.refresh(raw)
@@ -321,13 +455,13 @@ def create_raw_material_type(
     repo = _repo(db, tenant)
 
     raw_code = resolve_ac_business_code(
-        db, provided=payload.product_code, entity="ac_raw_product"
+        db, provided=payload.product_code, entity="ac_raw_product", tenant_id=tenant.tenant_id
     )
     fg_code = resolve_ac_business_code(
-        db, provided=payload.finished_product_code, entity="ac_finished_product"
+        db, provided=payload.finished_product_code, entity="ac_finished_product", tenant_id=tenant.tenant_id
     )
     routing_code = resolve_ac_business_code(
-        db, provided=payload.routing_code, entity="ac_routing"
+        db, provided=payload.routing_code, entity="ac_routing", tenant_id=tenant.tenant_id
     )
 
     fg_name = (payload.finished_product_name or payload.product_name).strip()
@@ -383,7 +517,8 @@ def create_raw_material_type(
         "finished_product_name": fg_name,
         "routing_id": str(routing_id),
         "routing_code": routing_code,
-        "operations": [op.model_dump() for op in payload.operations],
+        "operations": _operations_from_routing(db, tenant, routing_id),
+        "inbound_operations": [op.model_dump() for op in payload.inbound_operations],
         "process_parameters": [p.model_dump() for p in payload.process_parameters],
     }
 
@@ -391,7 +526,7 @@ def create_raw_material_type(
         raw = repo.get_by_code(Product, Product.product_code, raw_code)
         raw.product_name = payload.product_name.strip()
         raw.product_type = "RAW_MATERIAL"
-        raw.metadata_ = {**(raw.metadata_ or {}), **type_meta}
+        _set_product_metadata(raw, {**_product_meta(raw), **type_meta})
         repo.db.commit()
         repo.db.refresh(raw)
     except NotFoundError:
@@ -406,7 +541,7 @@ def create_raw_material_type(
             ),
         )
         raw = repo.get_by_pk(Product, Product.product_id, raw_out.product_id)
-        raw.metadata_ = type_meta
+        _set_product_metadata(raw, type_meta)
         repo.db.commit()
         repo.db.refresh(raw)
 
@@ -424,7 +559,7 @@ def update_raw_material_type(
 ) -> AcRawMaterialTypeOut:
     repo = _repo(db, tenant)
     raw = repo.get_by_pk(Product, Product.product_id, product_id)
-    meta = raw.metadata_ if isinstance(raw.metadata_, dict) else {}
+    meta = _product_meta(raw)
 
     if _product_is_obsolete(raw):
         raise ValidationError(
@@ -433,6 +568,7 @@ def update_raw_material_type(
         )
 
     usage = raw_material_usage(db, tenant, product_id)
+    routing_locked = usage.get("kiln_process_started") or usage.get("dispatch_completed")
 
     if payload.product_name:
         raw.product_name = payload.product_name.strip()
@@ -444,24 +580,41 @@ def update_raw_material_type(
         meta["finished_product_name"] = finished.product_name
 
     if payload.operations is not None:
-        if usage.get("kiln_process_started"):
+        if routing_locked:
             raise ValidationError(
-                "This raw material has batches that entered the kiln process. "
-                "Process steps cannot be changed — mark the material obsolete and "
-                "create a new raw material type for future inward."
+                "This raw material has batches that entered activation/pyrolysis or "
+                "been dispatched. Shop-floor process steps cannot be changed — mark "
+                "the material obsolete and create a new raw material type."
             )
         routing_id = _uuid_or_none(meta.get("routing_id"))
         if not routing_id:
-            raise ValidationError(
-                "This raw material has no linked routing — create it with a full type setup first."
+            routing_id, routing_code, finished = _bootstrap_routing_for_legacy_type(
+                db,
+                tenant,
+                raw,
+                meta,
+                payload.operations,
+                finished_product_name=payload.finished_product_name,
             )
+            meta["routing_id"] = str(routing_id)
+            meta["routing_code"] = routing_code
+            meta["finished_product_id"] = str(finished.product_id)
+            meta["finished_product_code"] = finished.product_code
+            meta["finished_product_name"] = finished.product_name
         _sync_routing_operations(db, tenant, routing_id, payload.operations)
-        meta["operations"] = [op.model_dump() for op in payload.operations]
+        meta["operations"] = _operations_from_routing(db, tenant, routing_id)
+
+    if payload.inbound_operations is not None:
+        if usage.get("dispatch_completed"):
+            raise ValidationError(
+                "Inbound prep steps cannot be changed after dispatch has completed."
+            )
+        meta["inbound_operations"] = [op.model_dump() for op in payload.inbound_operations]
 
     if payload.process_parameters is not None:
-        if usage.get("kiln_process_started"):
+        if routing_locked:
             raise ValidationError(
-                "Process parameters cannot be changed after kiln production has started."
+                "Process parameters cannot be changed after activation has started or dispatch."
             )
         meta["process_parameters"] = [p.model_dump() for p in payload.process_parameters]
 
@@ -471,7 +624,7 @@ def update_raw_material_type(
     ):
         meta["ac_raw_material_type"] = True
 
-    raw.metadata_ = meta
+    _set_product_metadata(raw, meta)
     raw.product_type = "RAW_MATERIAL"
     repo.db.commit()
     repo.db.refresh(raw)

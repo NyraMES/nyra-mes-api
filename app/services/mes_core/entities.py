@@ -768,6 +768,8 @@ def _production_lot_out(
         .filter(ProductionOrder.production_order_id == row.production_order_id)
         .first()
     )
+    lot_meta = row.metadata_ if isinstance(row.metadata_, dict) else {}
+    outward_bags = lot_meta.get("crusher_outward_bags") if isinstance(lot_meta.get("crusher_outward_bags"), list) else []
     return ProductionLotOut(
         production_lot_id=row.production_lot_id,
         tenant_id=row.tenant_id,
@@ -777,6 +779,9 @@ def _production_lot_out(
         lot_quantity=row.lot_quantity,
         status=row.status,
         created_at=row.created_at,
+        crusher_grade=lot_meta.get("crusher_grade"),
+        crusher_bag_code=lot_meta.get("crusher_bag_code"),
+        crusher_outward_bags=outward_bags,
     )
 
 

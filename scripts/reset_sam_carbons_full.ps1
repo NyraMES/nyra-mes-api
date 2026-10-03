@@ -25,9 +25,12 @@ Write-Host "Step 1/3: Ensure PostgreSQL sequences exist..." -ForegroundColor Cya
 python scripts/apply_mes_core_sequences.py
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-Write-Host "Step 2/3: Wipe tenant data, reinstall master, reset sequences..." -ForegroundColor Cyan
+Write-Host "Step 2/3: Wipe tenant data, reinstall master, reset all sequences..." -ForegroundColor Cyan
 python scripts/seed_sam_carbons_demo.py --reset-all --install-master --reset-sequences --force
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+Write-Host "Step 3/3: Verify all 17 core business-code sequences..." -ForegroundColor Cyan
+python scripts/reset_all_sequences.py
 
 Write-Host "`nDone. Transactional codes were auto-generated (ORD-AC-*, PO-AC-*, LOT-AC-*)." -ForegroundColor Green
 Write-Host "Master SKUs unchanged: RAW-COCO-SHELL, AC-GRAN-8x30, RES-KILN-01, CUST-AC-001"

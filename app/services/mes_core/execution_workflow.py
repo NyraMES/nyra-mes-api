@@ -170,6 +170,31 @@ def _planned_resources_for_op(
     }
 
 
+def resolve_start_resource_selection(
+    repo: TenantRepository,
+    rop: Optional[RoutingOperation],
+    payload: Optional[WorkOrderStartRequest],
+) -> dict[str, Any]:
+    """Resolve machine, labor, and tool codes for a shop-floor start request."""
+    planned = _planned_resources_for_op(repo, rop)
+    machine_code = (
+        (payload.machine_id if payload else None) or ""
+    ).strip() or (planned.get("machine_code") or "")
+    labor_pool = (
+        (payload.labor_pool_code if payload else None) or ""
+    ).strip() or (planned.get("labor_pool_code") or "")
+    tool_codes: list[str] = []
+    if payload and payload.tool_codes:
+        tool_codes = [str(c).strip() for c in payload.tool_codes if str(c).strip()]
+    elif planned.get("tool_codes"):
+        tool_codes = list(planned["tool_codes"])
+    return {
+        "machine_code": machine_code,
+        "labor_pool_code": labor_pool,
+        "tool_codes": tool_codes,
+    }
+
+
 def _parse_dt(value: Any) -> Optional[datetime]:
     if value is None:
         return None
@@ -327,6 +352,13 @@ def lot_execution_summary(
             _parameter_defs_for_operation(repo, rop.routing_operation_id) if rop else []
         )
         captured = _captured_readings_for_execution(repo, ex.execution_id)
+        rop_meta = rop.metadata_ if rop and isinstance(rop.metadata_, dict) else {}
+        process_step = (
+            rop_meta.get("process_step")
+            or rop_meta.get("process_code")
+            or rop_meta.get("process_type")
+            or meta.get("process_step")
+        )
         operations.append(
             {
                 "work_order_id": ex.execution_code,
@@ -336,6 +368,9 @@ def lot_execution_summary(
                 "operation_name": (rop.operation_name if rop else None)
                 or (rop.operation_code if rop else ex.execution_code),
                 "seq": rop.operation_sequence if rop else None,
+                "operation_sequence": rop.operation_sequence if rop else None,
+                "process_step": process_step,
+                "is_mandatory": rop_meta.get("is_mandatory", meta.get("is_mandatory", True)),
                 "status": ui,
                 "work_order_status": _db_work_order_status(ex.status),
                 "schedule_id": meta.get("schedule_code"),
@@ -426,18 +461,10 @@ def start_execution(
     if not operator:
         raise ValidationError("operator_name is required to start")
 
-    planned = _planned_resources_for_op(repo, rop)
-    machine_code = (
-        (payload.machine_id if payload else None) or ""
-    ).strip() or planned.get("machine_code") or ""
-    labor_pool = (
-        (payload.labor_pool_code if payload else None) or ""
-    ).strip() or planned.get("labor_pool_code") or ""
-    tool_codes = []
-    if payload and payload.tool_codes:
-        tool_codes = [str(c).strip() for c in payload.tool_codes if str(c).strip()]
-    elif planned.get("tool_codes"):
-        tool_codes = list(planned["tool_codes"])
+    selection = resolve_start_resource_selection(repo, rop, payload)
+    machine_code = selection["machine_code"]
+    labor_pool = selection["labor_pool_code"]
+    tool_codes = selection["tool_codes"]
 
     meta = _meta(row)
     meta = {

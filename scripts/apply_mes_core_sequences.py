@@ -16,6 +16,7 @@ from sqlalchemy import text
 from app.db.mes_core_database import get_mes_core_engine
 
 SEQUENCES = [
+    "core.supplier_code_seq",
     "core.customer_code_seq",
     "core.product_code_seq",
     "core.resource_code_seq",

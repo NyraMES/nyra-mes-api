@@ -65,11 +65,11 @@ from app.services.industry.activated_carbon.codes import (
 from app.services.mes_core import feasibility as mes_core_feasibility
 from app.services.mes_core.base import TenantRepository
 
-TENANT_CODE = os.getenv("AC_TENANT_CODE", "SAM_CARBONS")
-WORKSPACE_CODE = os.getenv("AC_WORKSPACE_CODE", "SAM_CARBONS_ACTIVATED_CARBON")
+TENANT_CODE = os.getenv("AC_TENANT_CODE", "GR_CARBONS")
+WORKSPACE_CODE = os.getenv("AC_WORKSPACE_CODE", "GR_CARBONS_ACTIVATED_CARBON")
 
-# Testbed Cognito users typically bind to SAM_CARBONS_DEMO — wipe both on full reset.
-AC_TENANT_PREFIX = "SAM_CARBONS"
+# Production client GR_CARBONS; demo playground remains SAM_CARBONS_DEMO*.
+AC_TENANT_PREFIX = "GR_CARBONS"
 
 MASTER_CUSTOMER_CODE = "CUST-AC-001"
 RAW_PRODUCT_CODE = "RAW-COCO-SHELL"
@@ -98,11 +98,11 @@ def _ctx(db: Session):
 
 
 def normalize_ac_display_names(db: Session, tenant) -> None:
-    """Use generic plant labels in tenant, workspace, and seed customer records."""
+    """Use GR Carbons plant labels in tenant, workspace, and seed customer records."""
     tid = str(tenant.tenant_id)
     db.execute(
         text(
-            "UPDATE core.tenant SET tenant_name = 'Activated Carbon Plant' "
+            "UPDATE core.tenant SET tenant_name = 'GR Carbons' "
             "WHERE tenant_id = :tid"
         ),
         {"tid": tid},
@@ -110,7 +110,7 @@ def normalize_ac_display_names(db: Session, tenant) -> None:
     if tenant.workspace_id is not None:
         db.execute(
             text(
-                "UPDATE core.project_workspace SET workspace_name = 'Activated Carbon' "
+                "UPDATE core.project_workspace SET workspace_name = 'GR Carbons — Activated Carbon' "
                 "WHERE workspace_id = :wid"
             ),
             {"wid": str(tenant.workspace_id)},
@@ -165,9 +165,10 @@ def list_ac_tenant_codes(db: Session) -> list[str]:
     rows = db.execute(
         text(
             "SELECT tenant_code FROM core.tenant "
-            "WHERE tenant_code LIKE :prefix ORDER BY tenant_code"
+            "WHERE tenant_code LIKE :gr OR tenant_code LIKE :sam "
+            "ORDER BY tenant_code"
         ),
-        {"prefix": f"{AC_TENANT_PREFIX}%"},
+        {"gr": f"{AC_TENANT_PREFIX}%", "sam": "SAM_CARBONS%"},
     ).fetchall()
     return [str(row[0]) for row in rows]
 
@@ -354,6 +355,11 @@ def main() -> int:
         help="Reset PostgreSQL business-code sequences (empty DB -> suffix 1)",
     )
     parser.add_argument("--force", action="store_true", help="Re-seed even if orders exist")
+    parser.add_argument(
+        "--masters-only",
+        action="store_true",
+        help="Install master data only — no inward orders, lots, or dashboard seed story",
+    )
     parser.add_argument("--tenant", default=None, help="Tenant code (default: AC_TENANT_CODE)")
     parser.add_argument("--workspace", default=None, help="Workspace code")
     args = parser.parse_args()
@@ -395,6 +401,20 @@ def main() -> int:
 
     if has_transactional_seed(db, tenant) and (args.force or args.reset_all):
         reset_transactional(db, tenant)
+
+    if args.masters_only:
+        normalize_ac_display_names(db, tenant)
+        if args.reset_all_ac_tenants or args.reset_sequences:
+            sync_ac_sequences(db, tenant.tenant_id)
+            print(f"OK: Synced AC business code sequences for {TENANT_CODE}")
+        elif args.reset_sequences:
+            reset_ac_sequences_empty(db)
+            print("OK: Reset AC business code sequences to start at suffix 1")
+        print("OK: Master data ready — empty plant (no inward orders or lots)")
+        print(f"  tenant_code: {TENANT_CODE}")
+        print(f"  workspace_code: {WORKSPACE_CODE}")
+        print("  Start production: Raw Material -> Inward -> Prep -> QC -> Release -> ...")
+        return 0
 
     result = seed_story(db, tenant)
     normalize_ac_display_names(db, tenant)

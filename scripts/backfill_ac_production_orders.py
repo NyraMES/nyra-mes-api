@@ -34,7 +34,18 @@ def main() -> int:
     Session = sessionmaker(bind=engine)
     with Session() as db:
         tenant = resolve_tenant(db, args.tenant, args.workspace)
+        synced = ac_adapter.sync_ac_production_order_material_links(db, tenant)
         created = ac_adapter.backfill_inward_production_orders(db, tenant)
+
+    if synced:
+        print(f"OK: Synced material routing metadata on {len(synced)} production order(s):")
+        for row in synced:
+            print(
+                f"  {row['production_order_code']} -> raw={row['raw_product_id']} "
+                f"routing={row.get('routing_id') or 'n/a'}"
+            )
+    else:
+        print("OK: All production orders already have raw material routing metadata.")
 
     if not created:
         print("OK: No inward orders needed a production order backfill.")

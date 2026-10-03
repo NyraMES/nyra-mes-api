@@ -9,6 +9,7 @@ from uuid import UUID
 from typing import List, Optional
 
 from sqlalchemy.orm import Session
+from sqlalchemy.orm.attributes import flag_modified
 
 from app.core.exceptions import NotFoundError, ValidationError, WorkflowError
 from app.core.tenant_context import TenantContext
@@ -26,6 +27,7 @@ from app.models.mes_core import (
     Resource,
     Routing,
     RoutingOperation,
+    Supplier,
     TripleStoreStaging,
 )
 from app.schemas.mes_core.schemas import (
@@ -57,10 +59,16 @@ from app.schemas.mes_core.schemas import (
     AcRawMaterialInwardCreateResponse,
     AcRawMaterialQcCreate,
     AcRawMaterialQcOut,
+    AcRawMaterialCrushCreate,
+    AcRawMaterialCrushOut,
+    AcInboundStepCompleteCreate,
+    AcInboundExecutionOut,
+    AcInboundStepStatusOut,
     AcRawMaterialStatusOut,
     AcRoutingMasterOut,
     AcRoutingOperationSummary,
     AcScreeningCreate,
+    AcGradeSeparationCreate,
     ActivatedCarbonYieldSummaryOut,
     CustomerCreate,
     CustomerOut,
@@ -97,7 +105,14 @@ from app.services.industry.activated_carbon.kiln_parameters_catalog import (
     list_kiln_parameter_definitions,
 )
 from app.services.industry.activated_carbon import raw_material_types as ac_raw_material_types
+from app.services.industry.activated_carbon import inbound_execution as ac_inbound_execution
+from app.services.industry.activated_carbon import lot_routing as ac_lot_routing
 from app.services.industry.activated_carbon import stock as ac_stock
+from app.services.industry.activated_carbon.resource_pool import (
+    claim_kiln_for_lot,
+    kiln_release_step,
+    release_lot_kiln_if_claimed,
+)
 from app.schemas.traceability import TraceabilityResponse
 from app.services.mes_core import entities as mes_core_entities
 from app.services.mes_core.feasibility import is_ready_for_scheduling
@@ -108,6 +123,15 @@ from app.services.mes_core.base import TenantRepository
 
 def _repo(db: Session, tenant: TenantContext) -> TenantRepository:
     return TenantRepository(db, tenant)
+
+
+def _uuid_or_none(value) -> Optional[UUID]:
+    if not value:
+        return None
+    try:
+        return UUID(str(value))
+    except (TypeError, ValueError):
+        return None
 
 
 def _headcount_from_metadata(meta: object) -> Optional[int]:
@@ -395,11 +419,29 @@ def list_raw_material_inward(
         .order_by(CustomerOrder.created_at.desc())
         .all()
     )
+    released_at_by_inward: dict[str, datetime] = {}
+    for po in repo.query(ProductionOrder).all():
+        po_meta = po.metadata_ if isinstance(po.metadata_, dict) else {}
+        inward_id = po_meta.get("source_inward_order_id")
+        if not inward_id or not po.created_at:
+            continue
+        key = str(inward_id)
+        prev = released_at_by_inward.get(key)
+        if prev is None or po.created_at < prev:
+            released_at_by_inward[key] = po.created_at
+
     out: List[CustomerOrderOut] = []
     for row in rows:
         order_out = mes_core_entities._customer_order_out(db, tenant, row)
         if _order_is_raw_material_inward(row, order_out, products):
-            out.append(ac_stock.enrich_inward_order_stock(order_out, row, products))
+            out.append(
+                ac_stock.enrich_inward_order_stock(
+                    order_out,
+                    row,
+                    products,
+                    released_at_fallback=released_at_by_inward.get(str(row.customer_order_id)),
+                )
+            )
     return out
 
 
@@ -1016,11 +1058,14 @@ def create_make_to_stock_production_order(
         remaining = ac_stock.allocate_raw_from_inward(
             db, tenant, source_inward_id, release_qty
         )
-        meta = {
-            **meta,
-            "last_release_kg": str(release_qty),
-            "available_after_release_kg": str(remaining),
-        }
+        repo.db.refresh(inward)
+        meta = dict(inward.metadata_ if isinstance(inward.metadata_, dict) else {})
+        meta.update(
+            {
+                "last_release_kg": str(release_qty),
+                "available_after_release_kg": str(remaining),
+            }
+        )
 
         po_out = _ensure_production_order_for_inward(
             db,
@@ -1034,11 +1079,19 @@ def create_make_to_stock_production_order(
         po_row = repo.get_by_pk(
             ProductionOrder, ProductionOrder.production_order_id, po_out.production_order_id
         )
+        raw_product_id = _uuid_or_none(meta.get("raw_product_id"))
         po_row.metadata_ = {
             **(po_row.metadata_ if isinstance(po_row.metadata_, dict) else {}),
             "flow": "RELEASED_TO_PRODUCTION",
             "source_inward_order_id": str(source_inward_id),
             "last_release_kg": str(release_qty),
+            **(
+                ac_lot_routing.production_order_meta_for_raw(
+                    db, tenant, raw_product_id
+                )
+                if raw_product_id
+                else {}
+            ),
         }
         meta["production_order_id"] = str(po_row.production_order_id)
         meta["production_order_code"] = po_row.production_order_code
@@ -1055,25 +1108,112 @@ def create_make_to_stock_production_order(
         if finished_line_out is None and order_out.lines:
             finished_line_out = order_out.lines[0]
 
-        lot_code = resolve_ac_business_code(
-            db, provided=None, entity="ac_production_lot"
-        )
-        lot_out = mes_core_entities.create_production_lot(
-            db,
-            tenant,
-            ProductionLotCreate(
-                lot_code=lot_code,
-                production_order_id=po_out.production_order_id,
-                lot_quantity=release_qty,
-                status="CREATED",
-            ),
-        )
+        split_entries: list[tuple[Decimal, Optional[str], Optional[str]]]
+        if payload.lot_splits:
+            split_entries = [
+                (
+                    Decimal(str(item.quantity_kg)),
+                    item.grade_label,
+                    None,
+                )
+                for item in payload.lot_splits
+            ]
+            if any(q <= 0 for q, _, _ in split_entries):
+                raise ValidationError("Each grade lot quantity must be greater than zero.")
+            split_total = sum(q for q, _, _ in split_entries)
+            if split_total != release_qty:
+                raise ValidationError(
+                    "Grade lot quantities must sum to the release quantity.",
+                    details={
+                        "release_quantity": str(release_qty),
+                        "split_total": str(split_total),
+                    },
+                )
+        elif payload.lot_quantities:
+            split_entries = [(Decimal(str(q)), None, None) for q in payload.lot_quantities]
+            if any(q <= 0 for q, _, _ in split_entries):
+                raise ValidationError("Each lot quantity must be greater than zero.")
+            split_total = sum(q for q, _, _ in split_entries)
+            if split_total != release_qty:
+                raise ValidationError(
+                    "Lot split quantities must sum to the release quantity.",
+                    details={
+                        "release_quantity": str(release_qty),
+                        "split_total": str(split_total),
+                    },
+                )
+        else:
+            separation = (
+                meta.get("grade_separation")
+                if isinstance(meta.get("grade_separation"), dict)
+                else {}
+            )
+            auto_splits: list[tuple[Decimal, Optional[str], Optional[str]]] = []
+            if separation.get("status") == "COMPLETED":
+                for entry in separation.get("grade_splits") or []:
+                    if not isinstance(entry, dict):
+                        continue
+                    grade = (entry.get("grade_label") or "").strip()
+                    qty_raw = entry.get("quantity_kg")
+                    if not grade or qty_raw is None:
+                        continue
+                    qty = Decimal(str(qty_raw))
+                    if qty <= 0:
+                        continue
+                    auto_splits.append((qty, grade, None))
+            auto_total = sum(q for q, _, _ in auto_splits)
+            if auto_splits and auto_total == release_qty:
+                split_entries = auto_splits
+            else:
+                split_entries = [(release_qty, None, None)]
+
+        created_lots: list = []
+        released_lot_rows: list[dict] = list(meta.get("released_lots") or [])
+        for lot_qty, grade_label, _param_key in split_entries:
+            lot_code = resolve_ac_business_code(
+                db, provided=None, entity="ac_production_lot"
+            )
+            lot_out = mes_core_entities.create_production_lot(
+                db,
+                tenant,
+                ProductionLotCreate(
+                    lot_code=lot_code,
+                    production_order_id=po_out.production_order_id,
+                    lot_quantity=lot_qty,
+                    status="CREATED",
+                ),
+            )
+            if grade_label:
+                lot_row = repo.get_by_pk(
+                    ProductionLot,
+                    ProductionLot.production_lot_id,
+                    lot_out.production_lot_id,
+                )
+                lot_row.metadata_ = {
+                    **(lot_row.metadata_ if isinstance(lot_row.metadata_, dict) else {}),
+                    "crusher_grade": grade_label,
+                    "source_inward_order_id": str(source_inward_id),
+                }
+            created_lots.append(lot_out)
+            released_lot_rows.append(
+                {
+                    "lot_code": lot_out.lot_code,
+                    "quantity_kg": str(lot_qty),
+                    "production_order_code": po_row.production_order_code,
+                    **({"crusher_grade": grade_label} if grade_label else {}),
+                }
+            )
+        meta["released_lots"] = released_lot_rows
+        meta["last_release_lot_count"] = len(created_lots)
+        inward.metadata_ = meta
+        flag_modified(inward, "metadata_")
         repo.db.commit()
         return AcMakeToStockCreateResponse(
             order=order_out,
             line=finished_line_out,
             production_order=po_out,
-            production_lot=lot_out,
+            production_lot=created_lots[0] if created_lots else None,
+            production_lots=created_lots,
         )
 
     finished: Product
@@ -2005,30 +2145,13 @@ def _routing_operation_for_lot(
 ) -> RoutingOperation:
     repo = _repo(db, tenant)
     lot = repo.get_by_pk(ProductionLot, ProductionLot.production_lot_id, production_lot_id)
-    po = repo.get_by_pk(
-        ProductionOrder, ProductionOrder.production_order_id, lot.production_order_id
-    )
-    line = repo.get_by_pk(
-        CustomerOrderLine, CustomerOrderLine.order_line_id, po.order_line_id
-    )
-    routing = (
-        repo.query(Routing)
-        .filter(Routing.product_id == line.product_id, Routing.is_active.is_(True))
-        .order_by(Routing.routing_version.desc())
-        .first()
-    )
+    _product, routing, ops, _qty = ac_lot_routing.load_ac_lot_routing(db, tenant, lot)
     if not routing:
-        raise ValueError(f"No active routing for product on lot {lot.lot_code}")
+        raise ValueError(f"No active routing for lot {lot.lot_code}")
 
-    ops = (
-        repo.query(RoutingOperation)
-        .filter(RoutingOperation.routing_id == routing.routing_id)
-        .order_by(RoutingOperation.operation_sequence)
-        .all()
-    )
     target_code = f"OP-{process_step}"
     for op in ops:
-        meta = op.metadata_ or {}
+        meta = op.metadata_ if isinstance(op.metadata_, dict) else {}
         if meta.get("process_step") == process_step or op.operation_code == target_code:
             return op
     raise ValueError(f"No routing operation for process step {process_step}")
@@ -2044,6 +2167,7 @@ def _create_process_execution(
     repo = _repo(db, tenant)
     op = _routing_operation_for_lot(db, tenant, production_lot_id, process_step)
     code = resolve_ac_business_code(db, provided=None, entity="ac_operation_execution")
+    recorded_step = (metadata.get("process_step") or process_step).strip()
     row = repo.add(
         OperationExecution(
             execution_code=code,
@@ -2052,12 +2176,19 @@ def _create_process_execution(
             status="COMPLETED",
             metadata_={
                 **metadata,
-                "process_step": process_step,
+                "process_step": recorded_step,
                 "industry_template_code": tenant.industry_template_code,
             },
         )
     )
-    return OperationExecutionOut.model_validate(repo.commit_refresh(row))
+    out = OperationExecutionOut.model_validate(repo.commit_refresh(row))
+    if kiln_release_step(recorded_step):
+        lot = repo.get_by_pk(
+            ProductionLot, ProductionLot.production_lot_id, production_lot_id
+        )
+        release_lot_kiln_if_claimed(db, tenant, lot)
+        repo.db.commit()
+    return out
 
 
 def _ensure_production_order_for_inward(
@@ -2072,7 +2203,6 @@ def _ensure_production_order_for_inward(
 ) -> ProductionOrderOut:
     """Ensure finished-product line + production order exist for a raw material inward order."""
     repo = _repo(db, tenant)
-    finished = _resolve_finished_product(repo)
     products = {p.product_id: p for p in repo.query(Product).all()}
     lines = (
         repo.query(CustomerOrderLine)
@@ -2087,8 +2217,26 @@ def _ensure_production_order_for_inward(
             continue
         if _is_raw_product(product):
             raw_line = line
-        elif (product.product_code or "").upper() == FINISHED_PRODUCT_CODE:
+        elif finished_line is None:
             finished_line = line
+
+    if raw_line is None:
+        raise ValidationError(
+            "Inward order has no raw material line — cannot create a production order."
+        )
+
+    finished = _resolve_finished_product_for_raw(
+        db, tenant, raw_line.product_id
+    )
+    raw_po_meta = ac_lot_routing.production_order_meta_for_raw(
+        db, tenant, raw_line.product_id
+    )
+
+    for line in lines:
+        product = products.get(line.product_id)
+        if product and line.product_id == finished.product_id:
+            finished_line = line
+            break
 
     line_qty = raw_line.quantity if raw_line else quantity
     line_uom = raw_line.uom if raw_line else uom
@@ -2142,6 +2290,7 @@ def _ensure_production_order_for_inward(
         )
         existing_po.metadata_ = {
             **po_meta,
+            **raw_po_meta,
             "source_inward_order_id": str(order_id),
             "last_release_kg": str(po_qty),
         }
@@ -2154,7 +2303,7 @@ def _ensure_production_order_for_inward(
     po_code = resolve_ac_business_code(
         db, provided=production_order_code, entity="ac_production_order"
     )
-    return mes_core_entities.create_production_order(
+    po_out = mes_core_entities.create_production_order(
         db,
         tenant,
         ProductionOrderCreate(
@@ -2164,6 +2313,17 @@ def _ensure_production_order_for_inward(
             status="PLANNED",
         ),
     )
+    po_row = repo.get_by_pk(
+        ProductionOrder, ProductionOrder.production_order_id, po_out.production_order_id
+    )
+    po_row.metadata_ = {
+        **(po_row.metadata_ if isinstance(po_row.metadata_, dict) else {}),
+        **raw_po_meta,
+        "source_inward_order_id": str(order_id),
+    }
+    repo.db.commit()
+    repo.db.refresh(po_row)
+    return mes_core_entities.get_production_order(db, tenant, po_row.production_order_id)
 
 
 def backfill_inward_production_orders(
@@ -2216,10 +2376,74 @@ def backfill_inward_production_orders(
     return created
 
 
+def sync_ac_production_order_material_links(
+    db: Session, tenant: TenantContext
+) -> List[dict]:
+    """Stamp raw_product_id / routing_id on existing production orders from inward links."""
+    repo = _repo(db, tenant)
+    products = {p.product_id: p for p in repo.query(Product).all()}
+    updated: List[dict] = []
+
+    for po in repo.query(ProductionOrder).all():
+        po_meta = po.metadata_ if isinstance(po.metadata_, dict) else {}
+        raw_product_id = _uuid_or_none(po_meta.get("raw_product_id"))
+
+        if not raw_product_id:
+            inward_id = _uuid_or_none(po_meta.get("source_inward_order_id"))
+            if inward_id:
+                for ol in (
+                    repo.query(CustomerOrderLine)
+                    .filter(CustomerOrderLine.order_id == inward_id)
+                    .all()
+                ):
+                    product = products.get(ol.product_id)
+                    if product and _is_raw_product(product):
+                        raw_product_id = product.product_id
+                        break
+                if not raw_product_id:
+                    inward = repo.get_by_pk(
+                        CustomerOrder, CustomerOrder.customer_order_id, inward_id
+                    )
+                    imeta = inward.metadata_ if isinstance(inward.metadata_, dict) else {}
+                    raw_product_id = _uuid_or_none(imeta.get("raw_product_id"))
+
+        if not raw_product_id:
+            continue
+
+        stamp = ac_lot_routing.production_order_meta_for_raw(
+            db, tenant, raw_product_id
+        )
+        merged = {**po_meta, **stamp}
+        if merged == po_meta:
+            continue
+
+        po.metadata_ = merged
+        flag_modified(po, "metadata_")
+        updated.append(
+            {
+                "production_order_code": po.production_order_code,
+                "raw_product_id": str(raw_product_id),
+                "routing_id": stamp.get("routing_id"),
+            }
+        )
+
+    if updated:
+        repo.db.commit()
+    return updated
+
+
 def create_raw_material_inward(
     db: Session, tenant: TenantContext, payload: AcRawMaterialInwardCreate
 ) -> AcRawMaterialInwardCreateResponse:
     sync_ac_sequences(db, tenant.tenant_id)
+    if not (payload.dc_number or "").strip():
+        raise ValidationError("DC number is required on gate receipt.")
+    if payload.supplier_weight_kg is None:
+        raise ValidationError("Supplier weight (KG) is required on gate receipt.")
+    if payload.our_weight_kg is None and payload.quantity is None:
+        raise ValidationError("Our weight (KG) is required on gate receipt.")
+    if payload.our_weight_kg is not None:
+        payload.quantity = payload.our_weight_kg
     ac_raw_material_types.assert_raw_material_active_for_inward(
         db, tenant, payload.product_id
     )
@@ -2249,13 +2473,36 @@ def create_raw_material_inward(
     order_row = repo.get_by_pk(
         CustomerOrder, CustomerOrder.customer_order_id, order_resp.order.customer_order_id
     )
+    inward_receipt: dict = {}
+    if payload.dc_number:
+        inward_receipt["dc_number"] = payload.dc_number.strip()
+    if payload.supplier_weight_kg is not None:
+        inward_receipt["supplier_weight_kg"] = str(payload.supplier_weight_kg)
+    if getattr(payload, "our_weight_kg", None) is not None:
+        inward_receipt["our_weight_kg"] = str(payload.our_weight_kg)
+    if payload.supplier_value_inr is not None:
+        inward_receipt["supplier_value_inr"] = str(payload.supplier_value_inr)
+    if getattr(payload, "our_value_inr", None) is not None:
+        inward_receipt["our_value_inr"] = str(payload.our_value_inr)
     order_row.metadata_ = {
         **(order_row.metadata_ if isinstance(order_row.metadata_, dict) else {}),
         "flow": "RAW_MATERIAL_INWARD",
         "raw_product_id": str(payload.product_id),
     }
+    if inward_receipt:
+        order_row.metadata_["inward_receipt"] = inward_receipt
     repo.db.commit()
     repo.db.refresh(order_row)
+    supplier = repo.get_by_pk(Supplier, Supplier.supplier_id, payload.supplier_id)
+    _stage_inward_receipt_triples(
+        db,
+        tenant,
+        order_row,
+        supplier_code=supplier.supplier_code,
+        inward_receipt=inward_receipt,
+        received_qty_kg=payload.quantity,
+    )
+    repo.db.commit()
     po_out = None
     if payload.create_production_order:
         po_out = _ensure_production_order_for_inward(
@@ -2295,6 +2542,35 @@ def _raw_material_qc_from_order(
     line, product = raw_line
     meta = order.metadata_ if isinstance(order.metadata_, dict) else {}
     qc = meta.get("raw_material_qc") if isinstance(meta.get("raw_material_qc"), dict) else {}
+    crush = (
+        meta.get("raw_material_crush")
+        if isinstance(meta.get("raw_material_crush"), dict)
+        else {}
+    )
+
+    raw_type_id = _uuid_or_none(meta.get("raw_product_id")) or product.product_id
+    inbound_steps: list[AcInboundStepStatusOut] = []
+    inbound_prep_complete = True
+    next_inbound_step = None
+    next_inbound_operation_code = None
+    try:
+        material_type = ac_raw_material_types.get_raw_material_type(
+            db, tenant, raw_type_id
+        )
+        inbound_steps = ac_inbound_execution.build_inbound_step_statuses(
+            material_type, meta
+        )
+        inbound_prep_complete = ac_inbound_execution.mandatory_inbound_prep_complete(
+            material_type, meta
+        )
+        next_inbound_step = ac_inbound_execution.next_inbound_process_step(
+            material_type, meta
+        )
+        next_inbound_operation_code = ac_inbound_execution.next_inbound_operation_code(
+            material_type, meta
+        )
+    except NotFoundError:
+        inbound_prep_complete = True
 
     return AcRawMaterialQcOut(
         customer_order_id=order.customer_order_id,
@@ -2303,6 +2579,12 @@ def _raw_material_qc_from_order(
         product_name=product.product_name,
         quantity=line.quantity,
         uom=line.uom,
+        our_weight_kg=(
+            Decimal(str(meta.get("inward_receipt", {}).get("our_weight_kg")))
+            if isinstance(meta.get("inward_receipt"), dict)
+            and meta["inward_receipt"].get("our_weight_kg") is not None
+            else line.quantity
+        ),
         moisture_pct=qc.get("moisture_pct"),
         ash_pct=qc.get("ash_pct"),
         foreign_matter_pct=qc.get("foreign_matter_pct"),
@@ -2312,7 +2594,96 @@ def _raw_material_qc_from_order(
         operator_remarks=qc.get("operator_remarks"),
         qc_status=qc.get("qc_status") or "PENDING",
         qc_at=qc.get("qc_at"),
+        crush_status=crush.get("status") or "PENDING",
+        crush_at=crush.get("completed_at"),
+        raw_material_type_id=raw_type_id,
+        inbound_steps=inbound_steps,
+        inbound_prep_complete=inbound_prep_complete,
+        next_inbound_step=next_inbound_step,
+        next_inbound_operation_code=next_inbound_operation_code,
     )
+
+
+def _stage_inward_receipt_triples(
+    db: Session,
+    tenant: TenantContext,
+    order: CustomerOrder,
+    *,
+    supplier_code: str,
+    inward_receipt: dict,
+    received_qty_kg: Decimal,
+) -> None:
+    """Stage supplier receipt + DC details into kg.triple_store_staging (triplet ontology)."""
+    subject = f"urn:nyra:ac:inward:{order.order_code}"
+    source_id = order.customer_order_id
+    supplier_uri = f"urn:nyra:ac:supplier:{supplier_code}"
+    mes_core_entities.create_triple(
+        db,
+        tenant,
+        TripleCreate(
+            subject_uri=supplier_uri,
+            predicate_uri="urn:nyra:predicate:supplies",
+            object_uri=subject,
+            source_table="trn.customer_order",
+            source_id=source_id,
+        ),
+    )
+    mes_core_entities.create_triple(
+        db,
+        tenant,
+        TripleCreate(
+            subject_uri=subject,
+            predicate_uri="urn:nyra:predicate:captures",
+            object_uri="urn:nyra:ac:parameter:RECEIVED_QTY_KG",
+            object_literal=str(received_qty_kg),
+            object_datatype="http://www.w3.org/2001/XMLSchema#decimal",
+            source_table="trn.customer_order",
+            source_id=source_id,
+        ),
+    )
+    string_params = (
+        ("dc_number", "urn:nyra:ac:parameter:DC_NUMBER"),
+    )
+    for field, param_uri in string_params:
+        value = inward_receipt.get(field)
+        if not value:
+            continue
+        mes_core_entities.create_triple(
+            db,
+            tenant,
+            TripleCreate(
+                subject_uri=subject,
+                predicate_uri="urn:nyra:predicate:captures",
+                object_uri=param_uri,
+                object_literal=str(value),
+                object_datatype="http://www.w3.org/2001/XMLSchema#string",
+                source_table="trn.customer_order",
+                source_id=source_id,
+            ),
+        )
+    decimal_params = (
+        ("supplier_weight_kg", "urn:nyra:ac:parameter:SUPPLIER_WEIGHT_KG"),
+        ("our_weight_kg", "urn:nyra:ac:parameter:OUR_WEIGHT_KG"),
+        ("supplier_value_inr", "urn:nyra:ac:parameter:SUPPLIER_VALUE_INR"),
+        ("our_value_inr", "urn:nyra:ac:parameter:OUR_VALUE_INR"),
+    )
+    for field, param_uri in decimal_params:
+        value = inward_receipt.get(field)
+        if value is None:
+            continue
+        mes_core_entities.create_triple(
+            db,
+            tenant,
+            TripleCreate(
+                subject_uri=subject,
+                predicate_uri="urn:nyra:predicate:captures",
+                object_uri=param_uri,
+                object_literal=str(value),
+                object_datatype="http://www.w3.org/2001/XMLSchema#decimal",
+                source_table="trn.customer_order",
+                source_id=source_id,
+            ),
+        )
 
 
 def _stage_inward_qc_triples(
@@ -2379,6 +2750,137 @@ def _stage_inward_qc_triples(
         )
 
 
+def _stage_crushing_triples(
+    db: Session,
+    tenant: TenantContext,
+    order: CustomerOrder,
+    crush_payload: dict,
+) -> None:
+    subject = f"urn:nyra:ac:inward:{order.order_code}"
+    object_uri = f"urn:nyra:ac:crushing:{order.order_code}"
+    source_id = order.customer_order_id
+    mes_core_entities.create_triple(
+        db,
+        tenant,
+        TripleCreate(
+            subject_uri=subject,
+            predicate_uri="urn:nyra:predicate:captures",
+            object_uri=object_uri,
+            source_table="trn.customer_order",
+            source_id=source_id,
+        ),
+    )
+    for field, param_uri in (
+        ("input_lump_size_mm", "urn:nyra:ac:parameter:INPUT_LUMP_SIZE_MM"),
+        ("target_output_size_mm", "urn:nyra:ac:parameter:TARGET_OUTPUT_SIZE_MM"),
+        ("crush_output_kg", "urn:nyra:ac:parameter:CRUSH_OUTPUT_KG"),
+        ("crush_yield_pct", "urn:nyra:ac:parameter:CRUSH_YIELD_PCT"),
+        ("moisture_after_pct", "urn:nyra:ac:parameter:MOISTURE_AFTER_CRUSH_PCT"),
+        ("dust_generation_pct", "urn:nyra:ac:parameter:DUST_GENERATION_PCT"),
+    ):
+        value = crush_payload.get(field)
+        if value is None:
+            continue
+        mes_core_entities.create_triple(
+            db,
+            tenant,
+            TripleCreate(
+                subject_uri=subject,
+                predicate_uri="urn:nyra:predicate:captures",
+                object_uri=param_uri,
+                object_literal=str(value),
+                object_datatype="http://www.w3.org/2001/XMLSchema#decimal",
+                source_table="trn.customer_order",
+                source_id=source_id,
+            ),
+        )
+
+
+def list_inbound_execution(
+    db: Session, tenant: TenantContext
+) -> List[AcInboundExecutionOut]:
+    rows = list_raw_material_qc(db, tenant)
+    return [AcInboundExecutionOut.model_validate(row.model_dump()) for row in rows]
+
+
+def complete_inbound_execution_step(
+    db: Session, tenant: TenantContext, payload: AcInboundStepCompleteCreate
+) -> AcInboundExecutionOut:
+    repo = _repo(db, tenant)
+    order = repo.get_by_pk(
+        CustomerOrder, CustomerOrder.customer_order_id, payload.customer_order_id
+    )
+    row = _raw_material_qc_from_order(db, tenant, order)
+    if not row:
+        raise NotFoundError(
+            f"Order '{order.order_code}' has no raw material line for inbound execution"
+        )
+    product_id = row.raw_material_type_id
+    if not product_id:
+        raise ValidationError("Inward order is missing raw material type reference.")
+    ac_inbound_execution.complete_inbound_step(
+        db, tenant, payload, product_id=product_id
+    )
+    refreshed = _raw_material_qc_from_order(db, tenant, order)
+    assert refreshed is not None
+    return AcInboundExecutionOut.model_validate(refreshed.model_dump())
+
+
+def list_raw_material_crushing(
+    db: Session, tenant: TenantContext
+) -> List[AcRawMaterialCrushOut]:
+    rows = list_raw_material_qc(db, tenant)
+    return [AcRawMaterialCrushOut.model_validate(row.model_dump()) for row in rows]
+
+
+def create_raw_material_crush(
+    db: Session, tenant: TenantContext, payload: AcRawMaterialCrushCreate
+) -> AcRawMaterialCrushOut:
+    repo = _repo(db, tenant)
+    order = repo.get_by_pk(
+        CustomerOrder, CustomerOrder.customer_order_id, payload.customer_order_id
+    )
+    existing = _raw_material_qc_from_order(db, tenant, order)
+    if not existing:
+        raise NotFoundError(
+            f"Order '{order.order_code}' has no raw material line for crushing"
+        )
+    product_id = existing.raw_material_type_id
+    if not product_id:
+        raise ValidationError("Inward order is missing raw material type reference.")
+
+    parameters = {
+        k: v
+        for k, v in {
+            "input_lump_size_mm": payload.input_lump_size_mm,
+            "target_output_size_mm": payload.target_output_size_mm,
+            "throughput_kg_h": payload.throughput_kg_h,
+            "crush_output_kg": payload.crush_output_kg,
+            "crush_yield_pct": payload.crush_yield_pct,
+            "moisture_before_pct": payload.moisture_before_pct,
+            "moisture_after_pct": payload.moisture_after_pct,
+            "dust_generation_pct": payload.dust_generation_pct,
+            "crusher_id": payload.crusher_id,
+            "operator_remarks": payload.operator_remarks,
+        }.items()
+        if v is not None
+    }
+    ac_inbound_execution.complete_inbound_step(
+        db,
+        tenant,
+        AcInboundStepCompleteCreate(
+            customer_order_id=payload.customer_order_id,
+            process_step="CRUSHING",
+            parameters=parameters,
+        ),
+        product_id=product_id,
+        allow_unconfigured=True,
+    )
+    row = _raw_material_qc_from_order(db, tenant, order)
+    assert row is not None
+    return AcRawMaterialCrushOut.model_validate(row.model_dump())
+
+
 def list_raw_material_qc(
     db: Session, tenant: TenantContext
 ) -> List[AcRawMaterialQcOut]:
@@ -2416,6 +2918,32 @@ def create_raw_material_qc(
         )
 
     meta = dict(order.metadata_ if isinstance(order.metadata_, dict) else {})
+
+    raw_type_id = _uuid_or_none(meta.get("raw_product_id"))
+    if raw_type_id:
+        try:
+            material_type = ac_raw_material_types.get_raw_material_type(
+                db, tenant, raw_type_id
+            )
+            if not ac_inbound_execution.mandatory_inbound_prep_complete(
+                material_type, meta
+            ):
+                pending = ac_inbound_execution.next_inbound_process_step(
+                    material_type, meta
+                )
+                raise ValidationError(
+                    f"Order '{order.order_code}' requires inbound prep before QC — "
+                    f"complete step '{pending or 'inbound prep'}' on Inbound Execution first."
+                )
+        except NotFoundError:
+            pass
+    elif meta.get("raw_material_crush"):
+        crush = meta.get("raw_material_crush") if isinstance(meta.get("raw_material_crush"), dict) else {}
+        if crush.get("status") != "COMPLETED":
+            raise ValidationError(
+                f"Order '{order.order_code}' requires crushing / sizing before QC — "
+                "complete the Crushing step first."
+            )
 
     def _json_val(value):
         if isinstance(value, Decimal):
@@ -2482,12 +3010,39 @@ def create_kiln_feed_lot(
             lot.lot_quantity = payload.lot_quantity
         lot.status = payload.status or "IN_PROGRESS"
         if payload.kiln_resource_code:
+            now_iso = datetime.now(timezone.utc).isoformat()
+            claim_kiln_for_lot(
+                db, tenant, payload.kiln_resource_code, lot_code=lot.lot_code
+            )
+            lot_meta = lot.metadata_ if isinstance(lot.metadata_, dict) else {}
+            lot.metadata_ = {
+                **lot_meta,
+                "charged_at": now_iso,
+                "kiln_resource_code": payload.kiln_resource_code,
+                "kiln_resource_claimed": True,
+                "kiln_live_status": "IN_KILN",
+            }
             _create_process_execution(
                 db,
                 tenant,
                 lot.production_lot_id,
                 "ACTIVATION",
-                {"kiln_resource_code": payload.kiln_resource_code, "feed_recorded": True},
+                {
+                    "kiln_resource_code": payload.kiln_resource_code,
+                    "feed_recorded": True,
+                    "process_step": "KILN_FEED",
+                },
+            )
+            mes_core_entities.create_triple(
+                db,
+                tenant,
+                TripleCreate(
+                    subject_uri=f"urn:nyra:ac:lot:{lot.lot_code}",
+                    predicate_uri="urn:nyra:predicate:assignedTo",
+                    object_uri=f"urn:nyra:ac:kiln:{payload.kiln_resource_code}",
+                    source_table="trn.production_lot",
+                    source_id=lot.production_lot_id,
+                ),
             )
         repo.db.commit()
         repo.db.refresh(lot)
@@ -2518,14 +3073,45 @@ def create_kiln_feed_lot(
                 "Feasibility Gate must pass before charging the kiln — "
                 f"run feasibility for lot '{lot.lot_code}' first"
             )
+        now_iso = datetime.now(timezone.utc).isoformat()
+        lot_row = repo.get_by_pk(
+            ProductionLot, ProductionLot.production_lot_id, lot.production_lot_id
+        )
+        claim_kiln_for_lot(
+            db, tenant, payload.kiln_resource_code, lot_code=lot_row.lot_code
+        )
+        lot_meta = lot_row.metadata_ if isinstance(lot_row.metadata_, dict) else {}
+        lot_row.metadata_ = {
+            **lot_meta,
+            "charged_at": now_iso,
+            "kiln_resource_code": payload.kiln_resource_code,
+            "kiln_resource_claimed": True,
+            "kiln_live_status": "IN_KILN",
+        }
         _create_process_execution(
             db,
             tenant,
-            lot.production_lot_id,
+            lot_row.production_lot_id,
             "ACTIVATION",
-            {"kiln_resource_code": payload.kiln_resource_code, "feed_recorded": True},
+            {
+                "kiln_resource_code": payload.kiln_resource_code,
+                "feed_recorded": True,
+                "process_step": "KILN_FEED",
+            },
         )
-    return lot
+        mes_core_entities.create_triple(
+            db,
+            tenant,
+            TripleCreate(
+                subject_uri=f"urn:nyra:ac:lot:{lot_row.lot_code}",
+                predicate_uri="urn:nyra:predicate:assignedTo",
+                object_uri=f"urn:nyra:ac:kiln:{payload.kiln_resource_code}",
+                source_table="trn.production_lot",
+                source_id=lot_row.production_lot_id,
+            ),
+        )
+        repo.db.commit()
+    return mes_core_entities.get_production_lot(db, tenant, lot.production_lot_id)
 
 
 def create_kiln_parameters(
@@ -2547,6 +3133,54 @@ def create_kiln_parameters(
     return _create_process_execution(
         db, tenant, payload.production_lot_id, "ACTIVATION", meta
     )
+
+
+def _stage_screening_triples(
+    db: Session,
+    tenant: TenantContext,
+    lot: ProductionLot,
+    execution_code: str,
+    meta: dict,
+) -> None:
+    subject = f"urn:nyra:ac:lot:{lot.lot_code}"
+    mes_core_entities.create_triple(
+        db,
+        tenant,
+        TripleCreate(
+            subject_uri=subject,
+            predicate_uri="urn:nyra:predicate:screenedAt",
+            object_uri=f"urn:nyra:ac:screening:{execution_code}",
+            source_table="exec.operation_execution",
+            source_id=None,
+        ),
+    )
+    for field, param_uri in (
+        ("mesh_size", "urn:nyra:ac:parameter:SCREEN_MESH_SIZE"),
+        ("good_kg", "urn:nyra:ac:parameter:GOOD_KG"),
+        ("overs_kg", "urn:nyra:ac:parameter:OVERS_KG"),
+        ("fines_kg", "urn:nyra:ac:parameter:FINES_KG"),
+    ):
+        value = meta.get(field)
+        if value is None:
+            continue
+        datatype = (
+            "http://www.w3.org/2001/XMLSchema#string"
+            if field == "mesh_size"
+            else "http://www.w3.org/2001/XMLSchema#decimal"
+        )
+        mes_core_entities.create_triple(
+            db,
+            tenant,
+            TripleCreate(
+                subject_uri=subject,
+                predicate_uri="urn:nyra:predicate:captures",
+                object_uri=param_uri,
+                object_literal=str(value),
+                object_datatype=datatype,
+                source_table="exec.operation_execution",
+                source_id=None,
+            ),
+        )
 
 
 def create_screening_record(
@@ -2571,6 +3205,7 @@ def create_screening_record(
     lot = repo.get_by_pk(
         ProductionLot, ProductionLot.production_lot_id, payload.production_lot_id
     )
+    _stage_screening_triples(db, tenant, lot, result.execution_code, meta)
     lot_meta = lot.metadata_ if isinstance(lot.metadata_, dict) else {}
     lot.metadata_ = {
         **lot_meta,
@@ -2578,6 +3213,87 @@ def create_screening_record(
     }
     repo.db.flush()
     ac_stock.try_stock_lot_after_pipeline(db, tenant, payload.production_lot_id)
+    return result
+
+
+def _stage_grade_separation_triples(
+    db: Session,
+    tenant: TenantContext,
+    lot: ProductionLot,
+    execution_code: str,
+    meta: dict,
+) -> None:
+    subject = f"urn:nyra:ac:lot:{lot.lot_code}"
+    mes_core_entities.create_triple(
+        db,
+        tenant,
+        TripleCreate(
+            subject_uri=subject,
+            predicate_uri="urn:nyra:predicate:captures",
+            object_uri=f"urn:nyra:ac:gradeSeparation:{execution_code}",
+            source_table="exec.operation_execution",
+            source_id=None,
+        ),
+    )
+    for field, param_uri in (
+        ("grade_code", "urn:nyra:ac:parameter:GRADE_CODE"),
+        ("separated_kg", "urn:nyra:ac:parameter:SEPARATED_KG"),
+        ("grade_yield_pct", "urn:nyra:ac:parameter:GRADE_YIELD_PCT"),
+        ("overs_grade_kg", "urn:nyra:ac:parameter:OVERS_GRADE_KG"),
+        ("fines_grade_kg", "urn:nyra:ac:parameter:FINES_GRADE_KG"),
+    ):
+        value = meta.get(field)
+        if value is None:
+            continue
+        datatype = (
+            "http://www.w3.org/2001/XMLSchema#string"
+            if field == "grade_code"
+            else "http://www.w3.org/2001/XMLSchema#decimal"
+        )
+        mes_core_entities.create_triple(
+            db,
+            tenant,
+            TripleCreate(
+                subject_uri=subject,
+                predicate_uri="urn:nyra:predicate:captures",
+                object_uri=param_uri,
+                object_literal=str(value),
+                object_datatype=datatype,
+                source_table="exec.operation_execution",
+                source_id=None,
+            ),
+        )
+
+
+def create_grade_separation_record(
+    db: Session, tenant: TenantContext, payload: AcGradeSeparationCreate
+) -> OperationExecutionOut:
+    meta = {
+        k: v
+        for k, v in {
+            "grade_code": payload.grade_code,
+            "separated_kg": payload.separated_kg,
+            "grade_yield_pct": payload.grade_yield_pct,
+            "overs_grade_kg": payload.overs_grade_kg,
+            "fines_grade_kg": payload.fines_grade_kg,
+        }.items()
+        if v is not None
+    }
+    result = _create_process_execution(
+        db, tenant, payload.production_lot_id, "GRADE_SEPARATION", meta
+    )
+    repo = _repo(db, tenant)
+    lot = repo.get_by_pk(
+        ProductionLot, ProductionLot.production_lot_id, payload.production_lot_id
+    )
+    _stage_grade_separation_triples(db, tenant, lot, result.execution_code, meta)
+    lot_meta = lot.metadata_ if isinstance(lot.metadata_, dict) else {}
+    lot.metadata_ = {
+        **lot_meta,
+        "grade_code": payload.grade_code,
+        "grade_separation_at": datetime.now(timezone.utc).isoformat(),
+    }
+    repo.db.flush()
     return result
 
 
@@ -2602,13 +3318,26 @@ def create_quality_test(
     check_row = repo.get_by_pk(
         QualityCheck, QualityCheck.quality_check_id, check.quality_check_id
     )
+
+    def _qc_meta_val(value):
+        if isinstance(value, Decimal):
+            return float(value)
+        return value
+
+    qc_meta = {
+        k: _qc_meta_val(v)
+        for k, v in {
+            "iodine_mg_g": payload.iodine_mg_g,
+            "ash_pct": payload.ash_pct,
+            "moisture_pct": payload.moisture_pct,
+            "bulk_density": payload.bulk_density,
+            "remarks": payload.remarks,
+        }.items()
+        if v is not None
+    }
     check_row.metadata_ = {
         **(check_row.metadata_ if isinstance(check_row.metadata_, dict) else {}),
-        "iodine_mg_g": payload.iodine_mg_g,
-        "ash_pct": payload.ash_pct,
-        "moisture_pct": payload.moisture_pct,
-        "bulk_density": payload.bulk_density,
-        "remarks": payload.remarks,
+        **qc_meta,
     }
     lot = repo.get_by_pk(
         ProductionLot, ProductionLot.production_lot_id, payload.production_lot_id

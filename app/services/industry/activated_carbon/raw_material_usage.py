@@ -18,8 +18,9 @@ from app.models.mes_core.transaction import (
 )
 from app.services.mes_core.base import TenantRepository
 
-# Shop-floor steps that imply material has entered the kiln line.
+# Shop-floor steps that lock routing edits (activation / pyrolysis — not kiln feed alone).
 KILN_PROCESS_STEPS = frozenset({"KILN_FEED", "ACTIVATION", "PYROLYSIS"})
+ROUTING_LOCK_PROCESS_STEPS = frozenset({"ACTIVATION", "PYROLYSIS"})
 
 _EXECUTION_STARTED_STATUSES = frozenset(
     {"IN_PROGRESS", "COMPLETED", "DONE", "STARTED", "CLOSED"}
@@ -131,7 +132,7 @@ def raw_material_usage(db: Session, tenant: TenantContext, product_id: UUID) -> 
         )
         for ex in executions:
             step = _execution_process_step(ex)
-            if step in KILN_PROCESS_STEPS and _execution_started(ex):
+            if step in ROUTING_LOCK_PROCESS_STEPS and _execution_started(ex):
                 kiln_process_started = True
                 break
 

@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from sqlalchemy.orm import Session
+from sqlalchemy.orm.attributes import flag_modified
 
 from app.core.exceptions import WorkflowError
 from app.core.tenant_context import TenantContext
@@ -16,13 +17,13 @@ from app.models.mes_core import (
     RoutingOperationParameter,
 )
 from app.services.industry.activated_carbon.routing_helpers import _is_schedule_row
+from app.services.industry.activated_carbon.lot_routing import load_ac_lot_routing
 from app.services.mes_core.base import TenantRepository
 from app.services.mes_core.feasibility import is_ready_for_scheduling, run_feasibility_check
 from app.services.mes_core.ids import resolve_business_code
 from app.services.industry.activated_carbon.execution_enrich import (
     enrich_routing_plan_operations,
 )
-from app.services.mes_core.routing_helpers import load_lot_routing
 
 _SCHEDULE_META_FLAG = "is_production_schedule"
 
@@ -65,7 +66,7 @@ def get_lot_routing_plan(db: Session, tenant: TenantContext, lot_code: str) -> d
     """Routing plan shape compatible with the workflow RoutingFlow UI."""
     repo = _repo(db, tenant)
     lot = repo.get_by_code(ProductionLot, ProductionLot.lot_code, lot_code)
-    product, routing, operations, _qty = load_lot_routing(repo, lot)
+    product, routing, operations, _qty = load_ac_lot_routing(db, tenant, lot)
 
     if not product:
         raise WorkflowError(f"Lot '{lot_code}': cannot resolve product")
@@ -153,7 +154,7 @@ def generate_lot_route(db: Session, tenant: TenantContext, lot_code: str) -> dic
         )
     repo = _repo(db, tenant)
     lot = repo.get_by_code(ProductionLot, ProductionLot.lot_code, lot_code)
-    _product, routing, operations, _qty = load_lot_routing(repo, lot)
+    _product, routing, operations, _qty = load_ac_lot_routing(db, tenant, lot)
     if not routing or not operations:
         raise WorkflowError(f"No routing operations to generate for lot '{lot_code}'")
 
@@ -175,9 +176,20 @@ def generate_lot_route(db: Session, tenant: TenantContext, lot_code: str) -> dic
 
     created = []
     for op in operations:
-        if op.routing_operation_id in by_op:
-            continue
         op_meta = op.metadata_ if isinstance(op.metadata_, dict) else {}
+        existing_ex = by_op.get(op.routing_operation_id)
+        if existing_ex:
+            meta = dict(existing_ex.metadata_ or {}) if isinstance(existing_ex.metadata_, dict) else {}
+            if not _is_schedule_row(existing_ex):
+                meta[_SCHEDULE_META_FLAG] = True
+                meta.setdefault("schedule_code", existing_ex.execution_code)
+                meta.setdefault("schedule_status", existing_ex.status or "Scheduled")
+                meta.setdefault("source", "ac_routing_generate")
+            meta["process_step"] = op_meta.get("process_step") or meta.get("process_step")
+            meta["is_mandatory"] = op_meta.get("is_mandatory", meta.get("is_mandatory", True))
+            existing_ex.metadata_ = meta
+            flag_modified(existing_ex, "metadata_")
+            continue
         execution_code = resolve_business_code(db, provided=None, entity="operation_execution")
         row = repo.add(
             OperationExecution(

@@ -8,6 +8,7 @@ from typing import Optional
 from uuid import UUID
 
 from sqlalchemy.orm import Session
+from sqlalchemy.orm.attributes import flag_modified
 
 from app.core.tenant_context import TenantContext
 from app.models.mes_core import (
@@ -22,10 +23,15 @@ from app.models.mes_core import (
     RoutingOperation,
 )
 from app.services.industry.activated_carbon.resource_pool import (
+    assert_resources_available,
     claim_execution_resources,
+    kiln_release_step,
     release_execution_resources,
+    release_lot_kiln_if_claimed,
+    restore_execution_resources,
 )
 from app.services.mes_core.base import TenantRepository
+from app.services.mes_core import execution_workflow as mes_core_execution
 
 FG_STOCK_KEY = "fg_stock_kg"
 QC_PASS_STATUSES = frozenset({"PASS", "PASSED", "QC_PASSED", "APPROVED", "CLOSED"})
@@ -40,6 +46,56 @@ def _is_schedule_row(row: OperationExecution) -> bool:
 
 def _repo(db: Session, tenant: TenantContext) -> TenantRepository:
     return TenantRepository(db, tenant)
+
+
+def _execution_process_step(
+    repo: TenantRepository, row: OperationExecution
+) -> str:
+    meta = row.metadata_ if isinstance(row.metadata_, dict) else {}
+    step = (meta.get("process_step") or "").strip()
+    if step:
+        return step.upper()
+    if not row.routing_operation_id:
+        return ""
+    rop = (
+        repo.query(RoutingOperation)
+        .filter(RoutingOperation.routing_operation_id == row.routing_operation_id)
+        .first()
+    )
+    if not rop:
+        return ""
+    rop_meta = rop.metadata_ if isinstance(rop.metadata_, dict) else {}
+    return (rop_meta.get("process_step") or "").upper()
+
+
+def validate_resources_for_execution_start(
+    db: Session,
+    tenant: TenantContext,
+    execution_code: str,
+    payload,
+) -> None:
+    """Ensure machines, labor, and tools are free before shop-floor start."""
+    repo = _repo(db, tenant)
+    row = repo.get_by_code(
+        OperationExecution, OperationExecution.execution_code, execution_code
+    )
+    if not _is_schedule_row(row):
+        return
+    lot = repo.get_by_pk(ProductionLot, ProductionLot.production_lot_id, row.production_lot_id)
+    rop = repo.get_by_pk(
+        RoutingOperation,
+        RoutingOperation.routing_operation_id,
+        row.routing_operation_id,
+    )
+    selection = mes_core_execution.resolve_start_resource_selection(repo, rop, payload)
+    assert_resources_available(
+        db,
+        tenant,
+        lot_code=lot.lot_code,
+        machine_code=selection.get("machine_code") or "",
+        labor_code=selection.get("labor_pool_code") or "",
+        tool_codes=selection.get("tool_codes") or [],
+    )
 
 
 def _product_meta(product: Product) -> dict:
@@ -251,6 +307,9 @@ def after_execution_completed(
     release_execution_resources(db, tenant, row)
 
     lot = repo.get_by_pk(ProductionLot, ProductionLot.production_lot_id, row.production_lot_id)
+    if kiln_release_step(_execution_process_step(repo, row)):
+        release_lot_kiln_if_claimed(db, tenant, lot)
+
     lot_status = (lot.status or "").upper()
     if lot_status in ("COMPLETED", "DISPATCHED", "CLOSED", "STOCKED"):
         repo.db.commit()
@@ -263,6 +322,7 @@ def after_execution_completed(
             "routing_complete_at": datetime.now(timezone.utc).isoformat(),
         }
         lot.status = "QC_PENDING"
+        release_lot_kiln_if_claimed(db, tenant, lot)
         release_lot_schedule_resources(db, tenant, lot.production_lot_id)
         try_stock_lot_after_pipeline(db, tenant, lot.production_lot_id)
         repo.db.commit()
@@ -324,6 +384,33 @@ def stock_lot_after_final_qc(
     return updated
 
 
+def on_execution_held(
+    db: Session, tenant: TenantContext, execution_code: str
+) -> None:
+    repo = _repo(db, tenant)
+    row = repo.get_by_code(
+        OperationExecution, OperationExecution.execution_code, execution_code
+    )
+    if not _is_schedule_row(row) or not row.started_at:
+        return
+    release_execution_resources(db, tenant, row, for_hold=True)
+    repo.db.commit()
+
+
+def on_execution_resumed(
+    db: Session, tenant: TenantContext, execution_code: str
+) -> None:
+    repo = _repo(db, tenant)
+    row = repo.get_by_code(
+        OperationExecution, OperationExecution.execution_code, execution_code
+    )
+    if not _is_schedule_row(row) or not row.started_at:
+        return
+    lot = repo.get_by_pk(ProductionLot, ProductionLot.production_lot_id, row.production_lot_id)
+    restore_execution_resources(db, tenant, row, lot_code=lot.lot_code)
+    repo.db.commit()
+
+
 def on_execution_started(
     db: Session, tenant: TenantContext, execution_code: str
 ) -> None:
@@ -343,6 +430,8 @@ def release_lot_schedule_resources(
 ) -> None:
     """Clear kiln/labor schedule holds so feasibility can book the next lot."""
     repo = _repo(db, tenant)
+    lot = repo.get_by_pk(ProductionLot, ProductionLot.production_lot_id, lot_id)
+    release_lot_kiln_if_claimed(db, tenant, lot)
     now = datetime.now(timezone.utc).isoformat()
     rows = (
         repo.query(OperationExecution)
@@ -419,7 +508,13 @@ def available_raw_material_kg(db: Session, tenant: TenantContext) -> Decimal:
         qc_ok = (order.status or "").upper() == "QC_PASSED" or qc_status_passed(
             qc.get("qc_status")
         )
-        if not qc_ok:
+        separation = (
+            meta.get("grade_separation")
+            if isinstance(meta.get("grade_separation"), dict)
+            else {}
+        )
+        prep_ok = (separation.get("status") or "").upper() == "COMPLETED"
+        if not qc_ok and not prep_ok:
             continue
         allocated = Decimal(str(meta.get("allocated_to_production_kg") or 0))
         lines = (
@@ -460,10 +555,31 @@ def _raw_line_quantity(
     return Decimal("0"), None
 
 
+def _rail_step_status(meta: dict, exec_key: str, fallback: dict | None) -> tuple[str, Optional[str]]:
+    exec_map = meta.get("inbound_execution") if isinstance(meta.get("inbound_execution"), dict) else {}
+    row = exec_map.get(exec_key)
+    if isinstance(row, dict):
+        status = str(row.get("status") or "").upper()
+        if status == "COMPLETED":
+            return "COMPLETED", row.get("completed_at") or row.get("qc_at") or row.get("reconciled_at")
+    if isinstance(fallback, dict):
+        status = str(fallback.get("status") or fallback.get("qc_status") or "").upper()
+        if status in ("COMPLETED", "RECONCILED", "PASS", "QC_PASSED", "APPROVED"):
+            return (
+                "COMPLETED",
+                fallback.get("completed_at")
+                or fallback.get("qc_at")
+                or fallback.get("reconciled_at"),
+            )
+    return "PENDING", None
+
+
 def enrich_inward_order_stock(
     order_out,
     order_row,
     products: dict,
+    *,
+    released_at_fallback=None,
 ):
     """Attach quantity / allocated / available fields for raw material inward UI."""
     from app.schemas.mes_core.schemas import CustomerOrderOut
@@ -495,6 +611,31 @@ def enrich_inward_order_stock(
     qc_status = qc.get("qc_status")
     if not qc_status and (order_row.status or "").upper() == "QC_PASSED":
         qc_status = "QC_PASSED"
+    receipt = meta.get("inward_receipt") if isinstance(meta.get("inward_receipt"), dict) else {}
+    dc_number = receipt.get("dc_number")
+    supplier_weight_kg = (
+        Decimal(str(receipt["supplier_weight_kg"]))
+        if receipt.get("supplier_weight_kg") is not None
+        else None
+    )
+    our_weight_kg = (
+        Decimal(str(receipt["our_weight_kg"]))
+        if receipt.get("our_weight_kg") is not None
+        else qty
+    )
+    supplier_value_inr = (
+        Decimal(str(receipt["supplier_value_inr"]))
+        if receipt.get("supplier_value_inr") is not None
+        else None
+    )
+    initial_qc = meta.get("initial_qc") if isinstance(meta.get("initial_qc"), dict) else {}
+    bags = meta.get("bag_reconciliation") if isinstance(meta.get("bag_reconciliation"), dict) else {}
+    outward = meta.get("grade_separation") if isinstance(meta.get("grade_separation"), dict) else {}
+    lab_status, lab_at = _rail_step_status(meta, "IN-LAB", initial_qc)
+    rms_status, rms_at = _rail_step_status(meta, "IN-RMS-BAG", bags)
+    out_status, out_at = _rail_step_status(meta, "IN-RM-OUT", outward)
+    released_at = meta.get("released_to_production_at") or released_at_fallback
+    released_status = "RELEASED" if allocated > 0 or released_at else "PENDING"
     if not isinstance(order_out, CustomerOrderOut):
         return order_out
     return order_out.model_copy(
@@ -504,6 +645,18 @@ def enrich_inward_order_stock(
             "allocated_to_production_kg": allocated,
             "available_quantity_kg": available,
             "qc_status": qc_status or "PENDING",
+            "dc_number": dc_number,
+            "supplier_weight_kg": supplier_weight_kg,
+            "our_weight_kg": our_weight_kg,
+            "supplier_value_inr": supplier_value_inr,
+            "lab_status": lab_status,
+            "lab_at": lab_at,
+            "rms_inward_status": rms_status,
+            "rms_inward_at": rms_at,
+            "rm_outward_status": out_status,
+            "rm_outward_at": out_at,
+            "released_to_production_status": released_status,
+            "released_to_production_at": released_at,
         }
     )
 
@@ -543,6 +696,9 @@ def allocate_raw_from_inward(
         **meta,
         "allocated_to_production_kg": str(allocated + qty),
     }
+    if not meta.get("released_to_production_at"):
+        meta["released_to_production_at"] = datetime.now(timezone.utc).isoformat()
     order.metadata_ = meta
+    flag_modified(order, "metadata_")
     repo.db.flush()
     return max(line_qty - allocated - qty, Decimal("0"))

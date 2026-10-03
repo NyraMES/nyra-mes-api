@@ -454,6 +454,11 @@ def _run_material_checks(
 
 def _run_kiln_resource_check(repo: TenantRepository) -> Optional[FeasibilityCheckResult]:
     """Activated Carbon: ensure at least one activation kiln resource exists and is available."""
+    from app.services.industry.activated_carbon.resource_pool import (
+        release_stale_kiln_claims,
+    )
+
+    release_stale_kiln_claims(repo.db, repo.tenant)
     kilns = (
         repo.query(Resource)
         .filter(Resource.resource_code.like("RES-KILN%"))
@@ -544,6 +549,13 @@ def _run_lot_checks(
         checks.append(kiln_check)
 
     product, routing, operations, lot_qty = load_lot_routing(repo, lot)
+    template = (repo.tenant.industry_template_code or "").upper()
+    if "ACTIVATED" in template or template == "ACTIVATED_CARBON":
+        from app.services.industry.activated_carbon.lot_routing import load_ac_lot_routing
+
+        product, routing, operations, lot_qty = load_ac_lot_routing(
+            repo.db, repo.tenant, lot
+        )
 
     if not routing or not operations:
         product_code = product.product_code if product else "unknown"

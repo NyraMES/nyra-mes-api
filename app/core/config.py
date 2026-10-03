@@ -81,7 +81,7 @@ class Settings:
     auth_dev_user_email: str = os.getenv("AUTH_DEV_USER_EMAIL", "dev@localhost")
     auth_dev_user_roles: List[str] = field(
         default_factory=lambda: _split_csv(
-            os.getenv("AUTH_DEV_USER_ROLES", "MES_Admin")
+            os.getenv("AUTH_DEV_USER_ROLES", "MES_SuperAdmin")
         )
     )
     # Dev-only tenant scope when AUTH_ENABLED=false (mirrors Cognito custom:tenant_code).
@@ -126,6 +126,11 @@ class Settings:
     )
     demo_read_only: bool = field(
         default_factory=lambda: os.getenv("DEMO_READ_ONLY", "false").lower()
+        in ("1", "true", "yes")
+    )
+    # Testbed: allow SAM_CARBONS_DEMO JWT users to call SAM_CARBONS APIs (and vice versa).
+    ac_demo_tenant_bridge: bool = field(
+        default_factory=lambda: os.getenv("AC_DEMO_TENANT_BRIDGE", "false").lower()
         in ("1", "true", "yes")
     )
 

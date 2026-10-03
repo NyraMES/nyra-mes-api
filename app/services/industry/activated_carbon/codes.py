@@ -28,6 +28,26 @@ AC_CODE_SPECS: dict[str, tuple[str, str]] = {
     "ac_operation_execution": ("core.execution_code_seq", "EXEC-AC-"),
 }
 
+ALL_CORE_CODE_SEQUENCES: tuple[str, ...] = (
+    "core.supplier_code_seq",
+    "core.customer_code_seq",
+    "core.product_code_seq",
+    "core.resource_code_seq",
+    "core.equipment_code_seq",
+    "core.routing_code_seq",
+    "core.routing_operation_code_seq",
+    "core.customer_order_code_seq",
+    "core.customer_order_line_code_seq",
+    "core.production_order_code_seq",
+    "core.lot_code_seq",
+    "core.feasibility_check_code_seq",
+    "core.execution_code_seq",
+    "core.schedule_code_seq",
+    "core.quality_check_code_seq",
+    "core.ncr_code_seq",
+    "core.dispatch_code_seq",
+)
+
 # Minimum suffix already issued for demo seed (next code = floor + 1 when DB empty).
 AC_SEQUENCE_FLOORS: dict[str, int] = {
     "core.customer_code_seq": 0,
@@ -40,6 +60,8 @@ AC_SEQUENCE_FLOORS: dict[str, int] = {
     "core.feasibility_check_code_seq": 0,
     "core.schedule_code_seq": 0,
     "core.dispatch_code_seq": 0,
+    "core.routing_code_seq": 0,
+    "core.product_code_seq": 0,
 }
 
 # Shared PostgreSQL sequences — table/column + optional LIKE filter on business code.
@@ -59,6 +81,11 @@ AC_SEQUENCE_CODE_SOURCES: dict[str, list[tuple[str, str, Optional[str]]]] = {
     ],
     "core.dispatch_code_seq": [
         ("qms.quality_check", "check_code", "DISP-AC-%")
+    ],
+    "core.routing_code_seq": [("mst.routing", "routing_code", "RT-AC-%")],
+    "core.product_code_seq": [
+        ("mst.product", "product_code", "RAW-AC-%"),
+        ("mst.product", "product_code", "FG-AC-%"),
     ],
     "core.feasibility_check_code_seq": [
         ("trn.feasibility_check", "check_code", "FEAS%")
@@ -99,12 +126,28 @@ def _max_numeric_suffix(
     return int(row or 0)
 
 
-def generate_ac_business_code(db: Session, entity: str) -> str:
+def generate_ac_business_code(
+    db: Session, entity: str, *, tenant_id: Optional[UUID] = None
+) -> str:
     if entity not in AC_CODE_SPECS:
         raise ValueError(f"Unknown AC entity for ID generation: {entity}")
     sequence, prefix = AC_CODE_SPECS[entity]
-    n = _nextval(db, sequence)
-    return f"{prefix}{n}"
+    for _ in range(32):
+        n = _nextval(db, sequence)
+        code = f"{prefix}{n}"
+        if entity == "ac_routing" and tenant_id is not None:
+            taken = db.execute(
+                text(
+                    "SELECT 1 FROM mst.routing "
+                    "WHERE tenant_id = :tenant_id AND routing_code = :code LIMIT 1"
+                ),
+                {"tenant_id": str(tenant_id), "code": code},
+            ).scalar()
+            if not taken:
+                return code
+            continue
+        return code
+    raise ValueError(f"Could not allocate unique code for {entity}")
 
 
 def resolve_ac_business_code(
@@ -112,11 +155,12 @@ def resolve_ac_business_code(
     *,
     provided: Optional[str],
     entity: str,
+    tenant_id: Optional[UUID] = None,
 ) -> str:
     code = (provided or "").strip()
     if code:
         return code
-    return generate_ac_business_code(db, entity)
+    return generate_ac_business_code(db, entity, tenant_id=tenant_id)
 
 
 def sync_ac_sequences(db: Session, tenant_id: Optional[UUID] = None) -> None:
@@ -152,9 +196,9 @@ def sync_ac_sequences_global(db: Session) -> None:
 
 
 def reset_ac_sequences_empty(db: Session) -> None:
-    """Set AC-related PostgreSQL sequences so the next generated code uses suffix 1."""
-    sequences = set(AC_SEQUENCE_FLOORS) | {spec[0] for spec in AC_CODE_SPECS.values()}
-    for seq in sorted(sequences):
-        # PostgreSQL sequences cannot be set below 1; is_called=false => next nextval returns 1.
+    """Set all core business-code sequences so the next generated code uses suffix 1."""
+    for seq in ALL_CORE_CODE_SEQUENCES:
+        db.execute(text(f"CREATE SEQUENCE IF NOT EXISTS {seq} START 1"))
+        # is_called=false => next nextval returns 1.
         db.execute(text(f"SELECT setval('{seq}', 1, false)"))
     db.commit()

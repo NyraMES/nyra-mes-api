@@ -13,6 +13,7 @@ from jose import JWTError, jwt
 
 from app.core.config import settings
 from app.core.exceptions import ForbiddenError, UnauthorizedError
+from app.core.tenant_aliases import canonical_tenant_code
 
 _bearer = HTTPBearer(auto_error=False)
 
@@ -80,6 +81,11 @@ def _tenant_code_from_claims(claims: Dict[str, Any]) -> Optional[str]:
 # Demo playground tenants — any authenticated MES user may open these for industry previews.
 _DEMO_PLAYGROUND_TENANTS: frozenset[str] = frozenset({"SAM_CARBONS_DEMO"})
 
+# Activated Carbon validation tenants (client + generic demo playground).
+_AC_VALIDATION_TENANTS: frozenset[str] = frozenset(
+    {"GR_CARBONS", "SAM_CARBONS", "SAM_CARBONS_DEMO"}
+)
+
 
 def assert_user_may_access_tenant(user: UserContext, tenant_code: str) -> None:
     """Phase-2 guard: JWT tenant must match the resolved request tenant."""
@@ -92,7 +98,16 @@ def assert_user_may_access_tenant(user: UserContext, tenant_code: str) -> None:
             "Your account is not assigned to a tenant. Contact your administrator.",
             details={"requested_tenant": requested},
         )
+    if canonical_tenant_code(expected) == canonical_tenant_code(requested):
+        return
     if expected != requested:
+        if (
+            settings.ac_demo_tenant_bridge
+            and expected in _AC_VALIDATION_TENANTS
+            and requested in _AC_VALIDATION_TENANTS
+            and user.has_any_role(ALL_MES_ROLES)
+        ):
+            return
         if requested in _DEMO_PLAYGROUND_TENANTS and user.has_any_role(ALL_MES_ROLES):
             return
         raise ForbiddenError(

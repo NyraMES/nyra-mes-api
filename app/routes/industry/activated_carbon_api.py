@@ -46,10 +46,28 @@ from app.schemas.mes_core.schemas import (
     AcRawMaterialInwardCreateResponse,
     AcRawMaterialQcCreate,
     AcRawMaterialQcOut,
+    AcInboundStepCompleteCreate,
+    AcInboundExecutionOut,
+    AcRawMaterialCrushCreate,
+    AcRawMaterialCrushOut,
+    AcInitialQcCreate,
+    AcInitialQcOut,
+    AcInboundWorkflowOut,
+    AcInwardBagCreate,
+    AcInwardBagOut,
+    AcInwardBagReconcileCreate,
+    AcInwardGradeSeparationCreate,
+    AcWeightToCrusherCreate,
+    AcCrusherOutputCreate,
+    AcCrusherOutputOut,
+    AcInboundAdminOut,
+    AcInboundAdminUpdate,
+    AcInwardBagFeedCreate,
     AcRawMaterialTypeCreate,
     AcRawMaterialTypeOut,
     AcRawMaterialTypeUpdate,
     AcScreeningCreate,
+    AcGradeSeparationCreate,
     ActivatedCarbonYieldSummaryOut,
     CustomerCreate,
     CustomerOrderOut,
@@ -72,6 +90,8 @@ from app.schemas.traceability import TraceabilityResponse
 from app.services.industry.activated_carbon import adapter as ac_adapter
 from app.services.industry.activated_carbon import kiln_parameters_catalog as ac_kiln_catalog
 from app.services.industry.activated_carbon import raw_material_types as ac_raw_material_types
+from app.services.industry.activated_carbon import inbound_admin as ac_inbound_admin
+from app.services.industry.activated_carbon import inbound_workflow as ac_inbound_workflow
 from app.services.industry.activated_carbon import routing_workflow as ac_routing
 from app.services.mes_core import dispatch_workflow as mes_core_dispatch
 from app.services.mes_core import entities as mes_core_entities
@@ -641,6 +661,228 @@ def create_raw_material_qc(
 
 
 @router.get(
+    "/raw-material-inbound-execution",
+    response_model=List[AcInboundExecutionOut],
+    summary="Inward orders with configurable inbound prep step status",
+)
+def list_inbound_execution(
+    db: Session = Depends(get_mes_core_db),
+    tenant: TenantContext = Depends(_AC_RAW),
+):
+    return ac_adapter.list_inbound_execution(db, tenant)
+
+
+@router.post(
+    "/raw-material-inbound-execution",
+    response_model=AcInboundExecutionOut,
+    status_code=status.HTTP_201_CREATED,
+    summary="Complete an inbound prep step before raw material QC",
+)
+def complete_inbound_execution_step(
+    payload: AcInboundStepCompleteCreate,
+    db: Session = Depends(get_mes_core_db),
+    tenant: TenantContext = Depends(_AC_RAW),
+):
+    try:
+        return ac_adapter.complete_inbound_execution_step(db, tenant, payload)
+    except ValueError as exc:
+        raise ValidationError(str(exc)) from exc
+
+
+@router.get(
+    "/raw-material-crushing",
+    response_model=List[AcRawMaterialCrushOut],
+    summary="Inward orders with crushing status (before QC)",
+)
+def list_raw_material_crushing(
+    db: Session = Depends(get_mes_core_db),
+    tenant: TenantContext = Depends(_AC_RAW),
+):
+    return ac_adapter.list_raw_material_crushing(db, tenant)
+
+
+@router.post(
+    "/raw-material-crushing",
+    response_model=AcRawMaterialCrushOut,
+    status_code=status.HTTP_201_CREATED,
+    summary="Record crushing / sizing before raw material QC",
+)
+def create_raw_material_crushing(
+    payload: AcRawMaterialCrushCreate,
+    db: Session = Depends(get_mes_core_db),
+    tenant: TenantContext = Depends(_AC_RAW),
+):
+    return ac_adapter.create_raw_material_crush(db, tenant, payload)
+
+
+@router.get(
+    "/raw-material-inbound-workflow",
+    response_model=List[AcInboundWorkflowOut],
+    summary="Inward workflow status (initial QC, weight to crusher, crusher)",
+)
+def list_raw_material_inbound_workflow(
+    db: Session = Depends(get_mes_core_db),
+    tenant: TenantContext = Depends(_AC_RAW),
+):
+    return ac_inbound_workflow.list_inbound_workflow(db, tenant)
+
+
+@router.post(
+    "/raw-material-initial-qc",
+    response_model=AcInitialQcOut,
+    status_code=status.HTTP_201_CREATED,
+    summary="Record initial QC after raw material inward",
+)
+def create_raw_material_initial_qc(
+    payload: AcInitialQcCreate,
+    db: Session = Depends(get_mes_core_db),
+    tenant: TenantContext = Depends(_AC_RAW_QC),
+):
+    return ac_inbound_workflow.create_initial_qc(db, tenant, payload)
+
+
+@router.get(
+    "/inward-bags",
+    response_model=List[AcInwardBagOut],
+    summary="List grade-wise inward bags",
+)
+def list_inward_bags(
+    order_code: Optional[str] = Query(default=None),
+    customer_order_id: Optional[UUID] = Query(default=None),
+    db: Session = Depends(get_mes_core_db),
+    tenant: TenantContext = Depends(_AC_RAW),
+):
+    return ac_inbound_workflow.list_inward_bags(
+        db, tenant, order_code=order_code, customer_order_id=customer_order_id
+    )
+
+
+@router.post(
+    "/inward-bags",
+    response_model=AcInwardBagOut,
+    status_code=status.HTTP_201_CREATED,
+    summary="Register a grade-wise bag against an inward order",
+)
+def create_inward_bag(
+    payload: AcInwardBagCreate,
+    db: Session = Depends(get_mes_core_db),
+    tenant: TenantContext = Depends(_AC_RAW),
+):
+    return ac_inbound_workflow.create_inward_bag(db, tenant, payload)
+
+
+@router.delete(
+    "/inward-bags/{bag_id}",
+    response_model=AcInboundWorkflowOut,
+    summary="Remove a bag before reconciliation",
+)
+def delete_inward_bag(
+    bag_id: UUID,
+    customer_order_id: UUID = Query(...),
+    db: Session = Depends(get_mes_core_db),
+    tenant: TenantContext = Depends(_AC_RAW),
+):
+    return ac_inbound_workflow.delete_inward_bag(
+        db, tenant, customer_order_id=customer_order_id, bag_id=bag_id
+    )
+
+
+@router.post(
+    "/inward-bags/feed-crusher",
+    response_model=AcInwardBagOut,
+    summary="Feed one RMS bag into the crusher",
+)
+def feed_inward_bag_to_crusher(
+    payload: AcInwardBagFeedCreate,
+    db: Session = Depends(get_mes_core_db),
+    tenant: TenantContext = Depends(_AC_RAW),
+):
+    return ac_inbound_workflow.feed_inward_bag_to_crusher(db, tenant, payload)
+
+
+@router.get(
+    "/inbound-admin",
+    response_model=AcInboundAdminOut,
+    summary="Rotary inventory and RM outward split catalog",
+)
+def get_inbound_admin(
+    db: Session = Depends(get_mes_core_db),
+    tenant: TenantContext = Depends(_AC_RAW),
+):
+    return ac_inbound_admin.get_inbound_admin(db, tenant)
+
+
+@router.put(
+    "/inbound-admin",
+    response_model=AcInboundAdminOut,
+    summary="Save rotary inventory and RM outward splits (admin)",
+)
+def put_inbound_admin(
+    payload: AcInboundAdminUpdate,
+    db: Session = Depends(get_mes_core_db),
+    tenant: TenantContext = Depends(_AC_MASTERS),
+    _user=require_tenant_admin(),
+):
+    return ac_inbound_admin.save_inbound_admin(db, tenant, payload.model_dump())
+
+
+@router.post(
+    "/inward-bags/reconcile",
+    response_model=AcInboundWorkflowOut,
+    status_code=status.HTTP_201_CREATED,
+    summary="Reconcile bag totals to received quantity before crusher",
+)
+def reconcile_inward_bags(
+    payload: AcInwardBagReconcileCreate,
+    db: Session = Depends(get_mes_core_db),
+    tenant: TenantContext = Depends(_AC_RAW),
+):
+    return ac_inbound_workflow.reconcile_inward_bags(db, tenant, payload)
+
+
+@router.post(
+    "/raw-material-weight-to-crusher",
+    response_model=AcInboundWorkflowOut,
+    status_code=status.HTTP_201_CREATED,
+    summary="Record weight sent to crusher (reconcile against received quantity)",
+)
+def create_raw_material_weight_to_crusher(
+    payload: AcWeightToCrusherCreate,
+    db: Session = Depends(get_mes_core_db),
+    tenant: TenantContext = Depends(_AC_RAW),
+):
+    return ac_inbound_workflow.record_weight_to_crusher(db, tenant, payload)
+
+
+@router.post(
+    "/raw-material-grade-separation",
+    response_model=AcInboundWorkflowOut,
+    status_code=status.HTTP_201_CREATED,
+    summary="Split remaining crusher output into production grades",
+)
+def create_raw_material_grade_separation(
+    payload: AcInwardGradeSeparationCreate,
+    db: Session = Depends(get_mes_core_db),
+    tenant: TenantContext = Depends(_AC_RAW),
+):
+    return ac_inbound_workflow.create_inward_grade_separation(db, tenant, payload)
+
+
+@router.post(
+    "/raw-material-crusher-output",
+    response_model=AcCrusherOutputOut,
+    status_code=status.HTTP_201_CREATED,
+    summary="Record crusher mesh output and scrap weights",
+)
+def create_raw_material_crusher_output(
+    payload: AcCrusherOutputCreate,
+    db: Session = Depends(get_mes_core_db),
+    tenant: TenantContext = Depends(_AC_RAW),
+):
+    return ac_inbound_workflow.create_crusher_output(db, tenant, payload)
+
+
+@router.get(
     "/kiln-feed",
     response_model=List[ProductionLotOut],
     summary="Kiln feed lots",
@@ -733,6 +975,23 @@ def create_screening(
 ):
     try:
         return ac_adapter.create_screening_record(db, tenant, payload)
+    except ValueError as exc:
+        raise ValidationError(str(exc)) from exc
+
+
+@router.post(
+    "/grade-separation",
+    response_model=OperationExecutionOut,
+    status_code=status.HTTP_201_CREATED,
+    summary="Record grade separation after screening",
+)
+def create_grade_separation(
+    payload: AcGradeSeparationCreate,
+    db: Session = Depends(get_mes_core_db),
+    tenant: TenantContext = Depends(_AC_SCREENING),
+):
+    try:
+        return ac_adapter.create_grade_separation_record(db, tenant, payload)
     except ValueError as exc:
         raise ValidationError(str(exc)) from exc
 

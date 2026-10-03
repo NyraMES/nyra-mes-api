@@ -14,6 +14,7 @@ from app.core.auth import (
 from app.core.config import settings
 from app.core.exceptions import ForbiddenError
 from app.core.host_config import resolve_host_binding
+from app.core.tenant_aliases import canonical_tenant_code, canonical_workspace_code
 
 
 def test_tenant_code_from_claims_prefers_custom_attribute():
@@ -80,3 +81,21 @@ def test_resolve_builtin_ac_localhost_binding():
 
 def test_resolve_host_binding_unknown_returns_none():
     assert resolve_host_binding("unknown.example.com") is None
+
+
+def test_sam_carbons_aliases_to_gr_carbons():
+    assert canonical_tenant_code("SAM_CARBONS") == "GR_CARBONS"
+    assert canonical_workspace_code("SAM_CARBONS_ACTIVATED_CARBON") == (
+        "GR_CARBONS_ACTIVATED_CARBON"
+    )
+    assert canonical_tenant_code("GR_CARBONS") == "GR_CARBONS"
+    assert canonical_tenant_code("SAM_CARBONS_DEMO") == "SAM_CARBONS_DEMO"
+
+
+def test_assert_user_may_access_renamed_gr_carbons_tenant(monkeypatch):
+    monkeypatch.setattr(
+        "app.core.auth.settings", replace(settings, auth_enabled=True)
+    )
+    user = UserContext(sub="1", username="u", tenant_code="SAM_CARBONS")
+    assert_user_may_access_tenant(user, "GR_CARBONS")
+    assert_user_may_access_tenant(user, "SAM_CARBONS")
