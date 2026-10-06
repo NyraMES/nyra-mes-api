@@ -14,6 +14,7 @@ from app.core.tenant_context import TenantContext
 from app.models.mes_core.execution import OperationExecution
 from app.models.mes_core.master import Product, Routing, RoutingOperation
 from app.schemas.mes_core.schemas import (
+    AcRawMaterialProcessParameter,
     AcRawMaterialTypeCreate,
     AcRawMaterialTypeOperation,
     AcRawMaterialTypeOut,
@@ -92,6 +93,18 @@ def _operations_from_routing(
         .all()
     )
     return [_operation_dict(row) for row in rows]
+
+
+def _operation_codes(operations) -> set[str]:
+    codes: set[str] = set()
+    for op in operations or []:
+        if isinstance(op, dict):
+            code = (op.get("operation_code") or "").strip().upper()
+        else:
+            code = (getattr(op, "operation_code", None) or "").strip().upper()
+        if code:
+            codes.add(code)
+    return codes
 
 
 def _apply_process_metadata(meta: dict, process_step: str, is_mandatory: bool = True) -> dict:
@@ -368,12 +381,21 @@ def _legacy_type_out(
     )
 
 
+def _is_gr_coconut_shell(typed: AcRawMaterialTypeOut) -> bool:
+    code = (typed.product_code or "").upper()
+    name = (typed.product_name or "").lower()
+    if code == "RAW-COCO-SHELL":
+        return True
+    return "coconut" in name and ("(gr)" in name or name.endswith(" gr") or " gr " in name)
+
+
 def list_raw_material_types(
     db: Session,
     tenant: TenantContext,
     *,
     active_only: bool = False,
     include_usage: bool = True,
+    restrict_plant_material: bool = True,
 ) -> List[AcRawMaterialTypeOut]:
     rows = _repo(db, tenant).query(Product).order_by(Product.product_code).all()
     out: list[AcRawMaterialTypeOut] = []
@@ -391,6 +413,15 @@ def list_raw_material_types(
             if active_only and legacy.is_obsolete:
                 continue
             out.append(legacy)
+    tenant_code = (getattr(tenant, "tenant_code", None) or "").upper()
+    if restrict_plant_material and tenant_code in {
+        "GR_CARBONS",
+        "SAM_CARBONS",
+        "SAM_CARBONS_DEMO",
+    }:
+        coco = [row for row in out if _is_gr_coconut_shell(row)]
+        if coco:
+            return coco
     return out
 
 
@@ -580,13 +611,21 @@ def update_raw_material_type(
         meta["finished_product_name"] = finished.product_name
 
     if payload.operations is not None:
-        if routing_locked:
-            raise ValidationError(
-                "This raw material has batches that entered activation/pyrolysis or "
-                "been dispatched. Shop-floor process steps cannot be changed — mark "
-                "the material obsolete and create a new raw material type."
-            )
         routing_id = _uuid_or_none(meta.get("routing_id"))
+        current_ops = (
+            _operations_from_routing(db, tenant, routing_id)
+            if routing_id
+            else (meta.get("operations") or [])
+        )
+        if usage.get("dispatch_completed"):
+            raise ValidationError(
+                "This raw material has been dispatched. Shop-floor process steps cannot be changed."
+            )
+        if routing_locked and _operation_codes(current_ops) != _operation_codes(payload.operations):
+            raise ValidationError(
+                "Kiln production has started — you can reorder existing process steps, "
+                "but cannot add or remove them."
+            )
         if not routing_id:
             routing_id, routing_code, finished = _bootstrap_routing_for_legacy_type(
                 db,
@@ -611,11 +650,7 @@ def update_raw_material_type(
             )
         meta["inbound_operations"] = [op.model_dump() for op in payload.inbound_operations]
 
-    if payload.process_parameters is not None:
-        if routing_locked:
-            raise ValidationError(
-                "Process parameters cannot be changed after activation has started or dispatch."
-            )
+    if payload.process_parameters is not None and not routing_locked:
         meta["process_parameters"] = [p.model_dump() for p in payload.process_parameters]
 
     if meta.get("ac_raw_material_type") or (raw.product_type or "").upper() in (
@@ -632,4 +667,41 @@ def update_raw_material_type(
     typed = _type_from_product(db, tenant, raw)
     if typed is None:
         raise ValidationError("Failed to update raw material type")
+    return typed
+
+
+def ensure_missing_process_parameters(
+    db: Session,
+    tenant: TenantContext,
+    product_id: UUID,
+    extras: list[AcRawMaterialProcessParameter],
+) -> AcRawMaterialTypeOut:
+    """Append missing attribute keys only — does not change operations or existing fields."""
+    repo = _repo(db, tenant)
+    raw = repo.get_by_pk(Product, Product.product_id, product_id)
+    meta = _product_meta(raw)
+    current = list(meta.get("process_parameters") or [])
+    have = {
+        str(row.get("key") or row.get("parameter_code") or "").strip().lower()
+        for row in current
+        if isinstance(row, dict)
+    }
+    added = 0
+    for extra in extras:
+        payload = extra.model_dump() if hasattr(extra, "model_dump") else dict(extra)
+        key = str(payload.get("key") or payload.get("parameter_code") or "").strip().lower()
+        if not key or key in have:
+            continue
+        current.append(payload)
+        have.add(key)
+        added += 1
+    if added:
+        meta["process_parameters"] = current
+        meta["ac_raw_material_type"] = True
+        _set_product_metadata(raw, meta)
+        repo.db.commit()
+        repo.db.refresh(raw)
+    typed = _type_from_product(db, tenant, raw)
+    if typed is None:
+        raise ValidationError("Failed to add process parameters")
     return typed

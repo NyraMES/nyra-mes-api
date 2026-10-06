@@ -9,6 +9,8 @@ from app.core.auth import (
     get_current_user,
     require_roles,
     require_router_access,
+    require_nyra_services,
+    require_plant_admin,
     require_super_admin,
     require_tenant_admin,
 )
@@ -27,6 +29,8 @@ __all__ = [
     "require_capability",
     "require_roles",
     "require_router_access",
+    "require_nyra_services",
+    "require_plant_admin",
     "require_super_admin",
     "require_tenant_admin",
 ]

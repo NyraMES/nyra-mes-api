@@ -24,21 +24,13 @@ KILN_PARAMETER_DEFINITIONS: list[AcKilnParameterDefinition] = [
 AC_PROCESS_FLOW: list[tuple[int, str, str, str | None]] = [
     (1, "Raw Material Inward", "raw-material-inward", "AC_RAW_MATERIAL_INWARD"),
     (2, "Raw Material QC", "raw-material-qc", "AC_RAW_MATERIAL_QC"),
-    (3, "Feasibility Gate", "feasibility", None),
-    (4, "Kiln Feed", "kiln-feed", "AC_KILN_FEED"),
-    (5, "Lot Routing", "routing", None),
-    (6, "Execution", "execution", None),
-    (7, "Kiln Parameters", "kiln-parameters", "AC_HOURLY_KILN_PARAMETERS"),
-    (8, "Screening", "screening", "AC_SCREENING"),
-    (9, "Quality Testing", "quality-testing", "AC_QUALITY_TESTING"),
-    (10, "Yield Analysis", "yield-analysis", "AC_YIELD_ANALYSIS"),
-    (11, "Dispatch", "dispatch", None),
+    (3, "Execution", "execution", None),
+    (4, "Dispatch", "dispatch", None),
 ]
 
 # Count keys for steps without an industry capability code.
 AC_PROCESS_COUNT_KEYS: dict[str, str] = {
     "routing": "ROUTING",
-    "feasibility": "FEASIBILITY",
     "execution": "EXECUTION",
     "dispatch": "DISPATCH",
 }

@@ -129,7 +129,7 @@ def build_gr_process() -> tuple[list[AcRawMaterialTypeOperation], list[AcRawMate
         _op(1, "IN-LAB", "Lab — moisture, dust, AD (approve/deny)", "SCREENING"),
         _op(2, "IN-RMS-BAG", "RMS inward — bag & weight", "PACKING"),
         _op(3, "IN-CRUSHER", "Crusher performance — rotary & mesh sizes", "CRUSHING"),
-        _op(4, "IN-RM-OUT", "RM outward — grade splits & bag weight", "SCREENING"),
+        _op(4, "IN-RM-OUT", "RMS Outward — crusher output bags", "SCREENING"),
     ]
 
     inward_subject = "urn:nyra:ac:inward:{order_code}"
@@ -411,8 +411,8 @@ def build_gr_process() -> tuple[list[AcRawMaterialTypeOperation], list[AcRawMate
 
     """After release: Page 4 pre-kiln → Page 2 activation → Page 3 destoning & post-activation."""
     shop = [
-        _op(1, "OP-CRUSH-LOAD", "P4-2 Crushing — input bag → crusher output grade", "GRINDING"),
-        _op(2, "OP-DEDUST", "P4-3 De-dusting — screening bin → de-duster, grade & wt", "DRYING"),
+        _op(1, "OP-DEDUST", "P4-3 De-dusting — screening bin → de-duster, grade & wt", "DRYING"),
+        _op(2, "OP-CRUSH-LOAD", "P4-2 Crushing — input bag → crusher output grade", "GRINDING"),
         _op(3, "OP-DEMAG", "P4-4 De-magnetisation — bag load → grade out", "GRINDING"),
         _op(4, "OP-BLEND", "P4-5 Blending — bag load → output grade", "GRADE_SEPARATION"),
         _op(5, "OP-KILN-FEED-QC", "P2-1 Kiln feed bag quality (+2…-14, moisture, dust, volatile)", "KILN_FEED"),
@@ -499,6 +499,8 @@ def build_gr_process() -> tuple[list[AcRawMaterialTypeOperation], list[AcRawMate
             operation_code="OP-BLEND",
             string_field=True,
         ),
+        _param("feed_qc_date", "Date", process_step="KILN_FEED", subject=lot, operation_code="OP-KILN-FEED-QC", string_field=True),
+        _param("feed_qc_grade", "Grade", process_step="KILN_FEED", subject=lot, operation_code="OP-KILN-FEED-QC", string_field=True),
         *_mesh_kg_params(
             "kfqc",
             ["+2", "2/3", "3/6", "6/8", "8/10", "10/12", "12/14", "-14"],
@@ -506,9 +508,9 @@ def build_gr_process() -> tuple[list[AcRawMaterialTypeOperation], list[AcRawMate
             subject=lot,
             operation_code="OP-KILN-FEED-QC",
         ),
-        _param("feed_moisture_pct", "Feed moisture", unit="%", process_step="KILN_FEED", subject=lot, operation_code="OP-KILN-FEED-QC"),
-        _param("feed_dust_pct", "Feed dust", unit="%", process_step="KILN_FEED", subject=lot, operation_code="OP-KILN-FEED-QC"),
-        _param("feed_volatile_pct", "Feed volatile", unit="%", process_step="KILN_FEED", subject=lot, operation_code="OP-KILN-FEED-QC"),
+        _param("feed_moisture_pct", "Moisture", unit="%", process_step="KILN_FEED", subject=lot, operation_code="OP-KILN-FEED-QC"),
+        _param("feed_dust_pct", "Dust", unit="%", process_step="KILN_FEED", subject=lot, operation_code="OP-KILN-FEED-QC"),
+        _param("feed_volatile_pct", "Volatile", unit="%", process_step="KILN_FEED", subject=lot, operation_code="OP-KILN-FEED-QC"),
         _param("kfqc_remarks", "Kiln feed QC remarks", process_step="KILN_FEED", subject=lot, operation_code="OP-KILN-FEED-QC", string_field=True),
         _param("charge_kg", "Kiln charge weight", unit="KG", process_step="KILN_FEED", mandatory=True, subject=lot, operation_code="OP-KILN-FEED"),
         _param("kiln_feed_bag_ref", "Kiln feed bag load", process_step="KILN_FEED", subject=lot, operation_code="OP-KILN-FEED", string_field=True),

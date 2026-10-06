@@ -770,6 +770,10 @@ def _production_lot_out(
     )
     lot_meta = row.metadata_ if isinstance(row.metadata_, dict) else {}
     outward_bags = lot_meta.get("crusher_outward_bags") if isinstance(lot_meta.get("crusher_outward_bags"), list) else []
+    feed_events = lot_meta.get("kiln_feed_events") if isinstance(lot_meta.get("kiln_feed_events"), list) else []
+    loaded_raw = lot_meta.get("kiln_loaded_kg")
+    if loaded_raw is None and feed_events:
+        loaded_raw = sum(Decimal(str(ev.get("kg") or 0)) for ev in feed_events if isinstance(ev, dict))
     return ProductionLotOut(
         production_lot_id=row.production_lot_id,
         tenant_id=row.tenant_id,
@@ -779,9 +783,14 @@ def _production_lot_out(
         lot_quantity=row.lot_quantity,
         status=row.status,
         created_at=row.created_at,
+        metadata=lot_meta or None,
+        kiln_resource_code=lot_meta.get("kiln_resource_code"),
+        charged_at=lot_meta.get("charged_at"),
         crusher_grade=lot_meta.get("crusher_grade"),
         crusher_bag_code=lot_meta.get("crusher_bag_code"),
         crusher_outward_bags=outward_bags,
+        kiln_feed_events=feed_events,
+        kiln_loaded_kg=Decimal(str(loaded_raw)) if loaded_raw is not None else None,
     )
 
 

@@ -22,10 +22,13 @@ from app.schemas.mes_core.schemas import (
     AcInwardBagCreate,
     AcInwardBagOut,
     AcInwardBagReconcileCreate,
+    AcKilnFeedBagQcCreate,
+    AcKilnFeedBagQcOut,
     AcInwardGradeSeparationCreate,
     AcWeightToCrusherCreate,
     TripleCreate,
 )
+from app.services.industry.activated_carbon.codes import next_process_bag_code
 from app.services.industry.activated_carbon import inbound_admin as ac_inbound_admin
 from app.services.mes_core import entities as mes_core_entities
 from app.services.mes_core.base import TenantRepository
@@ -225,6 +228,19 @@ def _rms_bags(meta: dict) -> list[dict]:
 
 def _outward_bags(meta: dict) -> list[dict]:
     return [row for row in _bags(meta) if row.get("grade")]
+
+
+def _is_kiln_feed_grade(grade: str) -> bool:
+    raw = str(grade or "").strip()
+    return bool(raw) and not ac_inbound_admin.is_outward_byproduct(raw)
+
+
+def _is_kiln_feed_bag(bag: dict) -> bool:
+    return _is_kiln_feed_grade(bag.get("grade") or bag.get("grade_label") or "")
+
+
+def _kiln_feed_outward_bags(meta: dict) -> list[dict]:
+    return [row for row in _outward_bags(meta) if _is_kiln_feed_bag(row)]
 
 
 def _bag_reconciliation(meta: dict) -> dict:
@@ -474,17 +490,8 @@ def create_initial_qc(
     return AcInitialQcOut.model_validate(row.model_dump())
 
 
-def _next_bag_code(bags: list[dict]) -> str:
-    nums = []
-    for row in bags:
-        match = str(row.get("bag_code") or "")
-        if match.startswith("BAG-AC-"):
-            try:
-                nums.append(int(match.split("-")[-1]))
-            except ValueError:
-                pass
-    next_num = (max(nums) if nums else 1000) + 1
-    return f"BAG-AC-{next_num}"
+def _next_bag_code(db, *, outward: bool) -> str:
+    return next_process_bag_code(db, "RO" if outward else "RI")
 
 
 def _stage_inward_bag_triples(
@@ -547,7 +554,23 @@ def _lab_execution_decision(meta: dict) -> str:
     return str(lab.get("qc_decision") or lab.get("qc_status") or "").strip().upper()
 
 
+def lab_denied(meta: dict) -> bool:
+    if meta.get("inbound_lab_denied"):
+        return True
+    initial = _initial_qc(meta)
+    status = (initial.get("qc_status") or "").upper()
+    decision = _lab_execution_decision(meta)
+    return status in ("FAIL", "QC_FAILED", "REJECTED", "DENIED") or decision in (
+        "DENY",
+        "FAIL",
+        "REJECTED",
+        "DENIED",
+    )
+
+
 def lab_approved(meta: dict) -> bool:
+    if lab_denied(meta):
+        return False
     initial = _initial_qc(meta)
     status = (initial.get("qc_status") or "").upper()
     if status in ("PASS", "QC_PASSED", "APPROVED"):
@@ -562,7 +585,7 @@ def _assert_initial_qc_ready(meta: dict, order_code: str) -> None:
     decision = _lab_execution_decision(meta)
     if status in ("FAIL", "QC_FAILED", "REJECTED") or decision in ("DENY", "FAIL", "REJECTED"):
         raise ValidationError(
-            f"Order '{order_code}' was not approved — cannot split into bags."
+            f"Order '{order_code}' was denied in Lab — this inward will not proceed."
         )
     if status in ("HOLD",) or decision == "HOLD":
         raise ValidationError(
@@ -670,6 +693,7 @@ def list_inward_bags(
         if customer_order_id and order.customer_order_id != customer_order_id:
             continue
         for bag in _bags(meta):
+            qc = bag.get("kiln_feed_qc") if isinstance(bag.get("kiln_feed_qc"), dict) else None
             rows.append(
                 AcInwardBagOut(
                     bag_id=UUID(str(bag["bag_id"])),
@@ -677,11 +701,14 @@ def list_inward_bags(
                     customer_order_id=order.customer_order_id,
                     order_code=order.order_code,
                     grade=bag.get("grade"),
+                    rotary=bag.get("rotary"),
                     weight_kg=Decimal(str(bag.get("weight_kg") or 0)),
                     label=bag.get("label"),
                     status=bag.get("status") or "REGISTERED",
                     created_at=bag.get("created_at"),
                     fed_at=bag.get("fed_at"),
+                    created_by=bag.get("created_by") or (qc or {}).get("user_id"),
+                    kiln_feed_qc=qc,
                 )
             )
     return rows
@@ -694,15 +721,14 @@ def create_inward_bag(
     repo = _repo(db, tenant)
     meta = _meta(order)
     _assert_initial_qc_ready(meta, order.order_code)
-    allowed_grades = ac_inbound_admin.outward_split_labels(db, tenant)
     grade = (payload.grade or "").strip() or None
     if _bag_reconciliation(meta).get("status") == "RECONCILED" and not grade:
         raise ValidationError(
             f"Order '{order.order_code}' RMS bags are reconciled — add RM outward bags with a split grade."
         )
-    if grade and grade not in allowed_grades and grade not in BAG_GRADES:
+    if grade and not ac_inbound_admin.is_allowed_outward_grade(db, tenant, grade) and grade not in BAG_GRADES:
         raise ValidationError(
-            f"Invalid bag grade — choose one of: {', '.join(allowed_grades)}"
+            f"Invalid bag grade — choose one of: {', '.join(ac_inbound_admin.outward_grade_labels(db, tenant))}"
         )
     bags = _bags(meta)
     weight_kg = Decimal(str(payload.weight_kg))
@@ -715,13 +741,22 @@ def create_inward_bag(
             raise ValidationError(
                 f"Bag quantity exceeds inward weight — only {remaining} KG remaining of {received_kg} KG."
             )
-    bag_code = _next_bag_code(bags)
+    else:
+        outward_total = sum(
+            Decimal(str(row.get("weight_kg") or 0)) for row in _outward_bags(meta)
+        )
+        ac_inbound_admin.validate_outward_kg_within_inward(
+            outward_total + weight_kg, received_kg
+        )
+    bag_code = _next_bag_code(repo.db, outward=bool(grade))
+    rotary = str(getattr(payload, "rotary", None) or "").strip() or None
     bag_row = {
         "bag_id": str(uuid4()),
         "bag_code": bag_code,
         "grade": grade,
+        "rotary": rotary,
         "weight_kg": str(payload.weight_kg),
-        "label": payload.label,
+        "label": payload.label or (f"{grade} · {rotary}" if grade and rotary else grade),
         "status": "REGISTERED",
         "created_at": _utcnow_iso(),
     }
@@ -739,8 +774,9 @@ def create_inward_bag(
         customer_order_id=order.customer_order_id,
         order_code=order.order_code,
         grade=grade,
+        rotary=rotary,
         weight_kg=payload.weight_kg,
-        label=payload.label,
+        label=bag_row.get("label"),
         status="REGISTERED",
         created_at=bag_row["created_at"],
     )
@@ -800,6 +836,7 @@ def feed_inward_bag_to_crusher(
         customer_order_id=order.customer_order_id,
         order_code=order.order_code,
         grade=found.get("grade"),
+        rotary=found.get("rotary"),
         weight_kg=Decimal(str(found.get("weight_kg") or 0)),
         label=found.get("label"),
         status=found.get("status") or "FED_TO_CRUSHER",
@@ -1119,3 +1156,100 @@ def create_inward_grade_separation(
     row = build_workflow_out(db, tenant, order)
     assert row is not None
     return row
+
+
+def _kiln_feed_qc_param_defs(db: Session, tenant: TenantContext) -> list[dict]:
+    repo = _repo(db, tenant)
+    try:
+        raw = repo.get_by_code(Product, Product.product_code, "RAW-COCO-SHELL")
+    except Exception:
+        return []
+    meta = raw.metadata_ if isinstance(getattr(raw, "metadata_", None), dict) else {}
+    return [row for row in (meta.get("process_parameters") or []) if isinstance(row, dict)]
+
+
+def _find_outward_bag(
+    db: Session,
+    tenant: TenantContext,
+    bag_code: str,
+    customer_order_id: Optional[UUID] = None,
+) -> tuple[CustomerOrder, dict, dict]:
+    repo = _repo(db, tenant)
+    code = (bag_code or "").strip()
+    if not code:
+        raise ValidationError("Bag number is required.")
+    orders = repo.query(CustomerOrder).order_by(CustomerOrder.created_at.desc()).all()
+    for order in orders:
+        meta = _meta(order)
+        if meta.get("flow") != "RAW_MATERIAL_INWARD":
+            continue
+        if customer_order_id and order.customer_order_id != customer_order_id:
+            continue
+        for bag in _outward_bags(meta):
+            if str(bag.get("bag_code") or "") == code:
+                return order, meta, bag
+    raise ValidationError(f"RM outward bag '{code}' was not found.")
+
+
+def save_kiln_feed_bag_qc(
+    db: Session, tenant: TenantContext, payload: AcKilnFeedBagQcCreate
+) -> AcKilnFeedBagQcOut:
+    from app.services.industry.activated_carbon import triplet_capture as ac_triples
+
+    repo = _repo(db, tenant)
+    order, meta, bag = _find_outward_bag(
+        db, tenant, payload.bag_code, payload.customer_order_id
+    )
+    existing = bag.get("kiln_feed_qc") if isinstance(bag.get("kiln_feed_qc"), dict) else None
+    if existing and existing.get("saved_at"):
+        raise ValidationError(
+            f"Kiln feed quality for bag '{payload.bag_code}' is already saved and cannot be changed."
+        )
+    values: dict[str, Any] = {}
+    for key, raw in (payload.values or {}).items():
+        if raw is None:
+            continue
+        text = str(raw).strip()
+        if text == "":
+            continue
+        values[str(key)] = text
+
+    now = _utcnow_iso()
+    qc = {
+        "values": values,
+        "user_id": (payload.user_id or "").strip() or None,
+        "saved_at": now,
+        "lot_code": (payload.lot_code or "").strip() or None,
+    }
+    bags = _bags(meta)
+    for row in bags:
+        if str(row.get("bag_code") or "") == str(bag.get("bag_code")):
+            row["kiln_feed_qc"] = qc
+            break
+    meta["inward_bags"] = bags
+    order.metadata_ = meta
+    flag_modified(order, "metadata_")
+    ac_triples.stage_captures_for_values(
+        db,
+        tenant,
+        subject_uri=f"urn:nyra:ac:inwardBag:{bag['bag_code']}",
+        values=values,
+        source_table="trn.customer_order",
+        source_id=order.customer_order_id,
+        param_defs=_kiln_feed_qc_param_defs(db, tenant),
+        process_step="KILN_FEED",
+        used_at="execution",
+        operation_code="OP-KILN-FEED-QC",
+    )
+    repo.db.commit()
+    return AcKilnFeedBagQcOut(
+        bag_code=str(bag.get("bag_code")),
+        customer_order_id=order.customer_order_id,
+        order_code=order.order_code,
+        weight_kg=Decimal(str(bag.get("weight_kg") or 0)),
+        grade=bag.get("grade"),
+        created_at=bag.get("created_at"),
+        user_id=qc.get("user_id"),
+        values=values,
+        saved_at=now,
+    )

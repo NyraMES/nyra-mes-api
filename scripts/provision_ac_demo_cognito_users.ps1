@@ -21,9 +21,13 @@ $Provisioner = Join-Path $Root "scripts\provision_cognito_user.ps1"
 
 $Groups = @(
     "MES_Admin",
+    "MES_Manager",
     "MES_Planner",
     "MES_Operator",
     "MES_Quality",
+    "MES_RMS",
+    "MES_Activation",
+    "MES_PostActivation",
     "MES_Viewer",
     "MES_Demo"
 )

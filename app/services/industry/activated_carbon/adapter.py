@@ -5,8 +5,8 @@ from __future__ import annotations
 import re
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
-from uuid import UUID
-from typing import List, Optional
+from uuid import UUID, uuid4
+from typing import Any, List, Optional
 
 from sqlalchemy.orm import Session
 from sqlalchemy.orm.attributes import flag_modified
@@ -36,19 +36,35 @@ from app.schemas.mes_core.schemas import (
     AcLotLineOut,
     AcOpenLotOut,
     AcKilnFeedLotCreate,
+    AcKilnOutputBagCreate,
+    AcKilnOutputBagOut,
+    AcKilnOutputBagQcCreate,
+    AcKilnOutputBagQcOut,
+    AcDestoningBagOut,
+    AcDestoningLoadEventOut,
+    AcDestoningKilnGroupOut,
+    AcDestoningStateOut,
+    AcDestoningLoadCreate,
+    AcDestoningOutputCreate,
+    AcDestoningBagQcCreate,
+    AcDestoningBagQcOut,
+    AcKilnOutputListOut,
     AcKilnCreate,
     AcKilnOut,
     AcPlantResourceOut,
     AcKilnParametersCreate,
+    AcKilnParameterReadingOut,
     AcKilnStatusOut,
     AcMastersOut,
     AcProcessStepOut,
     AcQualityTestCreate,
     AcCustomerSalesOrderCreate,
     AcCustomerSalesOrderCreateResponse,
+    AcDeliveryCommitmentOut,
     AcDispatchFromOrderCreate,
     AcDispatchFromOrderResponse,
     AcGradeStockOut,
+    AcInStockBagOut,
     AcOpenCustomerOrderOut,
     AcRecentDispatchOut,
     AcStockedLotOut,
@@ -92,9 +108,14 @@ from app.schemas.mes_core.schemas import (
 )
 from app.services.industry.activated_carbon.codes import (
     AC_ID_PAD_WIDTH,
+    kiln_output_id_prefix,
+    next_destoning_bag_code,
+    next_kiln_output_bag_code,
     resolve_ac_business_code,
     sync_ac_sequences,
 )
+from app.services.industry.activated_carbon import post_activation as ac_post_activation
+from app.services.industry.activated_carbon import station_machines as ac_station_machines
 from app.services.industry.activated_carbon.constants import (
     AC_PROCESS_COUNT_KEYS,
     AC_PROCESS_FLOW,
@@ -106,6 +127,7 @@ from app.services.industry.activated_carbon.kiln_parameters_catalog import (
 )
 from app.services.industry.activated_carbon import raw_material_types as ac_raw_material_types
 from app.services.industry.activated_carbon import inbound_execution as ac_inbound_execution
+from app.services.industry.activated_carbon import inbound_workflow as ac_inbound_workflow
 from app.services.industry.activated_carbon import lot_routing as ac_lot_routing
 from app.services.industry.activated_carbon import stock as ac_stock
 from app.services.industry.activated_carbon.resource_pool import (
@@ -115,7 +137,6 @@ from app.services.industry.activated_carbon.resource_pool import (
 )
 from app.schemas.traceability import TraceabilityResponse
 from app.services.mes_core import entities as mes_core_entities
-from app.services.mes_core.feasibility import is_ready_for_scheduling
 from app.services.mes_core import dispatch_workflow as mes_core_dispatch
 from app.services.mes_core import traceability_workflow as mes_core_traceability
 from app.services.mes_core.base import TenantRepository
@@ -147,6 +168,15 @@ def _headcount_from_metadata(meta: object) -> Optional[int]:
 
 
 def _resource_out(row: Resource) -> ResourceOut:
+    from app.services.industry.activated_carbon.station_machines import station_of
+
+    meta = row.metadata_ if isinstance(row.metadata_, dict) else {}
+    unit_count = None
+    if meta.get("unit_count") not in (None, ""):
+        try:
+            unit_count = int(meta.get("unit_count"))
+        except (TypeError, ValueError):
+            unit_count = None
     return ResourceOut(
         resource_id=row.resource_id,
         tenant_id=row.tenant_id,
@@ -154,6 +184,8 @@ def _resource_out(row: Resource) -> ResourceOut:
         resource_name=row.resource_name,
         resource_type=row.resource_type,
         status=row.status,
+        station=station_of(row),
+        unit_count=unit_count,
         headcount=_headcount_from_metadata(row.metadata_),
         created_at=row.created_at,
     )
@@ -215,7 +247,13 @@ def _list_tenant_kiln_resources(db: Session, tenant: TenantContext) -> list[Reso
         .all()
     )
     if kiln_rows:
-        return kiln_rows
+        return sorted(
+            kiln_rows,
+            key=lambda row: (
+                kiln_output_id_prefix(row.resource_name or "", row.resource_code or ""),
+                row.resource_code or "",
+            ),
+        )
     repo = _repo(db, tenant)
     return (
         repo.query(Resource)
@@ -511,19 +549,91 @@ def list_kiln_production_orders(
     return _production_orders_with_routing(db, tenant)
 
 
+def _lot_finished_product_map(db: Session, tenant: TenantContext) -> dict[str, UUID]:
+    repo = _repo(db, tenant)
+    mapping: dict[str, UUID] = {}
+    for lot in repo.query(ProductionLot).all():
+        if not lot.lot_code:
+            continue
+        try:
+            product_id = ac_stock._lot_finished_product_id(db, tenant, lot)
+        except Exception:
+            product_id = None
+        if product_id:
+            mapping[str(lot.lot_code)] = product_id
+    return mapping
+
+
+def _in_stock_bags_for_product(
+    db: Session, tenant: TenantContext, product_id: Optional[UUID]
+) -> list[dict]:
+    bags = ac_post_activation.list_available_in_stock_bags(db, tenant)
+    if product_id is None:
+        return bags
+    mapping = _lot_finished_product_map(db, tenant)
+    matched: list[dict] = []
+    unmatched: list[dict] = []
+    for bag in bags:
+        lot_code = str(bag.get("lot_code") or "")
+        mapped = mapping.get(lot_code) if lot_code else None
+        if mapped == product_id:
+            matched.append(bag)
+        elif mapped is None:
+            unmatched.append(bag)
+    return matched + unmatched
+
+
+def _in_stock_kg_for_product(
+    db: Session, tenant: TenantContext, product_id: Optional[UUID]
+) -> Decimal:
+    return sum(
+        (
+            Decimal(str(bag.get("remaining_kg") or 0))
+            for bag in _in_stock_bags_for_product(db, tenant, product_id)
+        ),
+        Decimal("0"),
+    )
+
+
+def _available_stock_kg(
+    db: Session, tenant: TenantContext, product_id: UUID
+) -> Decimal:
+    return _in_stock_kg_for_product(db, tenant, product_id) + ac_stock.get_fg_stock_kg(
+        db, tenant, product_id
+    )
+
+
 def list_finished_goods_stock(
     db: Session, tenant: TenantContext
 ) -> List[AcFinishedGoodsStockOut]:
     repo = _repo(db, tenant)
     routable = _routable_product_ids(repo)
     rows = repo.query(Product).order_by(Product.product_code).all()
+    mapping = _lot_finished_product_map(db, tenant)
+    bags = ac_post_activation.list_available_in_stock_bags(db, tenant)
+    in_stock_by_product: dict[UUID, Decimal] = {}
+    unmatched = Decimal("0")
+    for bag in bags:
+        qty = Decimal(str(bag.get("remaining_kg") or 0))
+        lot_code = str(bag.get("lot_code") or "")
+        mapped = mapping.get(lot_code) if lot_code else None
+        if mapped:
+            in_stock_by_product[mapped] = in_stock_by_product.get(mapped, Decimal("0")) + qty
+        else:
+            unmatched += qty
     out: list[AcFinishedGoodsStockOut] = []
+    unmatched_added = False
     for row in rows:
         if row.product_id not in routable:
             code = (row.product_code or "").upper()
-            if code != FINISHED_PRODUCT_CODE:
+            if code != FINISHED_PRODUCT_CODE and row.product_id not in in_stock_by_product:
                 continue
-        qty = ac_stock.get_fg_stock_kg(db, tenant, row.product_id)
+        qty = in_stock_by_product.get(row.product_id, Decimal("0")) + ac_stock.get_fg_stock_kg(
+            db, tenant, row.product_id
+        )
+        if not unmatched_added and unmatched > 0:
+            qty += unmatched
+            unmatched_added = True
         if qty <= 0:
             continue
         out.append(
@@ -535,6 +645,20 @@ def list_finished_goods_stock(
                 uom=row.uom or "KG",
             )
         )
+    if unmatched > 0 and not unmatched_added:
+        fallback = next((row for row in rows if row.product_id in routable), None)
+        if fallback is None and rows:
+            fallback = rows[0]
+        if fallback is not None:
+            out.append(
+                AcFinishedGoodsStockOut(
+                    product_id=fallback.product_id,
+                    product_code=fallback.product_code,
+                    product_name=fallback.product_name,
+                    quantity_kg=unmatched,
+                    uom=fallback.uom or "KG",
+                )
+            )
     return out
 
 
@@ -547,7 +671,7 @@ def evaluate_delivery_commitment(
 ) -> AcDeliveryCommitmentOut:
     repo = _repo(db, tenant)
     product = repo.get_by_pk(Product, Product.product_id, finished_product_id)
-    stock = ac_stock.get_fg_stock_kg(db, tenant, finished_product_id)
+    stock = _available_stock_kg(db, tenant, finished_product_id)
     qty = Decimal(str(quantity))
     shortfall = max(qty - stock, Decimal("0"))
     raw_avail = ac_stock.available_raw_material_kg(db, tenant)
@@ -565,7 +689,7 @@ def evaluate_delivery_commitment(
             tentative_delivery_date=today,
             manufacturing_lead_days=0,
             message=(
-                f"{stock} KG in finished-goods stock — quantity can be dispatched without "
+                f"{stock} KG available in stock — quantity can be dispatched without "
                 "new production."
             ),
         )
@@ -576,13 +700,13 @@ def evaluate_delivery_commitment(
     tentative = today + timedelta(days=lead_days)
     if raw_avail < shortfall:
         message = (
-            f"Stock covers {stock} KG; need {shortfall} KG more. Raw material on hand "
+            f"In stock covers {stock} KG; need {shortfall} KG more. Raw material on hand "
             f"({raw_avail} KG) is insufficient — procure feedstock before promising "
             f"{tentative.isoformat()}."
         )
     else:
         message = (
-            f"Stock covers {stock} KG; manufacturing ~{lead_days} shop days for "
+            f"In stock covers {stock} KG; manufacturing ~{lead_days} shop days for "
             f"{shortfall} KG from available raw material — tentative delivery "
             f"{tentative.isoformat()}."
         )
@@ -606,7 +730,10 @@ def create_customer_sales_order(
 ) -> AcCustomerSalesOrderCreateResponse:
     sync_ac_sequences(db, tenant.tenant_id)
     order_code = resolve_ac_business_code(
-        db, provided=payload.order_code, entity="ac_customer_order"
+        db,
+        provided=payload.order_code,
+        entity="ac_customer_po",
+        tenant_id=tenant.tenant_id,
     )
     line_code = resolve_ac_business_code(
         db, provided=None, entity="ac_customer_order_line"
@@ -767,6 +894,40 @@ def list_grade_wise_stock(
     products = {p.product_id: p for p in repo.query(Product).all()}
     buckets: dict[str, AcGradeStockOut] = {}
     lot_counts: dict[str, int] = {}
+    mapping = _lot_finished_product_map(db, tenant)
+
+    for bag in ac_post_activation.list_available_in_stock_bags(db, tenant):
+        qty = Decimal(str(bag.get("remaining_kg") or 0))
+        if qty <= 0:
+            continue
+        grade_label = str(bag.get("grade") or "In Stock").strip() or "In Stock"
+        grade_code = re.sub(r"[^a-z0-9]+", "-", grade_label.lower()).strip("-") or "in-stock"
+        key = grade_code.upper()
+        lot_code = str(bag.get("lot_code") or "")
+        product_id = mapping.get(lot_code) if lot_code else None
+        product = products.get(product_id) if product_id else None
+        lot_counts[key] = lot_counts.get(key, 0) + 1
+        existing = buckets.get(key)
+        if existing:
+            buckets[key] = existing.model_copy(
+                update={
+                    "quantity_kg": existing.quantity_kg + qty,
+                    "stocked_lot_count": lot_counts[key],
+                    "product_id": existing.product_id or product_id,
+                    "product_code": existing.product_code or (product.product_code if product else None),
+                }
+            )
+        else:
+            buckets[key] = AcGradeStockOut(
+                grade_code=grade_code,
+                grade_label=grade_label,
+                product_id=product_id,
+                product_code=product.product_code if product else None,
+                quantity_kg=qty,
+                uom="KG",
+                source="in_stock",
+                stocked_lot_count=1,
+            )
 
     for row in list_stocked_lots_for_dispatch(db, tenant):
         key = (row.grade_code or row.product_code or "fg").upper()
@@ -820,9 +981,56 @@ def list_grade_wise_stock(
     return sorted(buckets.values(), key=lambda row: row.grade_code)
 
 
+def _ensure_customer_sales_po_codes(db: Session, tenant: TenantContext) -> None:
+    """Rewrite leftover CUSTOMER_SALES ORD-AC-* codes to CUST_PO_."""
+    repo = _repo(db, tenant)
+    changed = False
+    for order in repo.query(CustomerOrder).all():
+        meta = order.metadata_ if isinstance(order.metadata_, dict) else {}
+        if meta.get("flow") != "CUSTOMER_SALES":
+            continue
+        code = str(order.order_code or "")
+        if not code.upper().startswith("ORD-AC-"):
+            continue
+        order.order_code = resolve_ac_business_code(
+            db, provided=None, entity="ac_customer_po", tenant_id=tenant.tenant_id
+        )
+        changed = True
+    if changed:
+        repo.db.commit()
+
+
+def list_in_stock_bags_for_dispatch(
+    db: Session, tenant: TenantContext
+) -> list[AcInStockBagOut]:
+    repo = _repo(db, tenant)
+    products = {p.product_id: p for p in repo.query(Product).all()}
+    mapping = _lot_finished_product_map(db, tenant)
+    rows: list[AcInStockBagOut] = []
+    for bag in ac_post_activation.list_available_in_stock_bags(db, tenant):
+        lot_code = str(bag.get("lot_code") or "")
+        product_id = mapping.get(lot_code) if lot_code else None
+        product = products.get(product_id) if product_id else None
+        rows.append(
+            AcInStockBagOut(
+                bag_code=str(bag.get("bag_code") or ""),
+                remaining_kg=Decimal(str(bag.get("remaining_kg") or 0)),
+                quantity_kg=Decimal(str(bag.get("quantity_kg") or 0)),
+                grade=bag.get("grade"),
+                lot_code=bag.get("lot_code"),
+                product_id=product_id,
+                product_code=product.product_code if product else None,
+                source=bag.get("source"),
+                created_at=bag.get("created_at"),
+            )
+        )
+    return rows
+
+
 def list_open_customer_sales_orders(
     db: Session, tenant: TenantContext
 ) -> list[AcOpenCustomerOrderOut]:
+    _ensure_customer_sales_po_codes(db, tenant)
     repo = _repo(db, tenant)
     customers = {c.customer_id: c for c in repo.query(Customer).all()}
     products = {p.product_id: p for p in repo.query(Product).all()}
@@ -849,7 +1057,7 @@ def list_open_customer_sales_orders(
         status = (order.status or "OPEN").upper()
         if status == "CLOSED" and remaining <= 0:
             continue
-        stock = ac_stock.get_fg_stock_kg(db, tenant, line.product_id)
+        stock = _available_stock_kg(db, tenant, line.product_id)
         customer = customers.get(order.customer_id) if order.customer_id else None
         delivery_raw = meta.get("delivery_date") or meta.get("requested_delivery_date")
         delivery_date = None
@@ -938,7 +1146,7 @@ def create_ac_dispatch_from_order(
             f"Dispatch quantity {qty} KG exceeds remaining PO quantity {remaining} KG"
         )
 
-    stock = ac_stock.get_fg_stock_kg(db, tenant, line.product_id)
+    stock = _available_stock_kg(db, tenant, line.product_id)
     if qty > stock:
         commitment = evaluate_delivery_commitment(
             db, tenant, finished_product_id=line.product_id, quantity=qty
@@ -948,35 +1156,105 @@ def create_ac_dispatch_from_order(
             f"on hand {stock} KG, requested {qty} KG. {commitment.message}"
         )
 
-    lot = _stocked_lot_for_product(
-        db, tenant, line.product_id, lot_code=payload.lot_code
+    in_stock_bags = _in_stock_bags_for_product(db, tenant, line.product_id)
+    in_stock_kg = sum(
+        (Decimal(str(bag.get("remaining_kg") or 0)) for bag in in_stock_bags),
+        Decimal("0"),
     )
-    ac_stock.release_lot_schedule_resources(db, tenant, lot.production_lot_id)
-    lot_qty = Decimal(str(lot.lot_quantity or 0))
-    if qty > lot_qty:
+    from_bags = min(qty, in_stock_kg)
+    from_meta = qty - from_bags
+    eligible_codes = {
+        str(bag.get("bag_code") or "") for bag in in_stock_bags if bag.get("bag_code")
+    }
+    preferred = (payload.bag_code or "").strip()
+    consumed = []
+    if from_bags > 0:
+        remaining_bags = from_bags
+        if preferred and preferred in eligible_codes:
+            first = ac_post_activation.consume_in_stock_bags(
+                db, tenant, remaining_bags, bag_codes={preferred}
+            )
+            consumed.extend(first)
+            remaining_bags -= sum(
+                (Decimal(str(row.get("consumed_kg") or 0)) for row in first),
+                Decimal("0"),
+            )
+        if remaining_bags > 0:
+            rest_codes = eligible_codes - ({preferred} if preferred else set())
+            consumed.extend(
+                ac_post_activation.consume_in_stock_bags(
+                    db, tenant, remaining_bags, bag_codes=rest_codes or None
+                )
+            )
+    dispatch_lot_code = payload.lot_code
+    if preferred and not dispatch_lot_code:
+        preferred_bag = next(
+            (bag for bag in (consumed or in_stock_bags) if str(bag.get("bag_code") or "") == preferred),
+            None,
+        )
+        if preferred_bag and preferred_bag.get("lot_code"):
+            dispatch_lot_code = preferred_bag.get("lot_code")
+
+    lot = None
+    if dispatch_lot_code:
+        try:
+            lot = _stocked_lot_for_product(
+                db, tenant, line.product_id, lot_code=dispatch_lot_code
+            )
+        except ValidationError:
+            lot = repo.query(ProductionLot).filter(ProductionLot.lot_code == dispatch_lot_code).first()
+    if lot is None:
+        for bag in consumed or in_stock_bags:
+            lot_code = str(bag.get("lot_code") or "")
+            if not lot_code:
+                continue
+            lot = repo.query(ProductionLot).filter(ProductionLot.lot_code == lot_code).first()
+            if lot is not None:
+                break
+    if lot is None and from_meta > 0:
+        lot = _stocked_lot_for_product(db, tenant, line.product_id)
+    if lot is None:
+        for lot_row in repo.query(ProductionLot).order_by(ProductionLot.created_at.desc()).all():
+            try:
+                if ac_stock._lot_finished_product_id(db, tenant, lot_row) == line.product_id:
+                    lot = lot_row
+                    break
+            except Exception:
+                continue
+    if lot is None:
         raise ValidationError(
-            f"Lot {lot.lot_code} has only {lot_qty} KG; requested {qty} KG"
+            "No in-stock bag or stocked lot available for this product — "
+            "set destoning or post-activation destination to In Stock first."
         )
 
-    ac_stock.deduct_fg_stock_kg(db, tenant, line.product_id, qty)
+    ac_stock.release_lot_schedule_resources(db, tenant, lot.production_lot_id)
     lot_meta = lot.metadata_ if isinstance(lot.metadata_, dict) else {}
     now_iso = datetime.now(timezone.utc).isoformat()
-    if qty >= lot_qty:
-        lot.status = "DISPATCHED"
-        lot.metadata_ = {
-            **lot_meta,
-            "dispatched_at": now_iso,
-            "fg_stocked": False,
-            "fg_stock_kg_added": "0",
-            "last_dispatch_kg": str(qty),
-        }
+    if from_meta > 0:
+        ac_stock.deduct_fg_stock_kg(db, tenant, line.product_id, from_meta)
+        lot_qty = Decimal(str(lot.lot_quantity or 0))
+        if from_meta >= lot_qty and lot_meta.get("fg_stocked"):
+            lot.status = "DISPATCHED"
+            lot.metadata_ = {
+                **lot_meta,
+                "dispatched_at": now_iso,
+                "fg_stocked": False,
+                "fg_stock_kg_added": "0",
+                "last_dispatch_kg": str(qty),
+            }
+        elif lot_meta.get("fg_stocked"):
+            remaining_lot = max(lot_qty - from_meta, Decimal("0"))
+            lot.lot_quantity = remaining_lot
+            lot.metadata_ = {
+                **lot_meta,
+                "fg_stock_kg_added": str(remaining_lot),
+                "last_dispatch_kg": str(qty),
+            }
     else:
-        remaining_lot = lot_qty - qty
-        lot.lot_quantity = remaining_lot
         lot.metadata_ = {
             **lot_meta,
-            "fg_stock_kg_added": str(remaining_lot),
             "last_dispatch_kg": str(qty),
+            "last_dispatch_at": now_iso,
         }
 
     customer = (
@@ -1027,7 +1305,7 @@ def create_ac_dispatch_from_order(
     }
     repo.db.commit()
 
-    stock_after = ac_stock.get_fg_stock_kg(db, tenant, line.product_id)
+    stock_after = _available_stock_kg(db, tenant, line.product_id)
     return AcDispatchFromOrderResponse(
         dispatch_id=dispatch_code,
         order_code=order.order_code,
@@ -1117,6 +1395,7 @@ def create_make_to_stock_production_order(
                     None,
                 )
                 for item in payload.lot_splits
+                if ac_inbound_workflow._is_kiln_feed_grade(item.grade_label or "")
             ]
             if any(q <= 0 for q, _, _ in split_entries):
                 raise ValidationError("Each grade lot quantity must be greater than zero.")
@@ -1160,6 +1439,8 @@ def create_make_to_stock_production_order(
                     qty = Decimal(str(qty_raw))
                     if qty <= 0:
                         continue
+                    if not ac_inbound_workflow._is_kiln_feed_grade(grade):
+                        continue
                     auto_splits.append((qty, grade, None))
             auto_total = sum(q for q, _, _ in auto_splits)
             if auto_splits and auto_total == release_qty:
@@ -1183,17 +1464,44 @@ def create_make_to_stock_production_order(
                     status="CREATED",
                 ),
             )
+            lot_row = repo.get_by_pk(
+                ProductionLot,
+                ProductionLot.production_lot_id,
+                lot_out.production_lot_id,
+            )
+            outward_src = ac_inbound_workflow._kiln_feed_outward_bags(meta)
             if grade_label:
-                lot_row = repo.get_by_pk(
-                    ProductionLot,
-                    ProductionLot.production_lot_id,
-                    lot_out.production_lot_id,
-                )
-                lot_row.metadata_ = {
-                    **(lot_row.metadata_ if isinstance(lot_row.metadata_, dict) else {}),
-                    "crusher_grade": grade_label,
-                    "source_inward_order_id": str(source_inward_id),
+                matched = [
+                    bag
+                    for bag in outward_src
+                    if (bag.get("grade") or "").strip() == grade_label
+                ]
+            elif len(split_entries) == 1:
+                matched = list(outward_src)
+            else:
+                matched = []
+            outward_bags = [
+                {
+                    "bag_code": bag.get("bag_code"),
+                    "grade_label": grade_label or bag.get("grade"),
+                    "rotary": bag.get("rotary"),
+                    "quantity_kg": bag.get("weight_kg") or bag.get("quantity_kg"),
                 }
+                for bag in matched
+                if bag.get("bag_code")
+            ]
+            lot_row.metadata_ = {
+                **(lot_row.metadata_ if isinstance(lot_row.metadata_, dict) else {}),
+                "source_inward_order_id": str(source_inward_id),
+                **({"crusher_grade": grade_label} if grade_label else {}),
+                **({"crusher_outward_bags": outward_bags} if outward_bags else {}),
+                **(
+                    {"crusher_bag_code": outward_bags[0]["bag_code"]}
+                    if outward_bags
+                    else {}
+                ),
+            }
+            flag_modified(lot_row, "metadata_")
             created_lots.append(lot_out)
             released_lot_rows.append(
                 {
@@ -1201,6 +1509,7 @@ def create_make_to_stock_production_order(
                     "quantity_kg": str(lot_qty),
                     "production_order_code": po_row.production_order_code,
                     **({"crusher_grade": grade_label} if grade_label else {}),
+                    "outward_bag_codes": [bag["bag_code"] for bag in outward_bags],
                 }
             )
         meta["released_lots"] = released_lot_rows
@@ -1281,14 +1590,84 @@ def create_make_to_stock_production_order(
     )
 
 
+_KILN_READING_META = "kiln_parameter_readings"
+
+
+def _kiln_reading_values(payload: AcKilnParametersCreate) -> dict[str, Any]:
+    return {
+        k: v
+        for k, v in {
+            "zone1_temp_c": payload.zone1_temp_c,
+            "zone2_temp_c": payload.zone2_temp_c,
+            "steam_flow_kg_h": payload.steam_flow_kg_h,
+            "residence_time_min": payload.residence_time_min,
+            "o2_pct": payload.o2_pct,
+            "kiln_temp_c": payload.kiln_temp_c or payload.zone2_temp_c or payload.zone1_temp_c,
+            "pressure_bar": payload.pressure_bar,
+        }.items()
+        if v is not None
+    }
+
+
+def _parse_reading_at(value: Any) -> datetime:
+    if isinstance(value, datetime):
+        return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+    except ValueError:
+        return datetime.now(timezone.utc)
+
+
 def list_kiln_parameters(
     db: Session, tenant: TenantContext, lot_code: Optional[str] = None
-) -> List[OperationExecutionOut]:
-    rows = _repo(db, tenant).query(OperationExecution).order_by(OperationExecution.created_at.desc()).all()
-    if lot_code:
-        lot = _repo(db, tenant).get_by_code(ProductionLot, ProductionLot.lot_code, lot_code)
-        rows = [r for r in rows if r.production_lot_id == lot.production_lot_id]
-    return [OperationExecutionOut.model_validate(r) for r in rows]
+) -> List[AcKilnParameterReadingOut]:
+    out: list[AcKilnParameterReadingOut] = []
+    for kiln in _list_tenant_kiln_resources(db, tenant):
+        meta = kiln.metadata_ if isinstance(kiln.metadata_, dict) else {}
+        for row in meta.get(_KILN_READING_META) or []:
+            if not isinstance(row, dict):
+                continue
+            out.append(
+                AcKilnParameterReadingOut(
+                    reading_id=str(row.get("reading_id") or uuid4()),
+                    kiln_resource_code=str(row.get("kiln_resource_code") or kiln.resource_code),
+                    recorded_at=_parse_reading_at(row.get("recorded_at")),
+                    readings=row.get("readings") if isinstance(row.get("readings"), dict) else {},
+                )
+            )
+    if not out:
+        rows = _repo(db, tenant).query(OperationExecution).order_by(OperationExecution.created_at.desc()).all()
+        if lot_code:
+            lot = _repo(db, tenant).get_by_code(ProductionLot, ProductionLot.lot_code, lot_code)
+            rows = [r for r in rows if r.production_lot_id == lot.production_lot_id]
+        for row in rows:
+            meta = row.metadata_ if isinstance(row.metadata_, dict) else {}
+            readings = {
+                k: meta[k]
+                for k in (
+                    "zone1_temp_c",
+                    "zone2_temp_c",
+                    "steam_flow_kg_h",
+                    "residence_time_min",
+                    "o2_pct",
+                    "kiln_temp_c",
+                    "pressure_bar",
+                )
+                if meta.get(k) is not None
+            }
+            if not readings:
+                continue
+            out.append(
+                AcKilnParameterReadingOut(
+                    reading_id=str(row.execution_id),
+                    kiln_resource_code=str(meta.get("kiln_resource_code") or ""),
+                    recorded_at=row.created_at or datetime.now(timezone.utc),
+                    readings=readings,
+                )
+            )
+    out.sort(key=lambda row: row.recorded_at, reverse=True)
+    return out
 
 
 def list_screening_executions(
@@ -1407,18 +1786,42 @@ def get_masters(db: Session, tenant: TenantContext) -> AcMastersOut:
     ]
     if not raw_products:
         raw_products = products
-    finished_products = [
-        p
-        for p in products
-        if (p.product_code or "").upper() == FINISHED_PRODUCT_CODE
-        or (p.product_type or "").upper() in ("FINISHED", "FINISHED_GOOD", "FG")
-    ]
+    finished_ids: list = []
+    seen_finished: set = set()
+    for typed in raw_material_types:
+        if typed.is_obsolete or not typed.finished_product_id:
+            continue
+        fid = typed.finished_product_id
+        if fid in seen_finished:
+            continue
+        seen_finished.add(fid)
+        finished_ids.append(fid)
+    by_product_id = {p.product_id: p for p in products}
+    finished_products = [by_product_id[fid] for fid in finished_ids if fid in by_product_id]
+    if len(finished_products) < len(finished_ids):
+        repo_lookup = _repo(db, tenant)
+        for fid in finished_ids:
+            if fid in by_product_id:
+                continue
+            row = repo_lookup.get_by_pk(Product, Product.product_id, fid)
+            if row is not None:
+                finished_products.append(row)
+    if not finished_products:
+        finished_products = [
+            p
+            for p in products
+            if (p.product_code or "").upper() == FINISHED_PRODUCT_CODE
+            or (p.product_type or "").upper() in ("FINISHED", "FINISHED_GOOD", "FG")
+        ]
     if not finished_products:
         routable = _routable_product_ids(_repo(db, tenant))
         finished_products = [p for p in products if p.product_id in routable]
     production_orders = _production_orders_with_routing(db, tenant)
     production_lots = mes_core_entities.list_production_lots(db, tenant)
     kiln_rows = _list_tenant_kiln_resources(db, tenant)
+    from app.services.industry.activated_carbon.station_machines import ensure_station_machines
+
+    ensure_station_machines(db, tenant)
     repo = _repo(db, tenant)
     all_resource_rows = repo.query(Resource).order_by(Resource.resource_code).all()
     machine_rows = [
@@ -1426,6 +1829,7 @@ def get_masters(db: Session, tenant: TenantContext) -> AcMastersOut:
         for r in all_resource_rows
         if (r.resource_type or "").upper() == "MACHINE"
         and not (r.resource_code or "").upper().startswith("RES-KILN")
+        and str((r.metadata_ or {}).get("role") or "").lower() != "post_activation"
     ]
     tool_rows = [
         _resource_out(r) for r in all_resource_rows if (r.resource_type or "").upper() == "TOOL"
@@ -1535,6 +1939,13 @@ def create_plant_resource(
     if rtype == "LABOR" and payload.headcount is not None:
         meta["headcount"] = int(payload.headcount)
         meta["operators"] = int(payload.headcount)
+    if rtype == "MACHINE":
+        station = str(getattr(payload, "station", None) or "").strip().lower()
+        if station:
+            meta["station"] = station
+        unit_count = getattr(payload, "unit_count", None)
+        if unit_count is not None:
+            meta["unit_count"] = int(unit_count)
 
     resource = repo.add(
         Resource(
@@ -1586,6 +1997,8 @@ def create_plant_resource(
         headcount=_headcount_from_metadata(resource.metadata_)
         if rtype == "LABOR"
         else None,
+        station=meta.get("station"),
+        unit_count=meta.get("unit_count"),
         equipment_id=equipment_id,
         equipment_code=equipment_code,
         equipment_name=equipment_name,
@@ -1723,6 +2136,10 @@ def _kiln_status_rows(db: Session, tenant: TenantContext) -> list[AcKilnStatusOu
             for candidate in lots_by_id.values():
                 if (candidate.status or "").upper() != "IN_PROGRESS":
                     continue
+                lot_meta = candidate.metadata_ if isinstance(candidate.metadata_, dict) else {}
+                if lot_meta.get("kiln_resource_code") == code:
+                    lot = candidate
+                    break
                 for ex in executions:
                     if ex.production_lot_id != candidate.production_lot_id:
                         continue
@@ -1734,21 +2151,70 @@ def _kiln_status_rows(db: Session, tenant: TenantContext) -> list[AcKilnStatusOu
                 if lot:
                     break
         status = "IDLE"
-        if lot and latest:
+        last_at = latest.created_at if latest else None
+        if lot:
             lot_status = (lot.status or "").upper()
-            ex_status = (latest.status or "").upper()
-            if lot_status == "IN_PROGRESS" and ex_status not in ("COMPLETED", "CLOSED"):
-                status = "RUNNING"
-            elif lot_status in {"IN_PROGRESS", "COMPLETED", "QC_PENDING"} and ex_status == "COMPLETED":
+            lot_meta = lot.metadata_ if isinstance(lot.metadata_, dict) else {}
+            live = str(lot_meta.get("kiln_live_status") or "").upper()
+            charged = lot_meta.get("charged_at")
+            if charged and last_at is None:
+                try:
+                    last_at = datetime.fromisoformat(str(charged).replace("Z", "+00:00"))
+                except ValueError:
+                    last_at = None
+            ex_status = (latest.status or "").upper() if latest else ""
+            ex_step = str((latest.metadata_ or {}).get("process_step") or "").upper() if latest else ""
+            if lot_status == "IN_PROGRESS":
+                if live == "IN_KILN" or ex_step in {"KILN_FEED", "ACTIVATION"} or ex_status not in (
+                    "COMPLETED",
+                    "CLOSED",
+                ):
+                    status = "RUNNING"
+                elif ex_status == "COMPLETED":
+                    status = "COOLING"
+            elif lot_status in {"COMPLETED", "QC_PENDING"} and ex_status == "COMPLETED":
                 status = "COOLING"
+        feed_events: list[dict] = []
+        kiln_meta = kiln.metadata_ if isinstance(kiln.metadata_, dict) else {}
+        raw_events = kiln_meta.get("kiln_feed_events")
+        if isinstance(raw_events, list):
+            feed_events.extend(ev for ev in raw_events if isinstance(ev, dict))
+        for candidate in lots_by_id.values():
+            cand_meta = candidate.metadata_ if isinstance(candidate.metadata_, dict) else {}
+            if cand_meta.get("kiln_resource_code") != code:
+                continue
+            cand_events = cand_meta.get("kiln_feed_events")
+            if isinstance(cand_events, list) and cand_events:
+                feed_events.extend(ev for ev in cand_events if isinstance(ev, dict))
+            elif cand_meta.get("charged_at"):
+                feed_events.append(
+                    {
+                        "lot_code": candidate.lot_code,
+                        "bag_code": cand_meta.get("crusher_bag_code"),
+                        "kg": float(candidate.lot_quantity or 0),
+                        "loaded_at": cand_meta.get("charged_at"),
+                        "kiln_resource_code": code,
+                    }
+                )
+        seen: set[str] = set()
+        unique_events: list[dict] = []
+        for ev in sorted(feed_events, key=lambda row: str(row.get("loaded_at") or "")):
+            key = f"{ev.get('lot_code')}|{ev.get('bag_code') or ''}|{ev.get('loaded_at')}"
+            if key in seen:
+                continue
+            seen.add(key)
+            unique_events.append(ev)
+        loaded_kg = sum(Decimal(str(ev.get("kg") or 0)) for ev in unique_events)
         rows.append(
             AcKilnStatusOut(
                 resource_code=code,
                 resource_name=kiln.resource_name or code,
                 status=status,
                 active_lot_code=lot.lot_code if lot else None,
-                active_lot_kg=lot.lot_quantity if lot else None,
-                last_reading_at=latest.created_at if latest else None,
+                active_lot_kg=loaded_kg if unique_events else (lot.lot_quantity if lot else None),
+                loaded_kg=loaded_kg if unique_events else None,
+                feed_events=unique_events,
+                last_reading_at=last_at,
             )
         )
     return rows
@@ -1819,7 +2285,7 @@ def _lot_pipeline_stage(
             return "Routing / execution"
         return "Kiln feed"
     if st == "CREATED":
-        return "Awaiting feasibility"
+        return "Awaiting kiln feed"
     return lot_status or "Unknown"
 
 
@@ -1905,6 +2371,7 @@ def list_open_production_lots(
         stage = _lot_pipeline_stage(
             lot.status, feas, exec_done=done, exec_total=total
         )
+        lot_meta = lot.metadata_ if isinstance(lot.metadata_, dict) else {}
         rows.append(
             AcOpenLotOut(
                 production_lot_id=lot.production_lot_id,
@@ -1916,6 +2383,14 @@ def list_open_production_lots(
                 feasibility_status=feas,
                 pipeline_stage=stage,
                 routing_complete=routing_complete,
+                kiln_resource_code=lot_meta.get("kiln_resource_code"),
+                charged_at=lot_meta.get("charged_at"),
+                kiln_live_status=lot_meta.get("kiln_live_status"),
+                kiln_feed_events=lot_meta.get("kiln_feed_events")
+                if isinstance(lot_meta.get("kiln_feed_events"), list)
+                else [],
+                kiln_loaded_kg=lot_meta.get("kiln_loaded_kg"),
+                metadata=lot_meta or None,
             )
         )
     return rows
@@ -1930,7 +2405,7 @@ def _active_orders_from_lot_lines(
         "Routing / execution": 2,
         "Quality testing": 3,
         "Finished goods stock": 4,
-        "Awaiting feasibility": 5,
+        "Awaiting kiln feed": 5,
     }
 
     active: list[AcActiveOrderOut] = []
@@ -1980,7 +2455,6 @@ def _process_step_rows(db: Session, tenant: TenantContext) -> list[AcProcessStep
     stocked_count = sum(
         1 for lot in lot_rows if (lot.status or "").upper() == "STOCKED"
     )
-    feasibility_count = repo.query(FeasibilityCheck).count()
     execution_count = sum(
         1
         for ex in repo.query(OperationExecution).all()
@@ -2013,7 +2487,6 @@ def _process_step_rows(db: Session, tenant: TenantContext) -> list[AcProcessStep
             and order.metadata_["raw_material_qc"].get("qc_status") not in (None, "", "PENDING")
         ),
         "AC_KILN_FEED": kiln_feed_count or routing_lot_count,
-        "FEASIBILITY": feasibility_count,
         "EXECUTION": execution_count,
         "ROUTING": routing_lot_count,
         "AC_HOURLY_KILN_PARAMETERS": activation_count,
@@ -2034,8 +2507,8 @@ def _process_step_rows(db: Session, tenant: TenantContext) -> list[AcProcessStep
             status = "pending"
         elif count_key == "DISPATCH" and count > 0:
             status = "complete"
-        elif count_key in {"FEASIBILITY", "EXECUTION", "ROUTING"} and count > 0:
-            status = "done" if count_key in {"FEASIBILITY", "ROUTING"} else "active"
+        elif count_key in {"EXECUTION", "ROUTING"} and count > 0:
+            status = "done" if count_key == "ROUTING" else "active"
         else:
             status = "active"
         steps.append(
@@ -2157,12 +2630,31 @@ def _routing_operation_for_lot(
     raise ValueError(f"No routing operation for process step {process_step}")
 
 
+def _stage_triple(db: Session, tenant: TenantContext, payload: TripleCreate) -> None:
+    """Queue a triple in the current transaction — no per-row commit."""
+    repo = _repo(db, tenant)
+    repo.add(
+        TripleStoreStaging(
+            subject_uri=payload.subject_uri,
+            predicate_uri=payload.predicate_uri,
+            object_uri=payload.object_uri,
+            object_literal=payload.object_literal,
+            object_datatype=payload.object_datatype,
+            source_table=payload.source_table,
+            source_id=payload.source_id,
+            export_status=payload.export_status,
+        )
+    )
+
+
 def _create_process_execution(
     db: Session,
     tenant: TenantContext,
     production_lot_id,
     process_step: str,
     metadata: dict,
+    *,
+    commit: bool = True,
 ) -> OperationExecutionOut:
     repo = _repo(db, tenant)
     op = _routing_operation_for_lot(db, tenant, production_lot_id, process_step)
@@ -2181,13 +2673,19 @@ def _create_process_execution(
             },
         )
     )
-    out = OperationExecutionOut.model_validate(repo.commit_refresh(row))
+    if commit:
+        out = OperationExecutionOut.model_validate(repo.commit_refresh(row))
+    else:
+        repo.db.flush()
+        repo.db.refresh(row)
+        out = OperationExecutionOut.model_validate(row)
     if kiln_release_step(recorded_step):
         lot = repo.get_by_pk(
             ProductionLot, ProductionLot.production_lot_id, production_lot_id
         )
         release_lot_kiln_if_claimed(db, tenant, lot)
-        repo.db.commit()
+        if commit:
+            repo.db.commit()
     return out
 
 
@@ -2601,6 +3099,13 @@ def _raw_material_qc_from_order(
         inbound_prep_complete=inbound_prep_complete,
         next_inbound_step=next_inbound_step,
         next_inbound_operation_code=next_inbound_operation_code,
+        lab_denied=ac_inbound_workflow.lab_denied(meta),
+        lab_remarks=(
+            (meta.get("initial_qc") or {}).get("remarks")
+            if isinstance(meta.get("initial_qc"), dict)
+            else None
+        )
+        or qc.get("operator_remarks"),
     )
 
 
@@ -2980,6 +3485,720 @@ def create_raw_material_qc(
     return row
 
 
+def _kiln_feed_event_list(meta: dict) -> list[dict]:
+    raw = meta.get("kiln_feed_events")
+    return [dict(row) for row in raw if isinstance(row, dict)] if isinstance(raw, list) else []
+
+
+def _next_kiln_feed_bag(meta: dict, requested_bag: Optional[str] = None) -> Optional[dict]:
+    bags = meta.get("crusher_outward_bags")
+    bags = [row for row in bags if isinstance(row, dict)] if isinstance(bags, list) else []
+    bags = [row for row in bags if ac_inbound_workflow._is_kiln_feed_bag(row)]
+    fed = {
+        str(ev.get("bag_code"))
+        for ev in _kiln_feed_event_list(meta)
+        if ev.get("bag_code")
+    }
+    if requested_bag:
+        code = requested_bag.strip()
+        if code in fed:
+            raise WorkflowError(f"Bag '{code}' is already loaded into the kiln")
+        for bag in bags:
+            if str(bag.get("bag_code") or "") == code:
+                return bag
+        return {"bag_code": code, "quantity_kg": None}
+    for bag in bags:
+        code = str(bag.get("bag_code") or "")
+        if code and code not in fed:
+            return bag
+    return None
+
+
+def _append_kiln_resource_feed(
+    db: Session, tenant: TenantContext, kiln_code: str, event: dict
+) -> None:
+    repo = _repo(db, tenant)
+    resource = (
+        repo.query(Resource).filter(Resource.resource_code == kiln_code).first()
+    )
+    if resource is None:
+        return
+    meta = resource.metadata_ if isinstance(resource.metadata_, dict) else {}
+    events = _kiln_feed_event_list(meta)
+    events.append(event)
+    lot_codes = [str(c) for c in (meta.get("active_lot_codes") or []) if c]
+    if event.get("lot_code") and event["lot_code"] not in lot_codes:
+        lot_codes.append(event["lot_code"])
+    resource.metadata_ = {
+        **meta,
+        "kiln_feed_events": events,
+        "active_lot_codes": lot_codes,
+        "active_lot_code": event.get("lot_code") or meta.get("active_lot_code"),
+        "loaded_kg": str(sum(Decimal(str(ev.get("kg") or 0)) for ev in events)),
+    }
+    flag_modified(resource, "metadata_")
+
+
+def _kiln_output_prefix(resource: Resource) -> str:
+    return kiln_output_id_prefix(resource.resource_name or "", resource.resource_code or "")
+
+
+def list_kiln_output_bags(
+    db: Session, tenant: TenantContext, kiln_resource_code: str
+) -> AcKilnOutputListOut:
+    repo = _repo(db, tenant)
+    resource = (
+        repo.query(Resource)
+        .filter(Resource.resource_code == kiln_resource_code.strip())
+        .first()
+    )
+    if resource is None:
+        raise ValidationError(f"Kiln '{kiln_resource_code}' was not found")
+    meta = resource.metadata_ if isinstance(resource.metadata_, dict) else {}
+    raw = meta.get("kiln_output_bags")
+    bags = [row for row in raw if isinstance(row, dict)] if isinstance(raw, list) else []
+    items = [
+        AcKilnOutputBagOut(
+            bag_code=str(row.get("bag_code") or ""),
+            quantity_kg=Decimal(str(row.get("quantity_kg") or 0)),
+            kiln_resource_code=kiln_resource_code,
+            lot_code=row.get("lot_code"),
+            created_at=row.get("created_at"),
+        )
+        for row in bags
+        if row.get("bag_code")
+    ]
+    total = sum((row.quantity_kg for row in items), Decimal("0"))
+    return AcKilnOutputListOut(
+        kiln_resource_code=kiln_resource_code,
+        bags=items,
+        bag_count=len(items),
+        total_kg=total,
+    )
+
+
+def create_kiln_output_bag(
+    db: Session, tenant: TenantContext, payload: AcKilnOutputBagCreate
+) -> AcKilnOutputBagOut:
+    repo = _repo(db, tenant)
+    kiln_code = payload.kiln_resource_code.strip()
+    resource = repo.query(Resource).filter(Resource.resource_code == kiln_code).first()
+    if resource is None:
+        raise ValidationError(f"Kiln '{kiln_code}' was not found")
+    meta = resource.metadata_ if isinstance(resource.metadata_, dict) else {}
+    raw = meta.get("kiln_output_bags")
+    bags = [dict(row) for row in raw if isinstance(row, dict)] if isinstance(raw, list) else []
+    now_iso = datetime.now(timezone.utc).isoformat()
+    lot_code = (payload.lot_code or meta.get("active_lot_code") or "").strip() or None
+    prefix = _kiln_output_prefix(resource)
+    bag_code = next_kiln_output_bag_code(repo.db, prefix)
+    meta["kiln_output_seq"] = int(bag_code.rsplit("_", 1)[-1])
+    row = {
+        "bag_code": bag_code,
+        "quantity_kg": float(payload.quantity_kg),
+        "kiln_resource_code": kiln_code,
+        "lot_code": lot_code,
+        "created_at": now_iso,
+    }
+    bags.append(row)
+    resource.metadata_ = {**meta, "kiln_output_bags": bags}
+    flag_modified(resource, "metadata_")
+    mes_core_entities.create_triple(
+        db,
+        tenant,
+        TripleCreate(
+            subject_uri=f"urn:nyra:ac:kilnOutBag:{bag_code}",
+            predicate_uri="urn:nyra:predicate:contained_in",
+            object_uri=f"urn:nyra:ac:kiln:{kiln_code}",
+            source_table="cfg.resource",
+            source_id=resource.resource_id,
+        ),
+    )
+    if lot_code:
+        mes_core_entities.create_triple(
+            db,
+            tenant,
+            TripleCreate(
+                subject_uri=f"urn:nyra:ac:kilnOutBag:{bag_code}",
+                predicate_uri="urn:nyra:predicate:generatedFrom",
+                object_uri=f"urn:nyra:ac:lot:{lot_code}",
+                source_table="cfg.resource",
+                source_id=resource.resource_id,
+            ),
+        )
+    repo.db.commit()
+    return AcKilnOutputBagOut(
+        bag_code=bag_code,
+        quantity_kg=payload.quantity_kg,
+        kiln_resource_code=kiln_code,
+        lot_code=lot_code,
+        created_at=now_iso,
+    )
+
+
+def _kiln_out_qc_param_defs(db: Session, tenant: TenantContext) -> list[dict]:
+    repo = _repo(db, tenant)
+    try:
+        raw = repo.get_by_code(Product, Product.product_code, "RAW-COCO-SHELL")
+    except Exception:
+        return []
+    meta = raw.metadata_ if isinstance(getattr(raw, "metadata_", None), dict) else {}
+    return [row for row in (meta.get("process_parameters") or []) if isinstance(row, dict)]
+
+
+def _iter_kiln_output_resources(db: Session, tenant: TenantContext, kiln_resource_code: Optional[str] = None):
+    wanted = (kiln_resource_code or "").strip()
+    resources = (
+        _tenant_resources(db, tenant).filter(Resource.resource_code == wanted).all()
+        if wanted
+        else _list_tenant_kiln_resources(db, tenant)
+    )
+    for resource in resources:
+        meta = resource.metadata_ if isinstance(resource.metadata_, dict) else {}
+        raw = meta.get("kiln_output_bags")
+        bags = [row for row in raw if isinstance(row, dict)] if isinstance(raw, list) else []
+        if bags or (wanted and (resource.resource_code or "") == wanted):
+            yield resource, meta, bags
+
+
+def list_kiln_output_qc_bags(
+    db: Session, tenant: TenantContext, kiln_resource_code: Optional[str] = None
+) -> list[AcKilnOutputBagQcOut]:
+    rows: list[AcKilnOutputBagQcOut] = []
+    for resource, _meta, bags in _iter_kiln_output_resources(db, tenant, kiln_resource_code):
+        for bag in bags:
+            code = str(bag.get("bag_code") or "")
+            if not code:
+                continue
+            qc = bag.get("kiln_output_qc") if isinstance(bag.get("kiln_output_qc"), dict) else {}
+            rows.append(
+                AcKilnOutputBagQcOut(
+                    bag_code=code,
+                    kiln_resource_code=str(resource.resource_code or bag.get("kiln_resource_code") or ""),
+                    quantity_kg=Decimal(str(bag.get("quantity_kg") or 0)),
+                    lot_code=bag.get("lot_code"),
+                    created_at=bag.get("created_at"),
+                    user_id=qc.get("user_id") or bag.get("created_by"),
+                    values=qc.get("values") if isinstance(qc.get("values"), dict) else {},
+                    saved_at=qc.get("saved_at"),
+                )
+            )
+    rows.sort(key=lambda row: str(row.created_at or ""), reverse=True)
+    return rows
+
+
+def save_kiln_output_bag_qc(
+    db: Session, tenant: TenantContext, payload: AcKilnOutputBagQcCreate
+) -> AcKilnOutputBagQcOut:
+    from app.services.industry.activated_carbon import triplet_capture as ac_triples
+
+    repo = _repo(db, tenant)
+    code = (payload.bag_code or "").strip()
+    if not code:
+        raise ValidationError("Bag number is required.")
+    found = None
+    for resource, meta, bags in _iter_kiln_output_resources(db, tenant, payload.kiln_resource_code):
+        for bag in bags:
+            if str(bag.get("bag_code") or "") == code:
+                found = (resource, meta, bags, bag)
+                break
+        if found:
+            break
+    if found is None:
+        raise ValidationError(f"Kiln output bag '{code}' was not found.")
+    resource, meta, bags, bag = found
+    existing = bag.get("kiln_output_qc") if isinstance(bag.get("kiln_output_qc"), dict) else None
+    if existing and existing.get("saved_at"):
+        raise ValidationError(
+            f"Kiln output quality for bag '{code}' is already saved and cannot be changed."
+        )
+    values: dict[str, Any] = {}
+    for key, raw in (payload.values or {}).items():
+        if raw is None:
+            continue
+        text = str(raw).strip()
+        if text == "":
+            continue
+        values[str(key)] = text
+    now = datetime.now(timezone.utc).isoformat()
+    qc = {
+        "values": values,
+        "user_id": (payload.user_id or "").strip() or None,
+        "saved_at": now,
+        "lot_code": (payload.lot_code or bag.get("lot_code") or "").strip() or None,
+    }
+    bag["kiln_output_qc"] = qc
+    resource.metadata_ = {**meta, "kiln_output_bags": bags}
+    flag_modified(resource, "metadata_")
+    ac_triples.stage_captures_for_values(
+        db,
+        tenant,
+        subject_uri=f"urn:nyra:ac:kilnOutBag:{code}",
+        values=values,
+        source_table="cfg.resource",
+        source_id=resource.resource_id,
+        param_defs=_kiln_out_qc_param_defs(db, tenant),
+        process_step="ACTIVATION",
+        used_at="execution",
+        operation_code="OP-KILN-OUT-QC",
+    )
+    repo.db.commit()
+    return AcKilnOutputBagQcOut(
+        bag_code=code,
+        kiln_resource_code=str(resource.resource_code or ""),
+        quantity_kg=Decimal(str(bag.get("quantity_kg") or 0)),
+        lot_code=bag.get("lot_code"),
+        created_at=bag.get("created_at"),
+        user_id=qc.get("user_id"),
+        values=values,
+        saved_at=now,
+    )
+
+
+DESTONING_LOADER_CAPACITY = 6
+
+
+def _ensure_destoner_resource(db: Session, tenant: TenantContext) -> Resource:
+    repo = _repo(db, tenant)
+    destoner = (
+        _tenant_resources(db, tenant)
+        .filter(Resource.resource_code == "RES-DESTON-01")
+        .first()
+    )
+    if destoner is not None:
+        return destoner
+    for resource in _tenant_resources(db, tenant).all():
+        code = (resource.resource_code or "").upper()
+        name = (resource.resource_name or "").upper()
+        meta = resource.metadata_ if isinstance(resource.metadata_, dict) else {}
+        role = str(meta.get("role") or "").lower()
+        if "DESTON" in code or "DESTON" in name or role == "destoning":
+            return resource
+    row = Resource(
+        resource_code="RES-DESTON-01",
+        resource_name="De-Stoner",
+        resource_type="MACHINE",
+        status="ACTIVE",
+        metadata_={"role": "destoning"},
+    )
+    repo.add(row)
+    repo.db.flush()
+    return row
+
+
+def _destoning_kiln_letter(resource: Resource, bag_code: str) -> str:
+    code = str(bag_code or "").upper()
+    prefix = re.match(r"^(KA|KB|KC|KOA|KOB|KOC)(?:_|-|\d)", code)
+    if prefix:
+        return prefix.group(1)[-1]
+    blob = " ".join(
+        [
+            str(getattr(resource, "resource_name", "") or ""),
+            str(getattr(resource, "resource_code", "") or ""),
+        ]
+    ).upper()
+    match = re.search(r"KILN[-_\s]*([A-C])\b", blob)
+    if match:
+        return match.group(1)
+    return "A"
+
+
+def _deston_bag(row: dict, kiln_code: Optional[str] = None) -> AcDestoningBagOut:
+    return AcDestoningBagOut(
+        bag_code=str(row.get("bag_code") or ""),
+        quantity_kg=Decimal(str(row.get("quantity_kg") or 0)),
+        kiln_resource_code=kiln_code or row.get("kiln_resource_code"),
+        lot_code=row.get("lot_code"),
+        created_at=row.get("created_at"),
+        input_bag_codes=[str(c) for c in (row.get("input_bag_codes") or []) if c],
+    )
+
+
+def _destoning_lists(meta: dict) -> tuple[list[dict], list[dict]]:
+    loaded = [dict(row) for row in (meta.get("destoning_loaded_bags") or []) if isinstance(row, dict)]
+    outputs = [dict(row) for row in (meta.get("destoning_output_bags") or []) if isinstance(row, dict)]
+    return loaded, outputs
+
+
+def _destoning_events(meta: dict) -> list[dict]:
+    return [dict(row) for row in (meta.get("destoning_load_events") or []) if isinstance(row, dict)]
+
+
+def _deston_event(row: dict) -> AcDestoningLoadEventOut:
+    return AcDestoningLoadEventOut(
+        bag_code=row.get("bag_code"),
+        lot_code=row.get("lot_code"),
+        kg=Decimal(str(row.get("kg") or row.get("quantity_kg") or 0)),
+        loaded_at=row.get("loaded_at") or row.get("created_at"),
+        kiln_resource_code=row.get("kiln_resource_code"),
+    )
+
+
+def _destoning_state_from(
+    db: Session, tenant: TenantContext, destoner: Resource
+) -> AcDestoningStateOut:
+    dest_meta = destoner.metadata_ if isinstance(destoner.metadata_, dict) else {}
+    loaded, outputs = _destoning_lists(dest_meta)
+    loaded_codes = {str(row.get("bag_code") or "") for row in loaded if row.get("bag_code")}
+    consumed = {
+        str(code)
+        for out in outputs
+        for code in (out.get("input_bag_codes") or [])
+        if code
+    }
+    seen_bags: set[str] = set()
+    grouped: dict[str, AcDestoningKilnGroupOut] = {
+        letter: AcDestoningKilnGroupOut(
+            kiln_resource_code=f"KILN-{letter}",
+            kiln_name=f"Kiln {letter}",
+            bags=[],
+        )
+        for letter in ("A", "B")
+    }
+    for resource, _meta, bags in _iter_kiln_output_resources(db, tenant):
+        for bag in bags:
+            code = str(bag.get("bag_code") or "")
+            if not code or code in seen_bags or code in loaded_codes or code in consumed:
+                continue
+            seen_bags.add(code)
+            letter = _destoning_kiln_letter(resource, code)
+            if letter not in grouped:
+                grouped[letter] = AcDestoningKilnGroupOut(
+                    kiln_resource_code=f"KILN-{letter}",
+                    kiln_name=f"Kiln {letter}",
+                    bags=[],
+                )
+            grouped[letter].bags.append(_deston_bag(bag, resource.resource_code))
+    kiln_groups = [grouped[key] for key in sorted(grouped.keys()) if key in {"A", "B", "C"}]
+    loaded_kg = sum((Decimal(str(row.get("quantity_kg") or 0)) for row in loaded), Decimal("0"))
+    events = _destoning_events(dest_meta)
+    if not events:
+        events = [
+            {
+                "bag_code": row.get("bag_code"),
+                "lot_code": row.get("lot_code"),
+                "kg": row.get("quantity_kg") or 0,
+                "loaded_at": row.get("loaded_at") or row.get("created_at"),
+                "kiln_resource_code": row.get("kiln_resource_code"),
+            }
+            for row in loaded
+            if row.get("bag_code")
+        ]
+    return AcDestoningStateOut(
+        kilns=kiln_groups,
+        loaded=[_deston_bag(row) for row in loaded if row.get("bag_code")],
+        loaded_kg=loaded_kg,
+        loader_count=len(loaded),
+        loader_capacity=ac_station_machines.station_machine_capacity(db, tenant, "destoning"),
+        output_bags=[_deston_bag(row) for row in outputs if row.get("bag_code")],
+        load_events=[_deston_event(row) for row in events if row.get("bag_code") or row.get("loaded_at")],
+    )
+
+
+def get_destoning_state(db: Session, tenant: TenantContext) -> AcDestoningStateOut:
+    destoner = _ensure_destoner_resource(db, tenant)
+    return _destoning_state_from(db, tenant, destoner)
+
+
+def load_destoning_bag(
+    db: Session, tenant: TenantContext, payload: AcDestoningLoadCreate
+) -> AcDestoningStateOut:
+    repo = _repo(db, tenant)
+    destoner = _ensure_destoner_resource(db, tenant)
+    dest_meta = destoner.metadata_ if isinstance(destoner.metadata_, dict) else {}
+    loaded, outputs = _destoning_lists(dest_meta)
+    events = _destoning_events(dest_meta)
+    code = (payload.bag_code or "").strip()
+    if not code:
+        raise ValidationError("Bag number is required.")
+    if any(str(row.get("bag_code") or "") == code for row in loaded):
+        raise ValidationError(f"Bag '{code}' is already on the de-stoner.")
+    deston_capacity = ac_station_machines.station_machine_capacity(db, tenant, "destoning")
+    if len(loaded) >= deston_capacity:
+        raise ValidationError(f"De-stoner loader is full ({deston_capacity} machines).")
+    consumed = {
+        str(c) for out in outputs for c in (out.get("input_bag_codes") or []) if c
+    }
+    if code in consumed:
+        raise ValidationError(f"Bag '{code}' has already been destoned.")
+    found = None
+    for resource, _meta, bags in _iter_kiln_output_resources(db, tenant):
+        for bag in bags:
+            if str(bag.get("bag_code") or "") == code:
+                found = (resource, bag)
+                break
+        if found:
+            break
+    if found is None:
+        raise ValidationError(f"Kiln output bag '{code}' was not found.")
+    resource, bag = found
+    now = datetime.now(timezone.utc).isoformat()
+    loaded.append(
+        {
+            "bag_code": code,
+            "quantity_kg": float(bag.get("quantity_kg") or 0),
+            "kiln_resource_code": resource.resource_code,
+            "lot_code": bag.get("lot_code"),
+            "created_at": bag.get("created_at"),
+            "loaded_at": now,
+        }
+    )
+    events.append(
+        {
+            "bag_code": code,
+            "lot_code": bag.get("lot_code"),
+            "kg": float(bag.get("quantity_kg") or 0),
+            "loaded_at": now,
+            "kiln_resource_code": resource.resource_code,
+        }
+    )
+    destoner.metadata_ = {
+        **dest_meta,
+        "destoning_loaded_bags": loaded,
+        "destoning_output_bags": outputs,
+        "destoning_load_events": events,
+    }
+    flag_modified(destoner, "metadata_")
+    repo.db.commit()
+    repo.db.refresh(destoner)
+    return _destoning_state_from(db, tenant, destoner)
+
+
+def unload_destoning_bag(
+    db: Session, tenant: TenantContext, payload: AcDestoningLoadCreate
+) -> AcDestoningStateOut:
+    repo = _repo(db, tenant)
+    destoner = _ensure_destoner_resource(db, tenant)
+    dest_meta = destoner.metadata_ if isinstance(destoner.metadata_, dict) else {}
+    loaded, outputs = _destoning_lists(dest_meta)
+    events = _destoning_events(dest_meta)
+    code = (payload.bag_code or "").strip()
+    next_loaded = [row for row in loaded if str(row.get("bag_code") or "") != code]
+    if len(next_loaded) == len(loaded):
+        raise ValidationError(f"Bag '{code}' is not on the de-stoner.")
+    next_events = list(events)
+    for index in range(len(next_events) - 1, -1, -1):
+        if str(next_events[index].get("bag_code") or "") == code:
+            next_events.pop(index)
+            break
+    destoner.metadata_ = {
+        **dest_meta,
+        "destoning_loaded_bags": next_loaded,
+        "destoning_output_bags": outputs,
+        "destoning_load_events": next_events,
+    }
+    flag_modified(destoner, "metadata_")
+    repo.db.commit()
+    repo.db.refresh(destoner)
+    return _destoning_state_from(db, tenant, destoner)
+
+
+def create_destoning_output_bag(
+    db: Session, tenant: TenantContext, payload: AcDestoningOutputCreate
+) -> AcDestoningStateOut:
+    from app.services.industry.activated_carbon import triplet_capture as ac_triples
+
+    repo = _repo(db, tenant)
+    destoner = _ensure_destoner_resource(db, tenant)
+    dest_meta = destoner.metadata_ if isinstance(destoner.metadata_, dict) else {}
+    loaded, outputs = _destoning_lists(dest_meta)
+    existing_code = (payload.bag_code or "").strip()
+    input_codes = [str(row.get("bag_code")) for row in loaded if row.get("bag_code")]
+    lot_code = (payload.lot_code or "").strip() or next(
+        (str(row.get("lot_code")) for row in loaded if row.get("lot_code")),
+        None,
+    )
+    now = datetime.now(timezone.utc).isoformat()
+    if existing_code:
+        found = next(
+            (row for row in outputs if str(row.get("bag_code") or "") == existing_code),
+            None,
+        )
+        if found is None:
+            raise ValidationError(f"Destoning output '{existing_code}' was not found.")
+        found["quantity_kg"] = float(payload.quantity_kg)
+        if lot_code:
+            found["lot_code"] = lot_code
+        bag_code = existing_code
+        destoner.metadata_ = {
+            **dest_meta,
+            "destoning_loaded_bags": loaded,
+            "destoning_output_bags": outputs,
+            "destoning_load_events": _destoning_events(dest_meta),
+        }
+    else:
+        bag_code = next_destoning_bag_code(repo.db)
+        outputs.append(
+            {
+                "bag_code": bag_code,
+                "quantity_kg": float(payload.quantity_kg),
+                "lot_code": lot_code,
+                "created_at": now,
+                "input_bag_codes": input_codes,
+            }
+        )
+        destoner.metadata_ = {
+            **dest_meta,
+            "destoning_loaded_bags": [],
+            "destoning_output_bags": outputs,
+            "destoning_load_events": _destoning_events(dest_meta),
+        }
+    flag_modified(destoner, "metadata_")
+    if not existing_code:
+        _stage_triple(
+            db,
+            tenant,
+            TripleCreate(
+                subject_uri=f"urn:nyra:ac:destonBag:{bag_code}",
+                predicate_uri="urn:nyra:predicate:contained_in",
+                object_uri=f"urn:nyra:ac:destoner:{destoner.resource_code}",
+                source_table="cfg.resource",
+                source_id=destoner.resource_id,
+            ),
+        )
+        for src in input_codes:
+            _stage_triple(
+                db,
+                tenant,
+                TripleCreate(
+                    subject_uri=f"urn:nyra:ac:destonBag:{bag_code}",
+                    predicate_uri="urn:nyra:predicate:generatedFrom",
+                    object_uri=f"urn:nyra:ac:kilnOutBag:{src}",
+                    source_table="cfg.resource",
+                    source_id=destoner.resource_id,
+                ),
+            )
+    param_defs = _kiln_out_qc_param_defs(db, tenant)
+    ac_triples.stage_captures_for_values(
+        db,
+        tenant,
+        subject_uri=f"urn:nyra:ac:destonBag:{bag_code}",
+        values={
+            "destoning_bag_ref": bag_code,
+            "deston_output_kg": str(payload.quantity_kg),
+            "deston_input_bag_ref": ",".join(input_codes) if not existing_code else None,
+        },
+        source_table="cfg.resource",
+        source_id=destoner.resource_id,
+        param_defs=param_defs,
+        process_step="DESTONING",
+        used_at="execution",
+        operation_code="OP-DESTONING",
+        flush_only=True,
+    )
+    if lot_code:
+        ac_triples.stage_captures_for_values(
+            db,
+            tenant,
+            subject_uri=f"urn:nyra:ac:lot:{lot_code}",
+            values={
+                "destoning_bag_ref": bag_code,
+                "deston_output_kg": str(payload.quantity_kg),
+            },
+            source_table="cfg.resource",
+            source_id=destoner.resource_id,
+            param_defs=param_defs,
+            process_step="DESTONING",
+            used_at="execution",
+            operation_code="OP-DESTONING",
+            flush_only=True,
+        )
+    repo.db.commit()
+    repo.db.refresh(destoner)
+    return _destoning_state_from(db, tenant, destoner)
+
+
+def list_destoning_qc_bags(db: Session, tenant: TenantContext) -> list[AcDestoningBagQcOut]:
+    destoner = _ensure_destoner_resource(db, tenant)
+    dest_meta = destoner.metadata_ if isinstance(destoner.metadata_, dict) else {}
+    _loaded, outputs = _destoning_lists(dest_meta)
+    rows: list[AcDestoningBagQcOut] = []
+    for bag in outputs:
+        code = str(bag.get("bag_code") or "")
+        if not code:
+            continue
+        qc = bag.get("destoning_qc") if isinstance(bag.get("destoning_qc"), dict) else {}
+        rows.append(
+            AcDestoningBagQcOut(
+                bag_code=code,
+                quantity_kg=Decimal(str(bag.get("quantity_kg") or 0)),
+                lot_code=bag.get("lot_code"),
+                created_at=bag.get("created_at"),
+                user_id=qc.get("user_id") or bag.get("created_by"),
+                input_bag_codes=[str(c) for c in (bag.get("input_bag_codes") or []) if c],
+                values=qc.get("values") if isinstance(qc.get("values"), dict) else {},
+                saved_at=qc.get("saved_at"),
+            )
+        )
+    rows.sort(key=lambda row: str(row.created_at or ""), reverse=True)
+    return rows
+
+
+def save_destoning_bag_qc(
+    db: Session, tenant: TenantContext, payload: AcDestoningBagQcCreate
+) -> AcDestoningBagQcOut:
+    from app.services.industry.activated_carbon import triplet_capture as ac_triples
+
+    repo = _repo(db, tenant)
+    destoner = _ensure_destoner_resource(db, tenant)
+    dest_meta = destoner.metadata_ if isinstance(destoner.metadata_, dict) else {}
+    loaded, outputs = _destoning_lists(dest_meta)
+    code = (payload.bag_code or "").strip()
+    found = None
+    for bag in outputs:
+        if str(bag.get("bag_code") or "") == code:
+            found = bag
+            break
+    if found is None:
+        raise ValidationError(f"Destoning bag '{code}' was not found.")
+    existing = found.get("destoning_qc") if isinstance(found.get("destoning_qc"), dict) else None
+    if existing and existing.get("saved_at"):
+        raise ValidationError(
+            f"Destoning quality for bag '{code}' is already saved and cannot be changed."
+        )
+    values: dict[str, Any] = {}
+    for key, raw in (payload.values or {}).items():
+        if raw is None:
+            continue
+        text = str(raw).strip()
+        if text == "":
+            continue
+        values[str(key)] = text
+    now = datetime.now(timezone.utc).isoformat()
+    qc = {
+        "values": values,
+        "user_id": (payload.user_id or "").strip() or None,
+        "saved_at": now,
+        "copy_from_bag_code": (payload.copy_from_bag_code or "").strip() or None,
+    }
+    found["destoning_qc"] = qc
+    destoner.metadata_ = {**dest_meta, "destoning_loaded_bags": loaded, "destoning_output_bags": outputs}
+    flag_modified(destoner, "metadata_")
+    ac_triples.stage_captures_for_values(
+        db,
+        tenant,
+        subject_uri=f"urn:nyra:ac:destonBag:{code}",
+        values=values,
+        source_table="cfg.resource",
+        source_id=destoner.resource_id,
+        param_defs=_kiln_out_qc_param_defs(db, tenant),
+        process_step="SCREENING",
+        used_at="execution",
+        operation_code="OP-DESTON-QC",
+    )
+    repo.db.commit()
+    return AcDestoningBagQcOut(
+        bag_code=code,
+        quantity_kg=Decimal(str(found.get("quantity_kg") or 0)),
+        lot_code=found.get("lot_code"),
+        created_at=found.get("created_at"),
+        user_id=qc.get("user_id"),
+        input_bag_codes=[str(c) for c in (found.get("input_bag_codes") or []) if c],
+        values=values,
+        saved_at=now,
+    )
+
+
 def create_kiln_feed_lot(
     db: Session, tenant: TenantContext, payload: AcKilnFeedLotCreate
 ) -> ProductionLotOut:
@@ -2997,56 +4216,126 @@ def create_kiln_feed_lot(
 
     if lot is not None:
         lot_status = (lot.status or "").upper()
-        if lot_status not in ("CREATED",):
+        if lot_status in ("COMPLETED", "STOCKED", "DISPATCHED", "CLOSED", "CANCELLED"):
             raise WorkflowError(
-                f"Lot '{lot.lot_code}' is already charged or in progress (status: {lot.status})"
+                f"Lot '{lot.lot_code}' is closed and cannot be loaded (status: {lot.status})"
             )
-        if not is_ready_for_scheduling(db, tenant, lot.lot_code):
-            raise WorkflowError(
-                "Feasibility Gate must pass before charging the kiln — "
-                f"run feasibility for lot '{lot.lot_code}' first"
+        lot_meta = lot.metadata_ if isinstance(lot.metadata_, dict) else {}
+        events = _kiln_feed_event_list(lot_meta)
+        loaded_kg = sum(Decimal(str(ev.get("kg") or 0)) for ev in events)
+        lot_qty = Decimal(str(lot.lot_quantity or 0))
+        kiln_code = (payload.kiln_resource_code or lot_meta.get("kiln_resource_code") or "").strip()
+        if not kiln_code:
+            raise ValidationError("Select a kiln")
+        assigned = (lot_meta.get("kiln_resource_code") or "").strip()
+        if assigned and assigned != kiln_code:
+            raise WorkflowError(f"Lot '{lot.lot_code}' is already assigned to {assigned}")
+
+        bag = _next_kiln_feed_bag(lot_meta, payload.bag_code)
+        if bag is not None:
+            bag_code = (bag.get("bag_code") or payload.bag_code or "").strip() or None
+            feed_kg = Decimal(
+                str(
+                    payload.quantity_kg
+                    or bag.get("quantity_kg")
+                    or bag.get("weight_kg")
+                    or 0
+                )
             )
-        if payload.lot_quantity is not None:
+        else:
+            remaining = lot_qty - loaded_kg
+            if remaining <= 0:
+                raise WorkflowError(f"Lot '{lot.lot_code}' is already fully loaded into the kiln")
+            feed_kg = Decimal(str(payload.quantity_kg or remaining))
+            bag_code = (payload.bag_code or lot_meta.get("crusher_bag_code") or "").strip() or None
+
+        if feed_kg <= 0:
+            raise ValidationError("Load quantity must be greater than zero")
+        if lot_qty > 0 and loaded_kg + feed_kg > lot_qty + Decimal("0.001"):
+            raise ValidationError("Load would exceed the lot quantity")
+
+        now_iso = datetime.now(timezone.utc).isoformat()
+        first_feed = len(events) == 0
+        if payload.lot_quantity is not None and lot_status == "CREATED":
             lot.lot_quantity = payload.lot_quantity
-        lot.status = payload.status or "IN_PROGRESS"
-        if payload.kiln_resource_code:
-            now_iso = datetime.now(timezone.utc).isoformat()
-            claim_kiln_for_lot(
-                db, tenant, payload.kiln_resource_code, lot_code=lot.lot_code
-            )
-            lot_meta = lot.metadata_ if isinstance(lot.metadata_, dict) else {}
-            lot.metadata_ = {
-                **lot_meta,
-                "charged_at": now_iso,
-                "kiln_resource_code": payload.kiln_resource_code,
-                "kiln_resource_claimed": True,
-                "kiln_live_status": "IN_KILN",
-            }
+        if lot_status == "CREATED":
+            lot.status = payload.status or "IN_PROGRESS"
+
+        claim_kiln_for_lot(
+            db, tenant, kiln_code, lot_code=lot.lot_code, share=True
+        )
+        event = {
+            "lot_code": lot.lot_code,
+            "bag_code": bag_code,
+            "kg": float(feed_kg),
+            "loaded_at": now_iso,
+            "kiln_resource_code": kiln_code,
+        }
+        events = events + [event]
+        loaded_kg = loaded_kg + feed_kg
+        lot.metadata_ = {
+            **lot_meta,
+            "charged_at": lot_meta.get("charged_at") or now_iso,
+            "kiln_resource_code": kiln_code,
+            "kiln_resource_claimed": True,
+            "kiln_live_status": "IN_KILN",
+            "kiln_feed_events": events,
+            "kiln_loaded_kg": str(loaded_kg),
+        }
+        flag_modified(lot, "metadata_")
+        _append_kiln_resource_feed(db, tenant, kiln_code, event)
+        if first_feed:
             _create_process_execution(
                 db,
                 tenant,
                 lot.production_lot_id,
                 "ACTIVATION",
                 {
-                    "kiln_resource_code": payload.kiln_resource_code,
+                    "kiln_resource_code": kiln_code,
                     "feed_recorded": True,
                     "process_step": "KILN_FEED",
                 },
+                commit=False,
             )
-            mes_core_entities.create_triple(
+            _stage_triple(
                 db,
                 tenant,
                 TripleCreate(
                     subject_uri=f"urn:nyra:ac:lot:{lot.lot_code}",
                     predicate_uri="urn:nyra:predicate:assignedTo",
-                    object_uri=f"urn:nyra:ac:kiln:{payload.kiln_resource_code}",
+                    object_uri=f"urn:nyra:ac:kiln:{kiln_code}",
+                    source_table="trn.production_lot",
+                    source_id=lot.production_lot_id,
+                ),
+            )
+        _stage_triple(
+            db,
+            tenant,
+            TripleCreate(
+                subject_uri=f"urn:nyra:ac:lot:{lot.lot_code}",
+                predicate_uri="urn:nyra:predicate:chargedTo",
+                object_uri=(
+                    f"urn:nyra:ac:kilnFeed:{lot.lot_code}:{bag_code or now_iso}"
+                ),
+                source_table="trn.production_lot",
+                source_id=lot.production_lot_id,
+            ),
+        )
+        if bag_code:
+            _stage_triple(
+                db,
+                tenant,
+                TripleCreate(
+                    subject_uri=f"urn:nyra:ac:inwardBag:{bag_code}",
+                    predicate_uri="urn:nyra:predicate:chargedTo",
+                    object_uri=f"urn:nyra:ac:kiln:{kiln_code}",
                     source_table="trn.production_lot",
                     source_id=lot.production_lot_id,
                 ),
             )
         repo.db.commit()
         repo.db.refresh(lot)
-        return mes_core_entities.get_production_lot(db, tenant, lot.production_lot_id)
+        return mes_core_entities._production_lot_out(db, tenant, lot)
 
     if payload.production_order_id is None or payload.lot_quantity is None:
         raise ValidationError(
@@ -3068,18 +4357,25 @@ def create_kiln_feed_lot(
         ),
     )
     if payload.kiln_resource_code:
-        if not is_ready_for_scheduling(db, tenant, lot.lot_code):
-            raise WorkflowError(
-                "Feasibility Gate must pass before charging the kiln — "
-                f"run feasibility for lot '{lot.lot_code}' first"
-            )
         now_iso = datetime.now(timezone.utc).isoformat()
         lot_row = repo.get_by_pk(
             ProductionLot, ProductionLot.production_lot_id, lot.production_lot_id
         )
         claim_kiln_for_lot(
-            db, tenant, payload.kiln_resource_code, lot_code=lot_row.lot_code
+            db,
+            tenant,
+            payload.kiln_resource_code,
+            lot_code=lot_row.lot_code,
+            share=True,
         )
+        feed_kg = Decimal(str(payload.quantity_kg or payload.lot_quantity or lot_row.lot_quantity or 0))
+        event = {
+            "lot_code": lot_row.lot_code,
+            "bag_code": (payload.bag_code or "").strip() or None,
+            "kg": float(feed_kg),
+            "loaded_at": now_iso,
+            "kiln_resource_code": payload.kiln_resource_code,
+        }
         lot_meta = lot_row.metadata_ if isinstance(lot_row.metadata_, dict) else {}
         lot_row.metadata_ = {
             **lot_meta,
@@ -3087,7 +4383,11 @@ def create_kiln_feed_lot(
             "kiln_resource_code": payload.kiln_resource_code,
             "kiln_resource_claimed": True,
             "kiln_live_status": "IN_KILN",
+            "kiln_feed_events": [event],
+            "kiln_loaded_kg": str(feed_kg),
         }
+        flag_modified(lot_row, "metadata_")
+        _append_kiln_resource_feed(db, tenant, payload.kiln_resource_code, event)
         _create_process_execution(
             db,
             tenant,
@@ -3116,22 +4416,38 @@ def create_kiln_feed_lot(
 
 def create_kiln_parameters(
     db: Session, tenant: TenantContext, payload: AcKilnParametersCreate
-) -> OperationExecutionOut:
-    meta = {
-        k: v
-        for k, v in {
-            "zone1_temp_c": payload.zone1_temp_c,
-            "zone2_temp_c": payload.zone2_temp_c,
-            "steam_flow_kg_h": payload.steam_flow_kg_h,
-            "residence_time_min": payload.residence_time_min,
-            "o2_pct": payload.o2_pct,
-            "kiln_temp_c": payload.kiln_temp_c or payload.zone2_temp_c or payload.zone1_temp_c,
-            "pressure_bar": payload.pressure_bar,
-        }.items()
-        if v is not None
+) -> AcKilnParameterReadingOut:
+    kilns = _list_tenant_kiln_resources(db, tenant)
+    kiln_code = (payload.kiln_resource_code or "").strip()
+    kiln = next((row for row in kilns if row.resource_code == kiln_code), None)
+    if kiln is None and kilns:
+        kiln = kilns[0]
+    if kiln is None:
+        raise ValidationError("No kiln found. Add a kiln in Masters.")
+    readings = _kiln_reading_values(payload)
+    if not readings:
+        raise ValidationError("Enter at least one kiln reading.")
+    recorded_at = payload.recorded_at or datetime.now(timezone.utc)
+    if recorded_at.tzinfo is None:
+        recorded_at = recorded_at.replace(tzinfo=timezone.utc)
+    entry = {
+        "reading_id": str(uuid4()),
+        "recorded_at": recorded_at.isoformat(),
+        "kiln_resource_code": kiln.resource_code,
+        "readings": readings,
     }
-    return _create_process_execution(
-        db, tenant, payload.production_lot_id, "ACTIVATION", meta
+    meta = dict(kiln.metadata_ if isinstance(kiln.metadata_, dict) else {})
+    history = [row for row in (meta.get(_KILN_READING_META) or []) if isinstance(row, dict)]
+    history.insert(0, entry)
+    meta[_KILN_READING_META] = history[:200]
+    kiln.metadata_ = meta
+    flag_modified(kiln, "metadata_")
+    db.commit()
+    return AcKilnParameterReadingOut(
+        reading_id=entry["reading_id"],
+        kiln_resource_code=kiln.resource_code,
+        recorded_at=recorded_at,
+        readings=readings,
     )
 
 
@@ -3365,3 +4681,11 @@ def create_quality_test(
     elif ac_stock.qc_status_passed(qc_status):
         ac_stock.try_stock_lot_after_pipeline(db, tenant, payload.production_lot_id)
     return QualityCheckOut.model_validate(check_row)
+
+
+get_post_activation_state = ac_post_activation.get_post_activation_state
+load_post_activation_bag = ac_post_activation.load_post_activation_bag
+unload_post_activation_bag = ac_post_activation.unload_post_activation_bag
+create_post_activation_output_bag = ac_post_activation.create_post_activation_output_bag
+list_post_activation_quality = ac_post_activation.list_post_activation_quality
+save_post_activation_quality = ac_post_activation.save_post_activation_quality

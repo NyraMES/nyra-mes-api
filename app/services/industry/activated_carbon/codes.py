@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import re
+from datetime import datetime
 from typing import Optional
 from uuid import UUID
 
@@ -20,6 +22,7 @@ AC_CODE_SPECS: dict[str, tuple[str, str]] = {
     "ac_finished_product": ("core.product_code_seq", "FG-AC-"),
     "ac_routing": ("core.routing_code_seq", "RT-AC-"),
     "ac_customer_order": ("core.customer_order_code_seq", "ORD-AC-"),
+    "ac_customer_po": ("core.ac_customer_po_seq", "CUST_PO_"),
     "ac_customer_order_line": ("core.customer_order_line_code_seq", "ORDL-AC-"),
     "ac_production_order": ("core.production_order_code_seq", "PO-AC-"),
     "ac_production_lot": ("core.lot_code_seq", "LOT-AC-"),
@@ -46,6 +49,7 @@ ALL_CORE_CODE_SEQUENCES: tuple[str, ...] = (
     "core.quality_check_code_seq",
     "core.ncr_code_seq",
     "core.dispatch_code_seq",
+    "core.ac_customer_po_seq",
 )
 
 # Minimum suffix already issued for demo seed (next code = floor + 1 when DB empty).
@@ -60,6 +64,7 @@ AC_SEQUENCE_FLOORS: dict[str, int] = {
     "core.feasibility_check_code_seq": 0,
     "core.schedule_code_seq": 0,
     "core.dispatch_code_seq": 0,
+    "core.ac_customer_po_seq": 0,
     "core.routing_code_seq": 0,
     "core.product_code_seq": 0,
 }
@@ -68,6 +73,7 @@ AC_SEQUENCE_FLOORS: dict[str, int] = {
 AC_SEQUENCE_CODE_SOURCES: dict[str, list[tuple[str, str, Optional[str]]]] = {
     "core.customer_code_seq": [("mst.customer", "customer_code", "CUST-AC-%")],
     "core.customer_order_code_seq": [("trn.customer_order", "order_code", "ORD-AC-%")],
+    "core.ac_customer_po_seq": [("trn.customer_order", "order_code", "CUST_PO_%")],
     "core.customer_order_line_code_seq": [
         ("trn.customer_order_line", "line_code", "ORDL-AC-%")
     ],
@@ -132,9 +138,24 @@ def generate_ac_business_code(
     if entity not in AC_CODE_SPECS:
         raise ValueError(f"Unknown AC entity for ID generation: {entity}")
     sequence, prefix = AC_CODE_SPECS[entity]
+    if entity == "ac_customer_po":
+        db.execute(text(f"CREATE SEQUENCE IF NOT EXISTS {sequence}"))
     for _ in range(32):
         n = _nextval(db, sequence)
         code = f"{prefix}{n}"
+        if entity == "ac_customer_po":
+            taken = db.execute(
+                text(
+                    "SELECT 1 FROM trn.customer_order "
+                    "WHERE order_code = :code"
+                    + (" AND tenant_id = :tenant_id" if tenant_id is not None else "")
+                    + " LIMIT 1"
+                ),
+                {"code": code, **({"tenant_id": str(tenant_id)} if tenant_id is not None else {})},
+            ).scalar()
+            if not taken:
+                return code
+            continue
         if entity == "ac_routing" and tenant_id is not None:
             taken = db.execute(
                 text(
@@ -148,6 +169,72 @@ def generate_ac_business_code(
             continue
         return code
     raise ValueError(f"Could not allocate unique code for {entity}")
+
+
+def kiln_plant_letter(resource_name: str = "", resource_code: str = "") -> str:
+    """Kiln A / RES-KILN-01 → A; Kiln B / Klin 02 / RES-KILN-0002 → B."""
+    blob = f"{resource_name or ''} {resource_code or ''}".upper()
+    match = re.search(r"\bK(?:ILN|LIN)?[-_\s]*([A-C])\b", blob)
+    if match:
+        return match.group(1)
+    digits = re.search(r"(\d+)$", str(resource_code or ""))
+    if not digits:
+        digits = re.search(r"(\d+)\s*$", str(resource_name or "").strip())
+    if digits:
+        n = int(digits.group(1))
+        if 1 <= n <= 26:
+            return chr(64 + n)
+    return "A"
+
+
+def kiln_output_id_prefix(resource_name: str = "", resource_code: str = "") -> str:
+    """Kiln A → KA, Kiln B → KB."""
+    return f"K{kiln_plant_letter(resource_name, resource_code)}"
+
+
+def next_process_bag_code(db: Session, process_prefix: str) -> str:
+    """Process-prefixed bags: RI_BAG_001, RO_BAG_001."""
+    token = re.sub(r"[^A-Z]", "", str(process_prefix or "").upper())
+    if len(token) < 2:
+        token = "BG"
+    token = token[:2]
+    seq_name = f"core.ac_bag_{token.lower()}_seq"
+    db.execute(text(f"CREATE SEQUENCE IF NOT EXISTS {seq_name}"))
+    n = int(db.execute(text(f"SELECT nextval('{seq_name}')")).scalar() or 1)
+    return f"{token}_BAG_{n:03d}"
+
+
+def next_kiln_output_bag_code(db: Session, prefix: str) -> str:
+    """KA_DDMMYY_##### using a Postgres sequence per kiln prefix."""
+    token = str(prefix or "KA").upper()
+    if not re.fullmatch(r"K[A-Z]", token):
+        token = "KA"
+    seq_name = f"core.ac_kiln_out_{token.lower()}_seq"
+    db.execute(text(f"CREATE SEQUENCE IF NOT EXISTS {seq_name}"))
+    n = int(db.execute(text(f"SELECT nextval('{seq_name}')")).scalar() or 1)
+    stamp = datetime.now().strftime("%d%m%y")
+    return f"{token}_{stamp}_{n:05d}"
+
+
+def next_destoning_bag_code(db: Session) -> str:
+    """DS_DDMMYY_##### using a Postgres sequence."""
+    seq_name = "core.ac_deston_ds_seq"
+    db.execute(text(f"CREATE SEQUENCE IF NOT EXISTS {seq_name}"))
+    n = int(db.execute(text(f"SELECT nextval('{seq_name}')")).scalar() or 1)
+    stamp = datetime.now().strftime("%d%m%y")
+    return f"DS_{stamp}_{n:05d}"
+
+
+def next_post_activation_bag_code(db: Session, prefix: str) -> str:
+    """SC/CR/DD/DM/BL/FG_DDMMYY_##### using a Postgres sequence per process."""
+    token = str(prefix or "PA").upper()
+    if not re.fullmatch(r"[A-Z]{2}", token):
+        token = "PA"
+    seq_name = f"core.ac_post_{token.lower()}_seq"
+    db.execute(text(f"CREATE SEQUENCE IF NOT EXISTS {seq_name}"))
+    n = int(db.execute(text(f"SELECT nextval('{seq_name}')")).scalar() or 1)
+    stamp = datetime.now().strftime("%d%m%y")
+    return f"{token}_{stamp}_{n:05d}"
 
 
 def resolve_ac_business_code(
@@ -169,6 +256,7 @@ def sync_ac_sequences(db: Session, tenant_id: Optional[UUID] = None) -> None:
     When ``tenant_id`` is None, scan all tenants — use after wiping every AC tenant.
     """
     for seq, floor in AC_SEQUENCE_FLOORS.items():
+        db.execute(text(f"CREATE SEQUENCE IF NOT EXISTS {seq}"))
         max_used = floor
         for table, column, code_like in AC_SEQUENCE_CODE_SOURCES.get(seq, ()):
             max_used = max(

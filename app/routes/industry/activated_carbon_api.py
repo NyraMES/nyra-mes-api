@@ -9,25 +9,55 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, Query, status
 from sqlalchemy.orm import Session
 
+from app.core.ac_privileges import (
+    require_ac_activation_qc,
+    require_ac_activation_run,
+    require_ac_dispatch,
+    require_ac_post_qc,
+    require_ac_post_run,
+    require_ac_quality,
+    require_ac_rms,
+)
 from app.core.capability_guard import require_any_capability, require_capability
 from app.core.dependencies import (
+    UserContext,
     get_mes_core_db,
     get_tenant_context,
-    require_super_admin,
-    require_tenant_admin,
+    require_nyra_services,
+    require_plant_admin,
 )
 from app.core.exceptions import ConflictError, ValidationError, WorkflowError
 from app.core.openapi_tags import Tags
 from app.core.tenant_context import TenantContext
 from app.schemas.mes_core.schemas import (
+    AcAssignableRolesOut,
     AcDashboardOut,
     AcKilnFeedLotCreate,
+    AcKilnFeedBagQcCreate,
+    AcKilnFeedBagQcOut,
+    AcKilnOutputBagQcCreate,
+    AcKilnOutputBagQcOut,
+    AcDestoningLoadCreate,
+    AcDestoningOutputCreate,
+    AcDestoningStateOut,
+    AcDestoningBagQcCreate,
+    AcDestoningBagQcOut,
+    AcPostActivationLoadCreate,
+    AcPostActivationOutputCreate,
+    AcPostActivationQualityBagOut,
+    AcPostActivationQualityOut,
+    AcPostActivationQualitySave,
+    AcPostActivationStateOut,
+    AcKilnOutputBagCreate,
+    AcKilnOutputBagOut,
+    AcKilnOutputListOut,
     AcKilnParameterDefinition,
     AcKilnParameterDefinitionCreate,
     AcKilnCreate,
     AcKilnOut,
     AcPlantResourceOut,
     AcKilnParametersCreate,
+    AcKilnParameterReadingOut,
     AcMastersOut,
     AcQualityTestCreate,
     AcCustomerSalesOrderCreate,
@@ -35,8 +65,12 @@ from app.schemas.mes_core.schemas import (
     AcDispatchFromOrderCreate,
     AcDispatchFromOrderResponse,
     AcGradeStockOut,
+    AcInStockBagOut,
     AcOpenCustomerOrderOut,
     AcStockedLotOut,
+    AcTenantUserCreate,
+    AcTenantUserCreateResponse,
+    AcTenantUserOut,
     AcDeliveryCommitmentOut,
     AcFinishedGoodsStockOut,
     AcMakeToStockCreate,
@@ -88,6 +122,7 @@ from app.schemas.mes_core.schemas import (
 from app.schemas.dispatch import DispatchCreate, DispatchOut
 from app.schemas.traceability import TraceabilityResponse
 from app.services.industry.activated_carbon import adapter as ac_adapter
+from app.services.industry.activated_carbon import users as ac_users
 from app.services.industry.activated_carbon import kiln_parameters_catalog as ac_kiln_catalog
 from app.services.industry.activated_carbon import raw_material_types as ac_raw_material_types
 from app.services.industry.activated_carbon import inbound_admin as ac_inbound_admin
@@ -179,7 +214,7 @@ def ac_add_kiln_parameter(
     payload: AcKilnParameterDefinitionCreate,
     db: Session = Depends(get_mes_core_db),
     tenant: TenantContext = Depends(_AC_MASTERS),
-    _user=require_tenant_admin(),
+    _user=require_nyra_services(),
 ):
     try:
         return ac_kiln_catalog.add_kiln_parameter_definition(db, tenant, payload)
@@ -197,7 +232,7 @@ def ac_create_kiln(
     payload: AcKilnCreate,
     db: Session = Depends(get_mes_core_db),
     tenant: TenantContext = Depends(_AC_MASTERS),
-    _user=require_tenant_admin(),
+    _user=require_nyra_services(),
 ):
     try:
         return ac_adapter.create_kiln(db, tenant, payload)
@@ -217,7 +252,7 @@ def ac_create_resource(
     payload: ResourceCreate,
     db: Session = Depends(get_mes_core_db),
     tenant: TenantContext = Depends(_AC_MASTERS),
-    _user=require_tenant_admin(),
+    _user=require_nyra_services(),
 ):
     try:
         return ac_adapter.create_plant_resource(db, tenant, payload)
@@ -250,6 +285,7 @@ def ac_generate_lot_route(
     lot_code: str,
     db: Session = Depends(get_mes_core_db),
     tenant: TenantContext = Depends(_AC_MASTERS),
+    _user=require_ac_activation_run(),
 ):
     try:
         return ac_routing.generate_lot_route(db, tenant, lot_code)
@@ -265,6 +301,7 @@ def ac_run_feasibility_and_prepare_execution(
     lot_code: str,
     db: Session = Depends(get_mes_core_db),
     tenant: TenantContext = Depends(_AC_MASTERS),
+    _user=require_ac_activation_run(),
 ):
     """Persist feasibility results; materialise routing work orders when the gate opens."""
     result = mes_core_feasibility.run_feasibility_check(db, tenant, lot_code)
@@ -303,7 +340,7 @@ def ac_create_customer(
     payload: CustomerCreate,
     db: Session = Depends(get_mes_core_db),
     tenant: TenantContext = Depends(_AC_MASTERS),
-    _user=require_tenant_admin(),
+    _user=require_nyra_services(),
 ):
     return ac_adapter.create_ac_customer(db, tenant, payload)
 
@@ -330,7 +367,7 @@ def ac_create_supplier(
     payload: SupplierCreate,
     db: Session = Depends(get_mes_core_db),
     tenant: TenantContext = Depends(_AC_MASTERS),
-    _user=require_tenant_admin(),
+    _user=require_nyra_services(),
 ):
     return ac_adapter.create_ac_supplier(db, tenant, payload)
 
@@ -360,7 +397,7 @@ def ac_create_raw_material_type(
     payload: AcRawMaterialTypeCreate,
     db: Session = Depends(get_mes_core_db),
     tenant: TenantContext = Depends(_AC_MASTERS),
-    _user=require_super_admin(),
+    _user=require_nyra_services(),
 ):
     try:
         return ac_raw_material_types.create_raw_material_type(db, tenant, payload)
@@ -393,7 +430,7 @@ def ac_update_raw_material_type(
     payload: AcRawMaterialTypeUpdate,
     db: Session = Depends(get_mes_core_db),
     tenant: TenantContext = Depends(_AC_MASTERS),
-    _user=require_super_admin(),
+    _user=require_nyra_services(),
 ):
     try:
         return ac_raw_material_types.update_raw_material_type(
@@ -414,7 +451,7 @@ def ac_mark_raw_material_type_obsolete(
     product_id: UUID,
     db: Session = Depends(get_mes_core_db),
     tenant: TenantContext = Depends(_AC_MASTERS),
-    _user=require_super_admin(),
+    _user=require_nyra_services(),
 ):
     try:
         return ac_raw_material_types.mark_raw_material_type_obsolete(
@@ -448,6 +485,7 @@ def ac_create_dispatch(
     payload: DispatchCreate,
     db: Session = Depends(get_mes_core_db),
     tenant: TenantContext = Depends(_AC_MASTERS),
+    _user=require_ac_dispatch(),
 ):
     try:
         return mes_core_dispatch.create_dispatch(db, tenant, payload)
@@ -477,6 +515,7 @@ def ac_create_dispatch_record(
     payload: TrnDispatchCreate,
     db: Session = Depends(get_mes_core_db),
     tenant: TenantContext = Depends(_AC_MASTERS),
+    _user=require_ac_dispatch(),
 ):
     return mes_core_trn_dispatch.create_dispatch(db, tenant, payload)
 
@@ -491,6 +530,7 @@ def ac_update_dispatch_record(
     payload: TrnDispatchUpdate,
     db: Session = Depends(get_mes_core_db),
     tenant: TenantContext = Depends(_AC_MASTERS),
+    _user=require_ac_dispatch(),
 ):
     return mes_core_trn_dispatch.update_dispatch(db, tenant, dispatch_id, payload)
 
@@ -505,6 +545,7 @@ def create_raw_material_inward(
     payload: AcRawMaterialInwardCreate,
     db: Session = Depends(get_mes_core_db),
     tenant: TenantContext = Depends(_AC_RAW),
+    _user=require_ac_rms(),
 ):
     return ac_adapter.create_raw_material_inward(db, tenant, payload)
 
@@ -519,6 +560,7 @@ def create_make_to_stock_order(
     payload: AcMakeToStockCreate,
     db: Session = Depends(get_mes_core_db),
     tenant: TenantContext = Depends(_AC_KILN_FEED),
+    _user=require_ac_rms(),
 ):
     return ac_adapter.create_make_to_stock_production_order(db, tenant, payload)
 
@@ -564,6 +606,7 @@ def create_customer_sales_order(
     payload: AcCustomerSalesOrderCreate,
     db: Session = Depends(get_mes_core_db),
     tenant: TenantContext = Depends(_AC_MASTERS),
+    _user=require_ac_dispatch(),
 ):
     return ac_adapter.create_customer_sales_order(db, tenant, payload)
 
@@ -604,6 +647,18 @@ def list_stocked_lots(
     return ac_adapter.list_stocked_lots_for_dispatch(db, tenant)
 
 
+@router.get(
+    "/in-stock-bags",
+    response_model=List[AcInStockBagOut],
+    summary="Bags marked In Stock and available for customer dispatch",
+)
+def list_in_stock_bags(
+    db: Session = Depends(get_mes_core_db),
+    tenant: TenantContext = Depends(_AC_MASTERS),
+):
+    return ac_adapter.list_in_stock_bags_for_dispatch(db, tenant)
+
+
 @router.post(
     "/dispatch-from-order",
     response_model=AcDispatchFromOrderResponse,
@@ -614,6 +669,7 @@ def create_dispatch_from_order(
     payload: AcDispatchFromOrderCreate,
     db: Session = Depends(get_mes_core_db),
     tenant: TenantContext = Depends(_AC_MASTERS),
+    _user=require_ac_dispatch(),
 ):
     try:
         return ac_adapter.create_ac_dispatch_from_order(db, tenant, payload)
@@ -630,6 +686,7 @@ def create_dispatch_from_order(
 def backfill_inward_production_orders(
     db: Session = Depends(get_mes_core_db),
     tenant: TenantContext = Depends(_AC_RAW),
+    _user=require_ac_rms(),
 ):
     return ac_adapter.backfill_inward_production_orders(db, tenant)
 
@@ -656,6 +713,7 @@ def create_raw_material_qc(
     payload: AcRawMaterialQcCreate,
     db: Session = Depends(get_mes_core_db),
     tenant: TenantContext = Depends(_AC_RAW_QC),
+    _user=require_ac_rms(),
 ):
     return ac_adapter.create_raw_material_qc(db, tenant, payload)
 
@@ -682,6 +740,7 @@ def complete_inbound_execution_step(
     payload: AcInboundStepCompleteCreate,
     db: Session = Depends(get_mes_core_db),
     tenant: TenantContext = Depends(_AC_RAW),
+    _user=require_ac_rms(),
 ):
     try:
         return ac_adapter.complete_inbound_execution_step(db, tenant, payload)
@@ -711,6 +770,7 @@ def create_raw_material_crushing(
     payload: AcRawMaterialCrushCreate,
     db: Session = Depends(get_mes_core_db),
     tenant: TenantContext = Depends(_AC_RAW),
+    _user=require_ac_rms(),
 ):
     return ac_adapter.create_raw_material_crush(db, tenant, payload)
 
@@ -737,6 +797,7 @@ def create_raw_material_initial_qc(
     payload: AcInitialQcCreate,
     db: Session = Depends(get_mes_core_db),
     tenant: TenantContext = Depends(_AC_RAW_QC),
+    _user=require_ac_rms(),
 ):
     return ac_inbound_workflow.create_initial_qc(db, tenant, payload)
 
@@ -767,6 +828,7 @@ def create_inward_bag(
     payload: AcInwardBagCreate,
     db: Session = Depends(get_mes_core_db),
     tenant: TenantContext = Depends(_AC_RAW),
+    _user=require_ac_rms(),
 ):
     return ac_inbound_workflow.create_inward_bag(db, tenant, payload)
 
@@ -781,6 +843,7 @@ def delete_inward_bag(
     customer_order_id: UUID = Query(...),
     db: Session = Depends(get_mes_core_db),
     tenant: TenantContext = Depends(_AC_RAW),
+    _user=require_ac_rms(),
 ):
     return ac_inbound_workflow.delete_inward_bag(
         db, tenant, customer_order_id=customer_order_id, bag_id=bag_id
@@ -796,6 +859,7 @@ def feed_inward_bag_to_crusher(
     payload: AcInwardBagFeedCreate,
     db: Session = Depends(get_mes_core_db),
     tenant: TenantContext = Depends(_AC_RAW),
+    _user=require_ac_rms(),
 ):
     return ac_inbound_workflow.feed_inward_bag_to_crusher(db, tenant, payload)
 
@@ -821,7 +885,7 @@ def put_inbound_admin(
     payload: AcInboundAdminUpdate,
     db: Session = Depends(get_mes_core_db),
     tenant: TenantContext = Depends(_AC_MASTERS),
-    _user=require_tenant_admin(),
+    _user=require_nyra_services(),
 ):
     return ac_inbound_admin.save_inbound_admin(db, tenant, payload.model_dump())
 
@@ -836,6 +900,7 @@ def reconcile_inward_bags(
     payload: AcInwardBagReconcileCreate,
     db: Session = Depends(get_mes_core_db),
     tenant: TenantContext = Depends(_AC_RAW),
+    _user=require_ac_rms(),
 ):
     return ac_inbound_workflow.reconcile_inward_bags(db, tenant, payload)
 
@@ -850,6 +915,7 @@ def create_raw_material_weight_to_crusher(
     payload: AcWeightToCrusherCreate,
     db: Session = Depends(get_mes_core_db),
     tenant: TenantContext = Depends(_AC_RAW),
+    _user=require_ac_rms(),
 ):
     return ac_inbound_workflow.record_weight_to_crusher(db, tenant, payload)
 
@@ -864,6 +930,7 @@ def create_raw_material_grade_separation(
     payload: AcInwardGradeSeparationCreate,
     db: Session = Depends(get_mes_core_db),
     tenant: TenantContext = Depends(_AC_RAW),
+    _user=require_ac_rms(),
 ):
     return ac_inbound_workflow.create_inward_grade_separation(db, tenant, payload)
 
@@ -878,6 +945,7 @@ def create_raw_material_crusher_output(
     payload: AcCrusherOutputCreate,
     db: Session = Depends(get_mes_core_db),
     tenant: TenantContext = Depends(_AC_RAW),
+    _user=require_ac_rms(),
 ):
     return ac_inbound_workflow.create_crusher_output(db, tenant, payload)
 
@@ -904,8 +972,242 @@ def create_kiln_feed(
     payload: AcKilnFeedLotCreate,
     db: Session = Depends(get_mes_core_db),
     tenant: TenantContext = Depends(_AC_KILN_FEED),
+    _user=require_ac_activation_run(),
 ):
     return ac_adapter.create_kiln_feed_lot(db, tenant, payload)
+
+
+@router.get(
+    "/kiln-output",
+    response_model=AcKilnOutputListOut,
+    summary="Kiln output bags for a kiln",
+)
+def list_kiln_output(
+    kiln_resource_code: str = Query(..., min_length=1),
+    db: Session = Depends(get_mes_core_db),
+    tenant: TenantContext = Depends(_AC_KILN_FEED),
+):
+    return ac_adapter.list_kiln_output_bags(db, tenant, kiln_resource_code)
+
+
+@router.post(
+    "/kiln-output",
+    response_model=AcKilnOutputBagOut,
+    status_code=status.HTTP_201_CREATED,
+    summary="Add a kiln output bag",
+)
+def create_kiln_output(
+    payload: AcKilnOutputBagCreate,
+    db: Session = Depends(get_mes_core_db),
+    tenant: TenantContext = Depends(_AC_KILN_FEED),
+    _user=require_ac_activation_run(),
+):
+    return ac_adapter.create_kiln_output_bag(db, tenant, payload)
+
+
+@router.post(
+    "/kiln-feed-bag-qc",
+    response_model=AcKilnFeedBagQcOut,
+    summary="Save kiln feed quality on an RM outward bag",
+)
+def save_kiln_feed_bag_qc(
+    payload: AcKilnFeedBagQcCreate,
+    db: Session = Depends(get_mes_core_db),
+    tenant: TenantContext = Depends(_AC_KILN_FEED),
+    _user=require_ac_activation_qc(),
+):
+    return ac_inbound_workflow.save_kiln_feed_bag_qc(db, tenant, payload)
+
+
+@router.get(
+    "/kiln-output-bag-qc",
+    response_model=List[AcKilnOutputBagQcOut],
+    summary="Kiln output bags with quality captures",
+)
+def list_kiln_output_bag_qc(
+    kiln_resource_code: Optional[str] = Query(default=None),
+    db: Session = Depends(get_mes_core_db),
+    tenant: TenantContext = Depends(_AC_KILN_FEED),
+):
+    return ac_adapter.list_kiln_output_qc_bags(db, tenant, kiln_resource_code)
+
+
+@router.post(
+    "/kiln-output-bag-qc",
+    response_model=AcKilnOutputBagQcOut,
+    summary="Save kiln output quality on a kiln output bag",
+)
+def save_kiln_output_bag_qc(
+    payload: AcKilnOutputBagQcCreate,
+    db: Session = Depends(get_mes_core_db),
+    tenant: TenantContext = Depends(_AC_KILN_FEED),
+    _user=require_ac_activation_qc(),
+):
+    return ac_adapter.save_kiln_output_bag_qc(db, tenant, payload)
+
+
+@router.get(
+    "/destoning",
+    response_model=AcDestoningStateOut,
+    summary="Destoning loader and kiln output input bags",
+)
+def destoning_state(
+    db: Session = Depends(get_mes_core_db),
+    tenant: TenantContext = Depends(_AC_KILN_FEED),
+):
+    return ac_adapter.get_destoning_state(db, tenant)
+
+
+@router.post(
+    "/destoning/load",
+    response_model=AcDestoningStateOut,
+    summary="Load a kiln output bag onto the de-stoner",
+)
+def destoning_load(
+    payload: AcDestoningLoadCreate,
+    db: Session = Depends(get_mes_core_db),
+    tenant: TenantContext = Depends(_AC_KILN_FEED),
+    _user=require_ac_activation_run(),
+):
+    return ac_adapter.load_destoning_bag(db, tenant, payload)
+
+
+@router.post(
+    "/destoning/unload",
+    response_model=AcDestoningStateOut,
+    summary="Remove a bag from the de-stoner",
+)
+def destoning_unload(
+    payload: AcDestoningLoadCreate,
+    db: Session = Depends(get_mes_core_db),
+    tenant: TenantContext = Depends(_AC_KILN_FEED),
+    _user=require_ac_activation_run(),
+):
+    return ac_adapter.unload_destoning_bag(db, tenant, payload)
+
+
+@router.post(
+    "/destoning/output",
+    response_model=AcDestoningStateOut,
+    summary="Create a destoning output bag",
+)
+def destoning_output(
+    payload: AcDestoningOutputCreate,
+    db: Session = Depends(get_mes_core_db),
+    tenant: TenantContext = Depends(_AC_KILN_FEED),
+    _user=require_ac_activation_run(),
+):
+    return ac_adapter.create_destoning_output_bag(db, tenant, payload)
+
+
+@router.get(
+    "/destoning-bag-qc",
+    response_model=List[AcDestoningBagQcOut],
+    summary="Destoning output bags with quality captures",
+)
+def list_destoning_bag_qc(
+    db: Session = Depends(get_mes_core_db),
+    tenant: TenantContext = Depends(_AC_KILN_FEED),
+):
+    return ac_adapter.list_destoning_qc_bags(db, tenant)
+
+
+@router.post(
+    "/destoning-bag-qc",
+    response_model=AcDestoningBagQcOut,
+    summary="Save destoning quality on a DS bag",
+)
+def save_destoning_bag_qc(
+    payload: AcDestoningBagQcCreate,
+    db: Session = Depends(get_mes_core_db),
+    tenant: TenantContext = Depends(_AC_KILN_FEED),
+    _user=require_ac_activation_qc(),
+):
+    return ac_adapter.save_destoning_bag_qc(db, tenant, payload)
+
+
+@router.get(
+    "/post-activation/quality",
+    response_model=AcPostActivationQualityOut,
+    summary="Post-activation quality bags by process",
+)
+def post_activation_quality(
+    db: Session = Depends(get_mes_core_db),
+    tenant: TenantContext = Depends(_AC_KILN_FEED),
+):
+    return ac_adapter.list_post_activation_quality(db, tenant)
+
+
+@router.post(
+    "/post-activation/quality",
+    response_model=AcPostActivationQualityBagOut,
+    summary="Save post-activation bag quality and next destination",
+)
+def save_post_activation_quality(
+    payload: AcPostActivationQualitySave,
+    db: Session = Depends(get_mes_core_db),
+    tenant: TenantContext = Depends(_AC_KILN_FEED),
+    _user=require_ac_post_qc(),
+):
+    return ac_adapter.save_post_activation_quality(db, tenant, payload)
+
+
+@router.get(
+    "/post-activation/{process}",
+    response_model=AcPostActivationStateOut,
+    summary="Post-activation live loader for destoning output bags",
+)
+def post_activation_state(
+    process: str,
+    db: Session = Depends(get_mes_core_db),
+    tenant: TenantContext = Depends(_AC_KILN_FEED),
+):
+    return ac_adapter.get_post_activation_state(db, tenant, process)
+
+
+@router.post(
+    "/post-activation/{process}/load",
+    response_model=AcPostActivationStateOut,
+    summary="Load a destoning bag onto a post-activation process",
+)
+def post_activation_load(
+    process: str,
+    payload: AcPostActivationLoadCreate,
+    db: Session = Depends(get_mes_core_db),
+    tenant: TenantContext = Depends(_AC_KILN_FEED),
+    _user=require_ac_post_run(),
+):
+    return ac_adapter.load_post_activation_bag(db, tenant, process, payload)
+
+
+@router.post(
+    "/post-activation/{process}/unload",
+    response_model=AcPostActivationStateOut,
+    summary="Unload a destoning bag from a post-activation process",
+)
+def post_activation_unload(
+    process: str,
+    payload: AcPostActivationLoadCreate,
+    db: Session = Depends(get_mes_core_db),
+    tenant: TenantContext = Depends(_AC_KILN_FEED),
+    _user=require_ac_post_run(),
+):
+    return ac_adapter.unload_post_activation_bag(db, tenant, process, payload)
+
+
+@router.post(
+    "/post-activation/{process}/output",
+    response_model=AcPostActivationStateOut,
+    summary="Create a post-activation output bag with grade and weight",
+)
+def post_activation_output(
+    process: str,
+    payload: AcPostActivationOutputCreate,
+    db: Session = Depends(get_mes_core_db),
+    tenant: TenantContext = Depends(_AC_KILN_FEED),
+    _user=require_ac_post_run(),
+):
+    return ac_adapter.create_post_activation_output_bag(db, tenant, process, payload)
 
 
 @router.get(
@@ -922,11 +1224,11 @@ def kiln_feed_orders(
 
 @router.get(
     "/kiln-parameters",
-    response_model=List[OperationExecutionOut],
-    summary="Hourly kiln parameters via operation execution records",
+    response_model=List[AcKilnParameterReadingOut],
+    summary="Kiln parameter readings with timestamp (not lot-scoped)",
 )
 def kiln_parameters(
-    lot_code: Optional[str] = Query(None, description="Filter by lot code"),
+    lot_code: Optional[str] = Query(None, description="Unused — readings are kiln-scoped"),
     db: Session = Depends(get_mes_core_db),
     tenant: TenantContext = Depends(_AC_KILN_PARAMS),
 ):
@@ -935,14 +1237,15 @@ def kiln_parameters(
 
 @router.post(
     "/kiln-parameters",
-    response_model=OperationExecutionOut,
+    response_model=AcKilnParameterReadingOut,
     status_code=status.HTTP_201_CREATED,
-    summary="Record hourly kiln parameter readings",
+    summary="Record kiln parameter readings with timestamp",
 )
 def create_kiln_parameters(
     payload: AcKilnParametersCreate,
     db: Session = Depends(get_mes_core_db),
     tenant: TenantContext = Depends(_AC_KILN_PARAMS),
+    _user=require_ac_activation_run(),
 ):
     try:
         return ac_adapter.create_kiln_parameters(db, tenant, payload)
@@ -972,6 +1275,7 @@ def create_screening(
     payload: AcScreeningCreate,
     db: Session = Depends(get_mes_core_db),
     tenant: TenantContext = Depends(_AC_SCREENING),
+    _user=require_ac_post_run(),
 ):
     try:
         return ac_adapter.create_screening_record(db, tenant, payload)
@@ -989,6 +1293,7 @@ def create_grade_separation(
     payload: AcGradeSeparationCreate,
     db: Session = Depends(get_mes_core_db),
     tenant: TenantContext = Depends(_AC_SCREENING),
+    _user=require_ac_post_run(),
 ):
     try:
         return ac_adapter.create_grade_separation_record(db, tenant, payload)
@@ -1018,6 +1323,7 @@ def create_quality_testing(
     payload: AcQualityTestCreate,
     db: Session = Depends(get_mes_core_db),
     tenant: TenantContext = Depends(_AC_QC),
+    _user=require_ac_quality(),
 ):
     return ac_adapter.create_quality_test(db, tenant, payload)
 
@@ -1058,3 +1364,54 @@ def knowledge_graph_triples(
     tenant: TenantContext = Depends(_AC_KG),
 ):
     return ac_adapter.list_knowledge_graph_triples(db, tenant, limit=limit)
+
+
+@router.get(
+    "/users/roles",
+    response_model=AcAssignableRolesOut,
+    summary="MES roles the signed-in administrator may assign",
+)
+def ac_assignable_user_roles(
+    tenant: TenantContext = Depends(get_tenant_context),
+    user: UserContext = require_plant_admin(),
+):
+    return AcAssignableRolesOut(
+        items=ac_users.assignable_roles_for_actor(user),
+        login_suffix=ac_users.login_suffix_for_tenant(tenant.tenant_code),
+    )
+
+
+@router.get(
+    "/users",
+    response_model=List[AcTenantUserOut],
+    summary="Users with access to this plant",
+)
+def ac_list_users(
+    db: Session = Depends(get_mes_core_db),
+    tenant: TenantContext = Depends(get_tenant_context),
+    _user: UserContext = require_plant_admin(),
+):
+    return ac_users.list_tenant_users(db, tenant)
+
+
+@router.post(
+    "/users",
+    response_model=AcTenantUserCreateResponse,
+    status_code=status.HTTP_201_CREATED,
+    summary="Create a plant user (Administrator)",
+)
+def ac_create_user(
+    payload: AcTenantUserCreate,
+    db: Session = Depends(get_mes_core_db),
+    tenant: TenantContext = Depends(get_tenant_context),
+    user: UserContext = require_plant_admin(),
+):
+    return ac_users.create_tenant_user(
+        db,
+        tenant,
+        user,
+        username=payload.username,
+        email=payload.email,
+        display_name=payload.display_name,
+        role_code=payload.role_code,
+    )

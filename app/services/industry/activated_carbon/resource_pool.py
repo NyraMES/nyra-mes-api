@@ -130,13 +130,19 @@ def claim_kiln_for_lot(
     kiln_code: str,
     *,
     lot_code: str,
+    share: bool = False,
 ) -> None:
-    """Reserve a kiln when a lot is charged."""
+    """Reserve a kiln when a lot is charged. share=True allows more bags/lots in the same kiln."""
     code = (kiln_code or "").strip()
     if not code:
         return
-    assert_resources_available(db, tenant, lot_code=lot_code, machine_code=code)
     repo = _repo(db, tenant)
+    if share:
+        equipment, resource = _resource_for_machine(repo, code)
+        if not equipment and not resource:
+            raise ValidationError(f"Kiln resource '{code}' was not found")
+    else:
+        assert_resources_available(db, tenant, lot_code=lot_code, machine_code=code)
     rec = _mark_machine_in_use(
         repo, code, execution_code=f"kiln:{lot_code}", lot_code=lot_code
     )

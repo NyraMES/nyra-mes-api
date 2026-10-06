@@ -147,6 +147,9 @@ class ResourceOut(MesCoreModel):
     resource_name: str
     resource_type: str
     status: str
+    station: Optional[str] = None
+    unit_count: Optional[int] = None
+    headcount: Optional[int] = None
     created_at: Optional[datetime] = None
 
 
@@ -155,6 +158,9 @@ class ResourceCreate(BaseModel):
     resource_name: str = Field(..., min_length=1, max_length=256)
     resource_type: str = Field(..., min_length=1, max_length=64)
     status: str = "ACTIVE"
+    station: Optional[str] = Field(None, max_length=64)
+    unit_count: Optional[int] = Field(None, ge=1)
+    headcount: Optional[int] = Field(None, ge=1)
 
 
 class EquipmentOut(MesCoreModel):
@@ -526,6 +532,14 @@ class ProductionLotOut(MesCoreModel):
     lot_quantity: Decimal
     status: str
     created_at: Optional[datetime] = None
+    metadata: Optional[dict[str, Any]] = None
+    kiln_resource_code: Optional[str] = None
+    charged_at: Optional[str] = None
+    crusher_grade: Optional[str] = None
+    crusher_bag_code: Optional[str] = None
+    crusher_outward_bags: list[Any] = Field(default_factory=list)
+    kiln_feed_events: list[Any] = Field(default_factory=list)
+    kiln_loaded_kg: Optional[Decimal] = None
 
 
 class ProductionLotSplitItem(BaseModel):
@@ -781,6 +795,9 @@ class AcPlantResourceOut(BaseModel):
     resource_name: str
     resource_type: str
     status: str
+    station: Optional[str] = None
+    unit_count: Optional[int] = None
+    headcount: Optional[int] = None
     equipment_id: Optional[UUID] = None
     equipment_code: Optional[str] = None
     equipment_name: Optional[str] = None
@@ -890,6 +907,8 @@ class AcRawMaterialQcOut(BaseModel):
     inbound_prep_complete: bool = False
     next_inbound_step: Optional[str] = None
     next_inbound_operation_code: Optional[str] = None
+    lab_denied: bool = False
+    lab_remarks: Optional[str] = None
 
 
 class AcInboundStepStatusOut(BaseModel):
@@ -1002,6 +1021,7 @@ class AcCrusherOutputOut(AcInboundWorkflowOut):
 class AcInwardBagCreate(BaseModel):
     customer_order_id: UUID
     grade: Optional[str] = Field(None, max_length=128)
+    rotary: Optional[str] = Field(None, max_length=64)
     weight_kg: Decimal = Field(..., gt=0)
     label: Optional[str] = Field(None, max_length=128)
 
@@ -1012,11 +1032,14 @@ class AcInwardBagOut(BaseModel):
     customer_order_id: UUID
     order_code: str
     grade: Optional[str] = None
+    rotary: Optional[str] = None
     weight_kg: Decimal
     label: Optional[str] = None
     status: str = "REGISTERED"
     created_at: Optional[str] = None
     fed_at: Optional[str] = None
+    created_by: Optional[str] = None
+    kiln_feed_qc: Optional[dict[str, Any]] = None
 
 
 class AcInwardBagReconcileCreate(BaseModel):
@@ -1095,11 +1118,205 @@ class AcKilnFeedLotCreate(BaseModel):
     lot_quantity: Optional[Decimal] = Field(None, gt=0)
     lot_code: Optional[str] = Field(None, max_length=64)
     kiln_resource_code: Optional[str] = Field(None, max_length=64)
+    bag_code: Optional[str] = Field(None, max_length=64)
+    quantity_kg: Optional[Decimal] = Field(None, gt=0)
     status: str = "IN_PROGRESS"
 
 
+class AcKilnOutputBagCreate(BaseModel):
+    kiln_resource_code: str = Field(..., max_length=64)
+    quantity_kg: Decimal = Field(..., gt=0)
+    lot_code: Optional[str] = Field(None, max_length=64)
+
+
+class AcKilnOutputBagOut(BaseModel):
+    bag_code: str
+    quantity_kg: Decimal
+    kiln_resource_code: str
+    lot_code: Optional[str] = None
+    created_at: Optional[str] = None
+
+
+class AcKilnOutputListOut(BaseModel):
+    kiln_resource_code: str
+    bags: list[AcKilnOutputBagOut] = Field(default_factory=list)
+    bag_count: int = 0
+    total_kg: Decimal = Decimal("0")
+
+
+class AcKilnFeedBagQcCreate(BaseModel):
+    bag_code: str = Field(..., min_length=1, max_length=128)
+    customer_order_id: Optional[UUID] = None
+    values: dict[str, Any] = Field(default_factory=dict)
+    user_id: Optional[str] = Field(None, max_length=128)
+    lot_code: Optional[str] = Field(None, max_length=64)
+
+
+class AcKilnFeedBagQcOut(BaseModel):
+    bag_code: str
+    customer_order_id: UUID
+    order_code: str
+    weight_kg: Decimal
+    grade: Optional[str] = None
+    created_at: Optional[str] = None
+    user_id: Optional[str] = None
+    values: dict[str, Any] = Field(default_factory=dict)
+    saved_at: Optional[str] = None
+
+
+class AcKilnOutputBagQcCreate(BaseModel):
+    bag_code: str = Field(..., min_length=1, max_length=128)
+    kiln_resource_code: Optional[str] = Field(None, max_length=64)
+    values: dict[str, Any] = Field(default_factory=dict)
+    user_id: Optional[str] = Field(None, max_length=128)
+    lot_code: Optional[str] = Field(None, max_length=64)
+
+
+class AcKilnOutputBagQcOut(BaseModel):
+    bag_code: str
+    kiln_resource_code: str
+    quantity_kg: Decimal
+    lot_code: Optional[str] = None
+    created_at: Optional[str] = None
+    user_id: Optional[str] = None
+    values: dict[str, Any] = Field(default_factory=dict)
+    saved_at: Optional[str] = None
+
+
+class AcDestoningBagOut(BaseModel):
+    bag_code: str
+    quantity_kg: Decimal
+    kiln_resource_code: Optional[str] = None
+    lot_code: Optional[str] = None
+    created_at: Optional[str] = None
+    input_bag_codes: list[str] = Field(default_factory=list)
+
+
+class AcDestoningKilnGroupOut(BaseModel):
+    kiln_resource_code: str
+    kiln_name: str
+    bags: list[AcDestoningBagOut] = Field(default_factory=list)
+
+
+class AcDestoningLoadEventOut(BaseModel):
+    bag_code: Optional[str] = None
+    lot_code: Optional[str] = None
+    kg: Decimal = Decimal("0")
+    loaded_at: Optional[str] = None
+    kiln_resource_code: Optional[str] = None
+
+
+class AcDestoningStateOut(BaseModel):
+    kilns: list[AcDestoningKilnGroupOut] = Field(default_factory=list)
+    loaded: list[AcDestoningBagOut] = Field(default_factory=list)
+    loaded_kg: Decimal = Decimal("0")
+    loader_count: int = 0
+    loader_capacity: int = 6
+    output_bags: list[AcDestoningBagOut] = Field(default_factory=list)
+    load_events: list[AcDestoningLoadEventOut] = Field(default_factory=list)
+
+
+class AcDestoningLoadCreate(BaseModel):
+    bag_code: str = Field(..., min_length=1, max_length=128)
+
+
+class AcDestoningOutputCreate(BaseModel):
+    quantity_kg: Decimal = Field(..., gt=0)
+    lot_code: Optional[str] = Field(None, max_length=64)
+    bag_code: Optional[str] = Field(None, max_length=128)
+
+
+class AcDestoningBagQcCreate(BaseModel):
+    bag_code: str = Field(..., min_length=1, max_length=128)
+    values: dict[str, Any] = Field(default_factory=dict)
+    user_id: Optional[str] = Field(None, max_length=128)
+    copy_from_bag_code: Optional[str] = Field(None, max_length=128)
+
+
+class AcDestoningBagQcOut(BaseModel):
+    bag_code: str
+    quantity_kg: Decimal
+    lot_code: Optional[str] = None
+    created_at: Optional[str] = None
+    user_id: Optional[str] = None
+    input_bag_codes: list[str] = Field(default_factory=list)
+    values: dict[str, Any] = Field(default_factory=dict)
+    saved_at: Optional[str] = None
+
+
+class AcPostActivationBagOut(BaseModel):
+    bag_code: str
+    quantity_kg: Decimal
+    grade: Optional[str] = None
+    lot_code: Optional[str] = None
+    created_at: Optional[str] = None
+    loaded_at: Optional[str] = None
+    input_bag_codes: list[str] = Field(default_factory=list)
+    process: Optional[str] = None
+
+
+class AcPostActivationLoadEventOut(BaseModel):
+    bag_code: Optional[str] = None
+    lot_code: Optional[str] = None
+    kg: Decimal = Decimal("0")
+    loaded_at: Optional[str] = None
+    process: Optional[str] = None
+
+
+class AcPostActivationStateOut(BaseModel):
+    process: str
+    process_label: str
+    available: list[AcPostActivationBagOut] = Field(default_factory=list)
+    loaded: list[AcPostActivationBagOut] = Field(default_factory=list)
+    loaded_kg: Decimal = Decimal("0")
+    loader_count: int = 0
+    loader_capacity: int = 6
+    output_bags: list[AcPostActivationBagOut] = Field(default_factory=list)
+    load_events: list[AcPostActivationLoadEventOut] = Field(default_factory=list)
+
+
+class AcPostActivationLoadCreate(BaseModel):
+    bag_code: str = Field(..., min_length=1, max_length=128)
+
+
+class AcPostActivationOutputCreate(BaseModel):
+    quantity_kg: Decimal = Field(..., gt=0)
+    grade: str = Field(..., min_length=1, max_length=128)
+    lot_code: Optional[str] = Field(None, max_length=64)
+
+
+class AcPostActivationQualityBagOut(BaseModel):
+    bag_code: str
+    quantity_kg: Decimal
+    grade: Optional[str] = None
+    lot_code: Optional[str] = None
+    created_at: Optional[str] = None
+    process: str
+    values: dict[str, Any] = Field(default_factory=dict)
+    saved_at: Optional[str] = None
+
+
+class AcPostActivationQualitySectionOut(BaseModel):
+    process: str
+    process_label: str
+    bags: list[AcPostActivationQualityBagOut] = Field(default_factory=list)
+
+
+class AcPostActivationQualityOut(BaseModel):
+    sections: list[AcPostActivationQualitySectionOut] = Field(default_factory=list)
+
+
+class AcPostActivationQualitySave(BaseModel):
+    process: str = Field(..., min_length=1, max_length=64)
+    bag_code: str = Field(..., min_length=1, max_length=128)
+    values: dict[str, Any] = Field(default_factory=dict)
+    user_id: Optional[str] = Field(None, max_length=128)
+
+
 class AcKilnParametersCreate(BaseModel):
-    production_lot_id: UUID
+    kiln_resource_code: Optional[str] = Field(None, max_length=64)
+    production_lot_id: Optional[UUID] = None
+    recorded_at: Optional[datetime] = None
     zone1_temp_c: Optional[float] = None
     zone2_temp_c: Optional[float] = None
     steam_flow_kg_h: Optional[float] = None
@@ -1107,6 +1324,13 @@ class AcKilnParametersCreate(BaseModel):
     o2_pct: Optional[float] = None
     kiln_temp_c: Optional[float] = None
     pressure_bar: Optional[float] = None
+
+
+class AcKilnParameterReadingOut(BaseModel):
+    reading_id: str
+    kiln_resource_code: str
+    recorded_at: datetime
+    readings: dict[str, Any] = Field(default_factory=dict)
 
 
 class AcScreeningCreate(BaseModel):
@@ -1155,6 +1379,8 @@ class AcKilnStatusOut(BaseModel):
     status: str
     active_lot_code: Optional[str] = None
     active_lot_kg: Optional[Decimal] = None
+    loaded_kg: Optional[Decimal] = None
+    feed_events: list[Any] = Field(default_factory=list)
     last_reading_at: Optional[datetime] = None
 
 
@@ -1186,7 +1412,7 @@ class AcLotLineOut(BaseModel):
 
 
 class AcOpenLotOut(BaseModel):
-    """Open production lots for feasibility, kiln feed, and routing dropdowns."""
+    """Open production lots for kiln feed and execution."""
 
     production_lot_id: UUID
     order_code: Optional[str] = None
@@ -1197,6 +1423,12 @@ class AcOpenLotOut(BaseModel):
     feasibility_status: Optional[str] = None
     pipeline_stage: Optional[str] = None
     routing_complete: bool = False
+    kiln_resource_code: Optional[str] = None
+    charged_at: Optional[str] = None
+    kiln_live_status: Optional[str] = None
+    kiln_feed_events: list[Any] = Field(default_factory=list)
+    kiln_loaded_kg: Optional[Decimal] = None
+    metadata: Optional[dict[str, Any]] = None
 
 
 class AcActiveOrderOut(BaseModel):
@@ -1256,6 +1488,20 @@ class AcGradeStockOut(BaseModel):
     stocked_lot_count: int = 0
 
 
+class AcInStockBagOut(BaseModel):
+    """Destoning or post-activation bag whose destination is In Stock."""
+
+    bag_code: str
+    remaining_kg: Decimal
+    quantity_kg: Decimal
+    grade: Optional[str] = None
+    lot_code: Optional[str] = None
+    product_id: Optional[UUID] = None
+    product_code: Optional[str] = None
+    source: Optional[str] = None
+    created_at: Optional[str] = None
+
+
 class AcStockedLotOut(BaseModel):
     """Finished-goods lot ready for dispatch."""
 
@@ -1306,6 +1552,7 @@ class AcDispatchFromOrderCreate(BaseModel):
     customer_order_id: UUID
     quantity_kg: Decimal = Field(..., gt=0)
     lot_code: Optional[str] = Field(None, max_length=64)
+    bag_code: Optional[str] = Field(None, max_length=128)
     grade_code: Optional[str] = Field(None, max_length=64)
     vehicle_number: Optional[str] = Field(None, max_length=64)
     transporter_name: Optional[str] = Field(None, max_length=128)
@@ -1507,3 +1754,38 @@ class ChemDashboardOut(BaseModel):
     reactor_parameter_definitions: list[ChemReactorParameterDefinition] = Field(
         default_factory=list
     )
+
+
+class AcAssignableRoleOut(BaseModel):
+    role_code: str
+    label: str
+
+
+class AcAssignableRolesOut(BaseModel):
+    items: list[AcAssignableRoleOut] = Field(default_factory=list)
+    login_suffix: str = "@grcarbons"
+
+
+class AcTenantUserOut(BaseModel):
+    user_id: UUID
+    username: Optional[str] = None
+    email: str
+    display_name: Optional[str] = None
+    role_code: str
+    role_label: str
+    is_active: bool = True
+    cognito_linked: bool = False
+    created_at: Optional[datetime] = None
+
+
+class AcTenantUserCreate(BaseModel):
+    username: str = Field(..., min_length=1, max_length=128)
+    email: str = Field(..., min_length=3, max_length=320)
+    display_name: Optional[str] = Field(None, max_length=256)
+    role_code: str = Field(..., min_length=3, max_length=64)
+
+
+class AcTenantUserCreateResponse(AcTenantUserOut):
+    temporary_password: Optional[str] = None
+    cognito_provisioned: bool = False
+    cognito_message: Optional[str] = None

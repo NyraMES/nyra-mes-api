@@ -9,7 +9,13 @@ from uuid import UUID
 from sqlalchemy.orm import Session
 
 from app.core.tenant_context import TenantContext
-from app.models.mes_core import OperationExecution, ParameterReading, ProductionLot, RoutingOperation
+from app.models.mes_core import (
+    OperationExecution,
+    ParameterReading,
+    ProductionLot,
+    RoutingOperation,
+    TripleStoreStaging,
+)
 from app.schemas.mes_core.schemas import TripleCreate
 from app.services.industry.activated_carbon.lot_routing import resolve_raw_material_type_for_lot
 from app.services.mes_core import entities as mes_core_entities
@@ -107,6 +113,36 @@ def filter_param_defs(
     return out
 
 
+def stage_triple(db: Session, tenant: TenantContext, payload: TripleCreate) -> None:
+    """Queue a triple in the current transaction without committing."""
+    repo = TenantRepository(db, tenant)
+    repo.add(
+        TripleStoreStaging(
+            subject_uri=payload.subject_uri,
+            predicate_uri=payload.predicate_uri,
+            object_uri=payload.object_uri,
+            object_literal=payload.object_literal,
+            object_datatype=payload.object_datatype,
+            source_table=payload.source_table,
+            source_id=payload.source_id,
+            export_status=payload.export_status,
+        )
+    )
+
+
+def _write_triple(
+    db: Session,
+    tenant: TenantContext,
+    payload: TripleCreate,
+    *,
+    flush_only: bool,
+) -> None:
+    if flush_only:
+        stage_triple(db, tenant, payload)
+        return
+    mes_core_entities.create_triple(db, tenant, payload)
+
+
 def stage_captures_for_values(
     db: Session,
     tenant: TenantContext,
@@ -120,6 +156,7 @@ def stage_captures_for_values(
     used_at: Optional[str] = None,
     operation_code: Optional[str] = None,
     only_masters_keys: bool = False,
+    flush_only: bool = False,
 ) -> int:
     """Write capture triples for non-null values. Returns number of literal triples staged."""
     if not subject_uri or not values:
@@ -146,7 +183,7 @@ def stage_captures_for_values(
         value = values.get(key)
         if value is None:
             continue
-        mes_core_entities.create_triple(
+        _write_triple(
             db,
             tenant,
             TripleCreate(
@@ -158,6 +195,7 @@ def stage_captures_for_values(
                 source_table=source_table,
                 source_id=source_id,
             ),
+            flush_only=flush_only,
         )
         staged_keys.add(key)
         count += 1
@@ -171,7 +209,7 @@ def stage_captures_for_values(
     for field, value in values.items():
         if value is None or field in staged_keys or field in _SKIP_VALUE_KEYS:
             continue
-        mes_core_entities.create_triple(
+        _write_triple(
             db,
             tenant,
             TripleCreate(
@@ -183,6 +221,7 @@ def stage_captures_for_values(
                 source_table=source_table,
                 source_id=source_id,
             ),
+            flush_only=flush_only,
         )
         count += 1
 

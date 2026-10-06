@@ -10,6 +10,7 @@ from app.core.auth import (
     UserContext,
     assert_user_may_access_tenant,
     _tenant_code_from_claims,
+    resolve_tenant_code,
 )
 from app.core.config import settings
 from app.core.exceptions import ForbiddenError
@@ -20,6 +21,16 @@ from app.core.tenant_aliases import canonical_tenant_code, canonical_workspace_c
 def test_tenant_code_from_claims_prefers_custom_attribute():
     claims = {"custom:tenant_code": "SAM_CARBONS", "tenant_code": "OTHER"}
     assert _tenant_code_from_claims(claims) == "SAM_CARBONS"
+
+
+def test_resolve_tenant_code_from_username_when_claim_missing():
+    assert resolve_tenant_code({}, "admin@grcarbons", []) == "GR_CARBONS"
+
+
+def test_resolve_tenant_code_from_tenant_group():
+    assert resolve_tenant_code({}, "person@company.com", ["MES_Admin", "TENANT_GR_CARBONS"]) == (
+        "GR_CARBONS"
+    )
 
 
 def test_assert_user_may_access_tenant_allows_match(monkeypatch):

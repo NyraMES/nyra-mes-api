@@ -19,7 +19,7 @@ from app.models.mes_core import (
 from app.services.industry.activated_carbon.routing_helpers import _is_schedule_row
 from app.services.industry.activated_carbon.lot_routing import load_ac_lot_routing
 from app.services.mes_core.base import TenantRepository
-from app.services.mes_core.feasibility import is_ready_for_scheduling, run_feasibility_check
+from app.services.mes_core.feasibility import run_feasibility_check
 from app.services.mes_core.ids import resolve_business_code
 from app.services.industry.activated_carbon.execution_enrich import (
     enrich_routing_plan_operations,
@@ -147,11 +147,6 @@ def get_lot_routing_plan(db: Session, tenant: TenantContext, lot_code: str) -> d
 
 def generate_lot_route(db: Session, tenant: TenantContext, lot_code: str) -> dict[str, Any]:
     """Materialise routing operations as shop-floor work orders (mes_core executions)."""
-    if not is_ready_for_scheduling(db, tenant, lot_code):
-        raise WorkflowError(
-            "Lot is not feasibility-ready — run Feasibility Gate for this lot first",
-            details={"lot_id": lot_code},
-        )
     repo = _repo(db, tenant)
     lot = repo.get_by_code(ProductionLot, ProductionLot.lot_code, lot_code)
     _product, routing, operations, _qty = load_ac_lot_routing(db, tenant, lot)

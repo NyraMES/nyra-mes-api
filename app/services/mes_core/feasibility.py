@@ -51,6 +51,8 @@ _ROUTING_DONE_LOT_STATUSES = frozenset(
 
 
 def is_ready_for_scheduling(db: Session, tenant: TenantContext, lot_code: str) -> bool:
+    if (getattr(tenant, "industry_template_code", None) or "").upper() == "ACTIVATED_CARBON":
+        return True
     gate = get_feasibility_for_lot(db, tenant, lot_code)
     status = (gate.overall_status or "").upper()
     if status in _READY_STATUSES:

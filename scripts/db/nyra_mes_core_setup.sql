@@ -165,7 +165,19 @@ CREATE TABLE core.user_tenant_access (
     updated_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     CONSTRAINT uq_user_tenant UNIQUE (user_id, tenant_id),
     CONSTRAINT chk_user_role CHECK (
-        role_code IN ('MES_Admin', 'MES_Planner', 'MES_Operator', 'MES_Quality', 'MES_Viewer')
+        role_code IN (
+            'MES_SuperAdmin',
+            'MES_Admin',
+            'MES_Manager',
+            'MES_Planner',
+            'MES_Operator',
+            'MES_Quality',
+            'MES_RMS',
+            'MES_Activation',
+            'MES_PostActivation',
+            'MES_Viewer',
+            'MES_Demo'
+        )
     )
 );
 

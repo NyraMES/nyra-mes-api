@@ -560,10 +560,18 @@ def _rail_step_status(meta: dict, exec_key: str, fallback: dict | None) -> tuple
     row = exec_map.get(exec_key)
     if isinstance(row, dict):
         status = str(row.get("status") or "").upper()
+        decision = str(row.get("qc_decision") or row.get("qc_status") or "").upper()
+        if exec_key == "IN-LAB" and (
+            meta.get("inbound_lab_denied")
+            or decision in ("DENY", "FAIL", "REJECTED", "DENIED")
+        ):
+            return "DENIED", row.get("completed_at") or row.get("qc_at")
         if status == "COMPLETED":
             return "COMPLETED", row.get("completed_at") or row.get("qc_at") or row.get("reconciled_at")
     if isinstance(fallback, dict):
         status = str(fallback.get("status") or fallback.get("qc_status") or "").upper()
+        if status in ("FAIL", "QC_FAILED", "REJECTED", "DENIED"):
+            return "DENIED", fallback.get("completed_at") or fallback.get("qc_at")
         if status in ("COMPLETED", "RECONCILED", "PASS", "QC_PASSED", "APPROVED"):
             return (
                 "COMPLETED",

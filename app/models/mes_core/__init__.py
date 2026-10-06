@@ -19,12 +19,14 @@ from app.models.mes_core.master import (
     RoutingOperationParameter,
 )
 from app.models.mes_core.platform import (
+    AppUser,
     Capability,
     IndustryCapability,
     IndustryTemplate,
     ProjectWorkspace,
     Tenant,
     UserProjectAccess,
+    UserTenantAccess,
 )
 from app.models.mes_core.transaction import (
     CustomerOrder,
@@ -36,6 +38,7 @@ from app.models.mes_core.transaction import (
 )
 
 __all__ = [
+    "AppUser",
     "Capability",
     "Customer",
     "Supplier",
@@ -62,4 +65,5 @@ __all__ = [
     "Tenant",
     "TripleStoreStaging",
     "UserProjectAccess",
+    "UserTenantAccess",
 ]

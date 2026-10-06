@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+from decimal import Decimal
 from typing import Any
 
 from sqlalchemy.orm import Session
 from sqlalchemy.orm.attributes import flag_modified
 
+from app.core.exceptions import ValidationError
 from app.core.tenant_context import TenantContext
 from app.models.mes_core.platform import Tenant
 
@@ -18,13 +20,14 @@ DEFAULT_ROTARIES = (
 )
 
 DEFAULT_OUTWARD_SPLITS = (
-    {"key": "minus20_1st_rotary_a", "label": "-20 1st Stage - Rotary A"},
-    {"key": "grade_1st_rotary_a", "label": "Grade 1st stage - Rotary A"},
-    {"key": "minus20_2nd_rotary_b", "label": "-20 2nd Stage - Rotary B"},
-    {"key": "grade_2nd_rotary_b", "label": "Grade 2nd stage - Rotary B"},
-    {"key": "stones", "label": "Stones"},
+    {"key": "minus20_1st", "label": "-20 1st Stage"},
+    {"key": "grade_1st", "label": "Grade 1st Stage"},
     {"key": "unburnt", "label": "Unburnt"},
+    {"key": "stones", "label": "Stones"},
 )
+
+OUTWARD_GRADE_LABELS = tuple(row["label"] for row in DEFAULT_OUTWARD_SPLITS)
+OUTWARD_BYPRODUCT_GRADES = frozenset({"Unburnt", "Stones"})
 
 
 def default_inbound_admin() -> dict[str, Any]:
@@ -114,3 +117,77 @@ def rotary_names(db: Session, tenant: TenantContext) -> tuple[str, ...]:
 
 def outward_split_labels(db: Session, tenant: TenantContext) -> tuple[str, ...]:
     return tuple(row["label"] for row in get_inbound_admin(db, tenant)["outward_splits"])
+
+
+def outward_grade_labels(db: Session, tenant: TenantContext) -> tuple[str, ...]:
+    labels = [row["label"] for row in get_inbound_admin(db, tenant)["outward_splits"]]
+    cleaned = [_canonical_outward_grade(label) for label in labels]
+    seen: list[str] = []
+    for label in cleaned:
+        if label and label not in seen:
+            seen.append(label)
+    return tuple(seen) or OUTWARD_GRADE_LABELS
+
+
+def _canonical_outward_grade(label: str) -> str:
+    raw = str(label or "").strip()
+    lower = raw.lower()
+    for suffix in (" - rotary a", " - rotary b"):
+        if lower.endswith(suffix):
+            raw = raw[: -len(suffix)].strip()
+            lower = raw.lower()
+            break
+    aliases = {
+        "-20 1st stage": "-20 1st Stage",
+        "-20 2nd stage": "-20 1st Stage",
+        "grade 1st stage": "Grade 1st Stage",
+        "grade 2nd stage": "Grade 1st Stage",
+        "unburnt": "Unburnt",
+        "stones": "Stones",
+    }
+    return aliases.get(lower, raw)
+
+
+def is_outward_byproduct(label: str) -> bool:
+    return _canonical_outward_grade(label) in OUTWARD_BYPRODUCT_GRADES
+
+
+def validate_outward_kg_within_inward(outward_kg, inward_kg) -> None:
+    """RO bag total cannot exceed gate-receipt our weight."""
+    out = Decimal(str(outward_kg or 0))
+    inn = Decimal(str(inward_kg or 0))
+    if out > inn + Decimal("0.001"):
+        raise ValidationError(
+            f"RMS outward total {out} KG cannot exceed inward weight {inn} KG."
+        )
+
+
+def validate_rm_outward_splits(cleaned: list[dict]) -> None:
+    """One rotary is enough: that rotary must have a grade value plus Stones and Unburnt."""
+    if not cleaned:
+        raise ValidationError("Enter RM outward split weights and bags.")
+    if any(not str(row.get("rotary") or "").strip() for row in cleaned):
+        raise ValidationError("Select Rotary A or Rotary B for every outward bag.")
+    by_rotary: dict[str, set[str]] = {}
+    for row in cleaned:
+        rotary = str(row.get("rotary") or "").strip()
+        by_rotary.setdefault(rotary, set()).add(
+            _canonical_outward_grade(row.get("grade_label") or "")
+        )
+    for grades in by_rotary.values():
+        has_value = any(grade and grade not in OUTWARD_BYPRODUCT_GRADES for grade in grades)
+        if has_value and "Unburnt" in grades and "Stones" in grades:
+            return
+    raise ValidationError(
+        "Choose Rotary A or Rotary B and add a grade value plus Stones and Unburnt on that rotary."
+    )
+
+
+def is_allowed_outward_grade(db: Session, tenant: TenantContext, label: str) -> bool:
+    raw = str(label or "").strip()
+    if not raw:
+        return False
+    allowed = set(outward_split_labels(db, tenant)) | set(OUTWARD_GRADE_LABELS)
+    if raw in allowed:
+        return True
+    return _canonical_outward_grade(raw) in { _canonical_outward_grade(item) for item in allowed }

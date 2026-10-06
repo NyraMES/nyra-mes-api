@@ -90,7 +90,14 @@ def _step_record(meta: dict, op: dict) -> dict:
     return {}
 
 
+def _is_lab_operation(op: dict) -> bool:
+    code = str(op.get("operation_code") or "").strip().upper()
+    return code == "IN-LAB" or code.startswith("IN-LAB")
+
+
 def inbound_step_completed(meta: dict, op: dict) -> bool:
+    if ac_inbound_workflow.lab_denied(meta) and _is_lab_operation(op):
+        return False
     row = _step_record(meta, op)
     return str(row.get("status") or "").upper() == "COMPLETED"
 
@@ -102,6 +109,8 @@ def _step_status_row(
     step = _normalize_step(op.get("process_step") or "")
     row = _step_record(meta, op)
     status = str(row.get("status") or "PENDING").upper()
+    if ac_inbound_workflow.lab_denied(meta) and _is_lab_operation(op):
+        status = "DENIED"
     completed_at = row.get("completed_at")
     return AcInboundStepStatusOut(
         process_step=step,
@@ -124,6 +133,8 @@ def mandatory_inbound_prep_complete(
     material_type: AcRawMaterialTypeOut,
     meta: dict,
 ) -> bool:
+    if ac_inbound_workflow.lab_denied(meta):
+        return False
     for op in resolve_inbound_operations(material_type):
         if not op.get("is_mandatory", True):
             continue
@@ -136,6 +147,8 @@ def next_inbound_operation(
     material_type: AcRawMaterialTypeOut,
     meta: dict,
 ) -> Optional[dict]:
+    if ac_inbound_workflow.lab_denied(meta):
+        return None
     for op in resolve_inbound_operations(material_type):
         if not inbound_step_completed(meta, op):
             return op
@@ -167,6 +180,10 @@ def assert_prior_inbound_steps_complete(
     meta: dict,
     target_op: dict,
 ) -> None:
+    if ac_inbound_workflow.lab_denied(meta) and not _is_lab_operation(target_op):
+        raise ValidationError(
+            "Lab denied this inward — it will not proceed to RMS, crusher, outward, or release."
+        )
     target_key = _step_storage_key(target_op)
     for op in resolve_inbound_operations(material_type):
         if _step_storage_key(op) == target_key:
@@ -291,21 +308,44 @@ def _apply_step_domain_rules(
     params: dict,
 ) -> None:
     code = (target_op.get("operation_code") or "").strip().upper()
-    if code == "IN-LAB" or (
-        _normalize_step(target_op.get("process_step")) == "SCREENING" and code.startswith("IN-LAB")
-    ):
+    if _is_lab_operation(target_op):
         decision = str(params.get("qc_decision") or params.get("qc_status") or "").upper()
+        remarks = str(
+            params.get("qc_remarks")
+            or params.get("remarks")
+            or params.get("operator_remarks")
+            or ""
+        ).strip()
         mapped = "PASS" if decision in ("APPROVE", "APPROVED", "PASS", "") else decision
         if mapped in ("DENY", "REJECT"):
             mapped = "FAIL"
+        if mapped == "FAIL" and not remarks:
+            raise ValidationError(
+                "Enter remarks when denying this inward. The record will stop here."
+            )
         meta["initial_qc"] = {
             "qc_status": mapped,
             "moisture_pct": params.get("moisture_pct"),
             "dust_pct": params.get("dust_pct"),
             "ad_value": params.get("ad_value"),
+            "remarks": remarks or None,
             "qc_at": datetime.now(timezone.utc).isoformat(),
             "source": "inbound_execution_lab",
         }
+        if mapped == "FAIL":
+            meta["inbound_lab_denied"] = True
+            meta.setdefault("raw_material_qc", {})
+            if isinstance(meta["raw_material_qc"], dict):
+                meta["raw_material_qc"] = {
+                    **meta["raw_material_qc"],
+                    "qc_status": "QC_FAILED",
+                    "operator_remarks": remarks,
+                    "qc_at": meta["initial_qc"]["qc_at"],
+                    "source": "inbound_execution_lab_deny",
+                }
+            order.status = "QC_FAILED"
+        else:
+            meta["inbound_lab_denied"] = False
         return
 
     if code == "IN-RMS-BAG":
@@ -383,33 +423,37 @@ def _apply_step_domain_rules(
 
     if code == "IN-RM-OUT":
         splits = params.get("outward_splits") or params.get("grade_splits") or []
-        allowed = ac_inbound_admin.outward_split_labels(db, tenant)
+        rotaries = ac_inbound_admin.rotary_names(db, tenant)
         cleaned = []
         for row in splits:
             if not isinstance(row, dict):
                 continue
             label = str(row.get("grade_label") or row.get("label") or "").strip()
+            rotary = str(row.get("rotary") or "").strip()
             qty = row.get("quantity_kg") or row.get("weight_kg")
             bag_code = row.get("bag_code")
             if not label or qty in (None, ""):
                 continue
-            if label not in allowed:
+            if not ac_inbound_admin.is_allowed_outward_grade(db, tenant, label):
                 raise ValidationError(f"Unknown outward split '{label}'.")
+            if rotary and rotary not in rotaries:
+                raise ValidationError(f"Unknown rotary '{rotary}'.")
             cleaned.append(
                 {
-                    "grade_label": label,
+                    "grade_label": ac_inbound_admin._canonical_outward_grade(label),
+                    "rotary": rotary or None,
                     "quantity_kg": str(qty),
                     "bag_code": bag_code,
                 }
             )
-        present = {row["grade_label"] for row in cleaned}
-        missing = [label for label in allowed if label not in present]
-        if missing:
-            raise ValidationError(
-                "Every outward grade needs a bag: " + ", ".join(missing)
-            )
         if not cleaned:
             raise ValidationError("Enter RM outward split weights and bags.")
+        ac_inbound_admin.validate_rm_outward_splits(cleaned)
+        _, received_kg = ac_inbound_workflow._require_inward_order(
+            db, tenant, order.customer_order_id
+        )
+        outward_total = sum(Decimal(str(row.get("quantity_kg") or 0)) for row in cleaned)
+        ac_inbound_admin.validate_outward_kg_within_inward(outward_total, received_kg)
         meta["grade_separation"] = {
             "status": "COMPLETED",
             "grade_splits": cleaned,
@@ -456,7 +500,8 @@ def complete_inbound_step(
     step = _normalize_step(target_op.get("process_step") or payload.process_step)
     storage_key = _step_storage_key(target_op)
 
-    if inbound_step_completed(meta, target_op):
+    prior_status = str(_step_record(meta, target_op).get("status") or "").upper()
+    if prior_status in ("COMPLETED", "DENIED"):
         raise ValidationError(
             f"Order '{order.order_code}' — step '{target_op.get('operation_name')}' is already recorded."
         )
@@ -464,12 +509,14 @@ def complete_inbound_step(
     assert_prior_inbound_steps_complete(material_type, meta, target_op)
 
     params = dict(payload.parameters or {})
+    _apply_step_domain_rules(db, tenant, order, meta, target_op, params)
     now_iso = datetime.now(timezone.utc).isoformat()
+    denied = _is_lab_operation(target_op) and ac_inbound_workflow.lab_denied(meta)
     record = {
         k: _json_val(v)
         for k, v in {
             **params,
-            "status": "COMPLETED",
+            "status": "DENIED" if denied else "COMPLETED",
             "completed_at": now_iso,
             "process_step": step,
             "operation_code": target_op.get("operation_code"),
@@ -480,8 +527,6 @@ def complete_inbound_step(
     exec_map = _inbound_execution_map(meta)
     exec_map[storage_key] = record
     meta["inbound_execution"] = exec_map
-
-    _apply_step_domain_rules(db, tenant, order, meta, target_op, params)
 
     if step == "CRUSHING":
         meta["raw_material_crush"] = {

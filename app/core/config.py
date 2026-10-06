@@ -79,6 +79,7 @@ class Settings:
     cognito_user_pool_id: str = os.getenv("COGNITO_USER_POOL_ID", "")
     cognito_app_client_id: str = os.getenv("COGNITO_APP_CLIENT_ID", "")
     auth_dev_user_email: str = os.getenv("AUTH_DEV_USER_EMAIL", "dev@localhost")
+    auth_dev_user_username: str = os.getenv("AUTH_DEV_USER_USERNAME", "nyraservices@grcarbons").strip()
     auth_dev_user_roles: List[str] = field(
         default_factory=lambda: _split_csv(
             os.getenv("AUTH_DEV_USER_ROLES", "MES_SuperAdmin")

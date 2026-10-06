@@ -20,18 +20,26 @@ _bearer = HTTPBearer(auto_error=False)
 # Cognito groups mapped to MES application roles.
 MES_SUPER_ADMIN = "MES_SuperAdmin"
 MES_ADMIN = "MES_Admin"
+MES_MANAGER = "MES_Manager"
 MES_PLANNER = "MES_Planner"
 MES_OPERATOR = "MES_Operator"
 MES_QUALITY = "MES_Quality"
+MES_RMS = "MES_RMS"
+MES_ACTIVATION = "MES_Activation"
+MES_POST_ACTIVATION = "MES_PostActivation"
 MES_VIEWER = "MES_Viewer"
 MES_DEMO = "MES_Demo"
 
 ALL_MES_ROLES: Set[str] = {
     MES_SUPER_ADMIN,
     MES_ADMIN,
+    MES_MANAGER,
     MES_PLANNER,
     MES_OPERATOR,
     MES_QUALITY,
+    MES_RMS,
+    MES_ACTIVATION,
+    MES_POST_ACTIVATION,
     MES_VIEWER,
     MES_DEMO,
 }
@@ -76,6 +84,34 @@ def _tenant_code_from_claims(claims: Dict[str, Any]) -> Optional[str]:
         if value is not None and str(value).strip():
             return str(value).strip()
     return None
+
+
+def _tenant_code_from_groups(groups: List[str]) -> Optional[str]:
+    """Group ``TENANT_<CODE>`` is always in the JWT (custom attributes often are not)."""
+    for raw in groups or []:
+        name = str(raw or "").strip()
+        if name.upper().startswith("TENANT_") and len(name) > 7:
+            return name[7:]
+    return None
+
+
+def _tenant_code_from_username(username: str) -> Optional[str]:
+    name = str(username or "").strip().lower()
+    if name.endswith("@grcarbons") or name.endswith("@grcarbons.com"):
+        return "GR_CARBONS"
+    return None
+
+
+def resolve_tenant_code(
+    claims: Dict[str, Any] | None = None,
+    username: str = "",
+    groups: List[str] | None = None,
+) -> Optional[str]:
+    return (
+        _tenant_code_from_claims(claims or {})
+        or _tenant_code_from_groups(groups or [])
+        or _tenant_code_from_username(username)
+    )
 
 
 # Demo playground tenants — any authenticated MES user may open these for industry previews.
@@ -140,8 +176,21 @@ class UserContext:
     def is_tenant_admin(self) -> bool:
         return bool(set(self.groups) & TENANT_ADMIN_ROLES)
 
+    def is_plant_admin(self) -> bool:
+        return MES_ADMIN in self.groups
+
+    def is_nyra_services(self) -> bool:
+        for raw in (self.username, self.email):
+            value = (raw or "").strip().lower()
+            if not value:
+                continue
+            local = value.split("@", 1)[0]
+            if local == "nyraservices":
+                return True
+        return False
+
     def has_any_role(self, allowed: Set[str]) -> bool:
-        if self.is_super_admin() or MES_ADMIN in self.groups:
+        if self.is_super_admin() or self.is_nyra_services():
             return True
         return bool(set(self.groups) & allowed)
 
@@ -226,20 +275,22 @@ def decode_cognito_token(token: str) -> UserContext:
         or claims.get("sub")
         or "user"
     )
+    group_list = [str(g) for g in groups]
     return UserContext(
         sub=str(claims.get("sub") or username),
         username=str(username),
         email=claims.get("email"),
-        tenant_code=_tenant_code_from_claims(claims),
-        groups=[str(g) for g in groups],
+        tenant_code=resolve_tenant_code(claims, str(username), group_list),
+        groups=group_list,
     )
 
 
 def _dev_user() -> UserContext:
     tenant = (settings.auth_dev_user_tenant_code or "").strip() or None
+    username = (settings.auth_dev_user_username or "").strip() or "nyraservices@grcarbons"
     return UserContext(
         sub="dev-user",
-        username="dev",
+        username=username,
         email=settings.auth_dev_user_email,
         tenant_code=tenant,
         groups=list(settings.auth_dev_user_roles),
@@ -318,5 +369,40 @@ def require_tenant_admin():
                 details={"required_roles": sorted(TENANT_ADMIN_ROLES), "your_roles": user.roles},
             )
         return user
+
+    return Depends(_dependency)
+
+
+def require_plant_admin():
+    """Users screen — Administrator may create plant users."""
+
+    def _dependency(user: UserContext = Depends(get_current_user)) -> UserContext:
+        if not settings.auth_enabled:
+            if user.is_plant_admin() or user.is_nyra_services():
+                return user
+            raise ForbiddenError(
+                "Only an Administrator may create users.",
+                details={"required_roles": [MES_ADMIN], "your_roles": user.roles},
+            )
+        if not user.is_plant_admin():
+            raise ForbiddenError(
+                "Only an Administrator may create users.",
+                details={"required_roles": [MES_ADMIN], "your_roles": user.roles},
+            )
+        return user
+
+    return Depends(_dependency)
+
+
+def require_nyra_services():
+    """Masters and routing — nyraservices only."""
+
+    def _dependency(user: UserContext = Depends(get_current_user)) -> UserContext:
+        if user.is_nyra_services():
+            return user
+        raise ForbiddenError(
+            "Only nyraservices@grcarbons may change Masters.",
+            details={"required_user": "nyraservices@grcarbons", "your_user": user.username},
+        )
 
     return Depends(_dependency)
