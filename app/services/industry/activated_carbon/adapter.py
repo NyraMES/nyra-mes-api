@@ -101,6 +101,7 @@ from app.schemas.mes_core.schemas import (
     QualityCheckOut,
     ResourceCreate,
     ResourceOut,
+    ResourceUpdate,
     SupplierCreate,
     SupplierOut,
     TripleCreate,
@@ -128,6 +129,7 @@ from app.services.industry.activated_carbon.kiln_parameters_catalog import (
 from app.services.industry.activated_carbon import raw_material_types as ac_raw_material_types
 from app.services.industry.activated_carbon import inbound_execution as ac_inbound_execution
 from app.services.industry.activated_carbon import inbound_workflow as ac_inbound_workflow
+from app.services.industry.activated_carbon import isa95_rag as ac_isa95_rag
 from app.services.industry.activated_carbon import lot_routing as ac_lot_routing
 from app.services.industry.activated_carbon import stock as ac_stock
 from app.services.industry.activated_carbon.resource_pool import (
@@ -168,7 +170,10 @@ def _headcount_from_metadata(meta: object) -> Optional[int]:
 
 
 def _resource_out(row: Resource) -> ResourceOut:
-    from app.services.industry.activated_carbon.station_machines import station_of
+    from app.services.industry.activated_carbon.station_machines import (
+        monthly_capacity_kg_of,
+        station_of,
+    )
 
     meta = row.metadata_ if isinstance(row.metadata_, dict) else {}
     unit_count = None
@@ -177,6 +182,10 @@ def _resource_out(row: Resource) -> ResourceOut:
             unit_count = int(meta.get("unit_count"))
         except (TypeError, ValueError):
             unit_count = None
+    rtype = (row.resource_type or "").upper()
+    monthly = None
+    if rtype == "MACHINE" or (row.resource_code or "").upper().startswith("RES-KILN"):
+        monthly = monthly_capacity_kg_of(row)
     return ResourceOut(
         resource_id=row.resource_id,
         tenant_id=row.tenant_id,
@@ -186,6 +195,7 @@ def _resource_out(row: Resource) -> ResourceOut:
         status=row.status,
         station=station_of(row),
         unit_count=unit_count,
+        monthly_capacity_kg=monthly,
         headcount=_headcount_from_metadata(row.metadata_),
         created_at=row.created_at,
     )
@@ -1946,6 +1956,14 @@ def create_plant_resource(
         unit_count = getattr(payload, "unit_count", None)
         if unit_count is not None:
             meta["unit_count"] = int(unit_count)
+        from app.services.industry.activated_carbon.station_machines import (
+            DEFAULT_MONTHLY_CAPACITY_KG,
+        )
+
+        monthly = getattr(payload, "monthly_capacity_kg", None)
+        meta["monthly_capacity_kg"] = (
+            int(monthly) if monthly is not None else DEFAULT_MONTHLY_CAPACITY_KG
+        )
 
     resource = repo.add(
         Resource(
@@ -1999,10 +2017,27 @@ def create_plant_resource(
         else None,
         station=meta.get("station"),
         unit_count=meta.get("unit_count"),
+        monthly_capacity_kg=meta.get("monthly_capacity_kg"),
         equipment_id=equipment_id,
         equipment_code=equipment_code,
         equipment_name=equipment_name,
     )
+
+
+def update_plant_resource(
+    db: Session, tenant: TenantContext, resource_id: UUID, payload: ResourceUpdate
+) -> ResourceOut:
+    repo = _repo(db, tenant)
+    resource = repo.get_by_pk(Resource, Resource.resource_id, resource_id)
+    meta = dict(resource.metadata_ if isinstance(resource.metadata_, dict) else {})
+    if payload.monthly_capacity_kg is not None:
+        meta["monthly_capacity_kg"] = int(payload.monthly_capacity_kg)
+    if payload.unit_count is not None:
+        meta["unit_count"] = int(payload.unit_count)
+    resource.metadata_ = meta
+    flag_modified(resource, "metadata_")
+    repo.commit_refresh(resource)
+    return _resource_out(resource)
 
 
 def create_kiln(db: Session, tenant: TenantContext, payload: AcKilnCreate) -> AcKilnOut:
@@ -2035,13 +2070,27 @@ def create_kiln(db: Session, tenant: TenantContext, payload: AcKilnCreate) -> Ac
             "Leave Equipment code blank to auto-assign the next EQ-KILN-* code."
         )
 
+    from app.services.industry.activated_carbon.station_machines import (
+        DEFAULT_MONTHLY_CAPACITY_KG,
+        monthly_capacity_kg_of,
+    )
+
+    monthly = (
+        int(payload.monthly_capacity_kg)
+        if payload.monthly_capacity_kg is not None
+        else DEFAULT_MONTHLY_CAPACITY_KG
+    )
     resource = repo.add(
         Resource(
             resource_code=resource_code,
             resource_name=name,
             resource_type="MACHINE",
             status=payload.status or "ACTIVE",
-            metadata_={"role": "kiln", "equipment_class": "KILN"},
+            metadata_={
+                "role": "kiln",
+                "equipment_class": "KILN",
+                "monthly_capacity_kg": monthly,
+            },
         )
     )
     repo.db.flush()
@@ -2066,6 +2115,7 @@ def create_kiln(db: Session, tenant: TenantContext, payload: AcKilnCreate) -> Ac
         equipment_code=equipment.equipment_code,
         equipment_name=equipment.equipment_name,
         status=resource.status,
+        monthly_capacity_kg=monthly_capacity_kg_of(resource),
     )
 
 
@@ -2213,6 +2263,7 @@ def _kiln_status_rows(db: Session, tenant: TenantContext) -> list[AcKilnStatusOu
                 active_lot_code=lot.lot_code if lot else None,
                 active_lot_kg=loaded_kg if unique_events else (lot.lot_quantity if lot else None),
                 loaded_kg=loaded_kg if unique_events else None,
+                monthly_capacity_kg=ac_station_machines.monthly_capacity_kg_of(kiln),
                 feed_events=unique_events,
                 last_reading_at=last_at,
             )
@@ -2610,6 +2661,7 @@ def get_dashboard_summary(db: Session, tenant: TenantContext) -> AcDashboardOut:
         open_customer_orders=open_customer_orders,
         recent_dispatches=recent_dispatches,
         kiln_parameter_definitions=list_kiln_parameter_definitions(db, tenant),
+        utilization_rag=ac_isa95_rag.get_utilization_rag(db, tenant),
     )
 
 

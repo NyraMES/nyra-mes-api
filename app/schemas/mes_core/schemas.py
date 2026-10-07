@@ -149,6 +149,7 @@ class ResourceOut(MesCoreModel):
     status: str
     station: Optional[str] = None
     unit_count: Optional[int] = None
+    monthly_capacity_kg: Optional[int] = None
     headcount: Optional[int] = None
     created_at: Optional[datetime] = None
 
@@ -160,7 +161,13 @@ class ResourceCreate(BaseModel):
     status: str = "ACTIVE"
     station: Optional[str] = Field(None, max_length=64)
     unit_count: Optional[int] = Field(None, ge=1)
+    monthly_capacity_kg: Optional[int] = Field(None, ge=1)
     headcount: Optional[int] = Field(None, ge=1)
+
+
+class ResourceUpdate(BaseModel):
+    monthly_capacity_kg: Optional[int] = Field(None, ge=1)
+    unit_count: Optional[int] = Field(None, ge=1)
 
 
 class EquipmentOut(MesCoreModel):
@@ -777,6 +784,7 @@ class AcKilnCreate(BaseModel):
     resource_code: Optional[str] = Field(None, max_length=64)
     equipment_code: Optional[str] = Field(None, max_length=64)
     status: str = "ACTIVE"
+    monthly_capacity_kg: Optional[int] = Field(None, ge=1)
 
 
 class AcKilnOut(BaseModel):
@@ -787,6 +795,7 @@ class AcKilnOut(BaseModel):
     equipment_code: str
     equipment_name: str
     status: str
+    monthly_capacity_kg: Optional[int] = None
 
 
 class AcPlantResourceOut(BaseModel):
@@ -797,6 +806,7 @@ class AcPlantResourceOut(BaseModel):
     status: str
     station: Optional[str] = None
     unit_count: Optional[int] = None
+    monthly_capacity_kg: Optional[int] = None
     headcount: Optional[int] = None
     equipment_id: Optional[UUID] = None
     equipment_code: Optional[str] = None
@@ -1083,6 +1093,20 @@ class AcInboundAdminUpdate(BaseModel):
     outward_splits: list[AcInboundAdminSplit] = Field(default_factory=list)
 
 
+class AcIsa95UtilizationRagOut(BaseModel):
+    """ISA-95 L3 machine utilization bands (% of monthly designed output)."""
+
+    green_min_pct: int = 90
+    amber_min_pct: int = 70
+    red_below_pct: int = 70
+
+
+class AcIsa95UtilizationRagUpdate(BaseModel):
+    green_min_pct: int = Field(..., ge=0, le=100)
+    amber_min_pct: int = Field(..., ge=0, le=100)
+    red_below_pct: int = Field(..., ge=0, le=100)
+
+
 class AcInwardBagFeedCreate(BaseModel):
     customer_order_id: UUID
     bag_id: UUID
@@ -1271,6 +1295,7 @@ class AcPostActivationStateOut(BaseModel):
     loaded_kg: Decimal = Decimal("0")
     loader_count: int = 0
     loader_capacity: int = 6
+    monthly_capacity_kg: int = 15000
     output_bags: list[AcPostActivationBagOut] = Field(default_factory=list)
     load_events: list[AcPostActivationLoadEventOut] = Field(default_factory=list)
 
@@ -1380,6 +1405,7 @@ class AcKilnStatusOut(BaseModel):
     active_lot_code: Optional[str] = None
     active_lot_kg: Optional[Decimal] = None
     loaded_kg: Optional[Decimal] = None
+    monthly_capacity_kg: Optional[int] = None
     feed_events: list[Any] = Field(default_factory=list)
     last_reading_at: Optional[datetime] = None
 
@@ -1690,6 +1716,7 @@ class AcDashboardOut(BaseModel):
     open_customer_orders: list["AcOpenCustomerOrderOut"] = Field(default_factory=list)
     recent_dispatches: list["AcRecentDispatchOut"] = Field(default_factory=list)
     kiln_parameter_definitions: list[AcKilnParameterDefinition] = Field(default_factory=list)
+    utilization_rag: Optional["AcIsa95UtilizationRagOut"] = None
 
 
 class ChemReactorParameterDefinition(BaseModel):

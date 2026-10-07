@@ -32,7 +32,10 @@ from app.schemas.mes_core.schemas import (
 )
 from app.services.industry.activated_carbon.codes import next_post_activation_bag_code
 from app.services.mes_core.base import TenantRepository
-from app.services.industry.activated_carbon.station_machines import station_machine_capacity
+from app.services.industry.activated_carbon.station_machines import (
+    station_machine_capacity,
+    station_monthly_capacity_kg,
+)
 
 POST_ACTIVATION_LOADER_CAPACITY = 6
 EXKLIN_GRADE = "Exklin"
@@ -613,6 +616,7 @@ def get_post_activation_state(
         loaded_kg=loaded_kg,
         loader_count=len(loaded),
         loader_capacity=station_machine_capacity(db, tenant, key),
+        monthly_capacity_kg=station_monthly_capacity_kg(db, tenant, key),
         output_bags=outputs,
         load_events=[_event_out(row) for row in events if row.get("bag_code") or row.get("loaded_at")],
     )

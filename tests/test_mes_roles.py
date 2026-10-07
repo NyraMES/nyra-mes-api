@@ -158,6 +158,14 @@ def test_require_plant_admin_blocks_manager(monkeypatch):
         require_plant_admin().dependency(_user(MES_MANAGER))
 
 
+def test_require_plant_admin_allows_nyraservices(monkeypatch):
+    monkeypatch.setattr(
+        "app.core.auth.settings", replace(settings, auth_enabled=True)
+    )
+    user = UserContext(sub="1", username="nyraservices@grcarbons", groups=[MES_SUPER_ADMIN])
+    assert require_plant_admin().dependency(user) is not None
+
+
 def test_require_nyra_services_allows_username(monkeypatch):
     monkeypatch.setattr(
         "app.core.auth.settings", replace(settings, auth_enabled=True)

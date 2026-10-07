@@ -50,6 +50,7 @@ STATION_SPECS = (
 )
 
 STATION_KEYS = tuple(row["key"] for row in STATION_SPECS)
+DEFAULT_MONTHLY_CAPACITY_KG = 15000
 
 
 def _repo(db: Session, tenant: TenantContext) -> TenantRepository:
@@ -71,6 +72,19 @@ def _is_floor_machine(resource: Resource) -> bool:
     if role in {"post_activation", "kiln"}:
         return False
     return True
+
+
+def monthly_capacity_kg_of(resource: Resource) -> int:
+    meta = _meta(resource)
+    raw = meta.get("monthly_capacity_kg")
+    if raw not in (None, ""):
+        try:
+            value = int(raw)
+        except (TypeError, ValueError):
+            value = 0
+        if value > 0:
+            return value
+    return DEFAULT_MONTHLY_CAPACITY_KG
 
 
 def _unit_count(resource: Resource) -> int:
@@ -113,6 +127,9 @@ def _tag_station(resource: Resource, station_key: str) -> bool:
     if meta.get("unit_count") in (None, ""):
         meta["unit_count"] = _unit_count(resource)
         changed = True
+    if meta.get("monthly_capacity_kg") in (None, ""):
+        meta["monthly_capacity_kg"] = DEFAULT_MONTHLY_CAPACITY_KG
+        changed = True
     if changed:
         resource.metadata_ = meta
         flag_modified(resource, "metadata_")
@@ -154,6 +171,7 @@ def ensure_station_machines(db: Session, tenant: TenantContext) -> None:
                     "role": "machine",
                     "station": spec["key"],
                     "unit_count": 1,
+                    "monthly_capacity_kg": DEFAULT_MONTHLY_CAPACITY_KG,
                 },
             )
         )
@@ -175,3 +193,19 @@ def station_machine_capacity(db: Session, tenant: TenantContext, station_key: st
             continue
         total += _unit_count(row)
     return max(total, 1)
+
+
+def station_monthly_capacity_kg(db: Session, tenant: TenantContext, station_key: str) -> int:
+    ensure_station_machines(db, tenant)
+    total = 0
+    found = False
+    for row in _repo(db, tenant).query(Resource).all():
+        if (row.status or "ACTIVE").upper() != "ACTIVE":
+            continue
+        if not _is_floor_machine(row):
+            continue
+        if not _matches_station(row, station_key):
+            continue
+        found = True
+        total += monthly_capacity_kg_of(row)
+    return total if found and total > 0 else DEFAULT_MONTHLY_CAPACITY_KG

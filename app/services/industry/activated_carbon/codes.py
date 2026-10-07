@@ -52,6 +52,21 @@ ALL_CORE_CODE_SEQUENCES: tuple[str, ...] = (
     "core.ac_customer_po_seq",
 )
 
+# Shop-floor bag sequences — created on first use, one per process prefix.
+AC_SHOP_CODE_SEQUENCES: tuple[str, ...] = (
+    "core.ac_bag_ri_seq",
+    "core.ac_bag_ro_seq",
+    "core.ac_kiln_out_ka_seq",
+    "core.ac_kiln_out_kb_seq",
+    "core.ac_deston_ds_seq",
+    "core.ac_post_sc_seq",
+    "core.ac_post_dd_seq",
+    "core.ac_post_cr_seq",
+    "core.ac_post_dm_seq",
+    "core.ac_post_bl_seq",
+    "core.ac_post_fg_seq",
+)
+
 # Minimum suffix already issued for demo seed (next code = floor + 1 when DB empty).
 AC_SEQUENCE_FLOORS: dict[str, int] = {
     "core.customer_code_seq": 0,
@@ -285,7 +300,7 @@ def sync_ac_sequences_global(db: Session) -> None:
 
 def reset_ac_sequences_empty(db: Session) -> None:
     """Set all core business-code sequences so the next generated code uses suffix 1."""
-    for seq in ALL_CORE_CODE_SEQUENCES:
+    for seq in (*ALL_CORE_CODE_SEQUENCES, *AC_SHOP_CODE_SEQUENCES):
         db.execute(text(f"CREATE SEQUENCE IF NOT EXISTS {seq} START 1"))
         # is_called=false => next nextval returns 1.
         db.execute(text(f"SELECT setval('{seq}', 1, false)"))

@@ -96,6 +96,8 @@ from app.schemas.mes_core.schemas import (
     AcCrusherOutputOut,
     AcInboundAdminOut,
     AcInboundAdminUpdate,
+    AcIsa95UtilizationRagOut,
+    AcIsa95UtilizationRagUpdate,
     AcInwardBagFeedCreate,
     AcRawMaterialTypeCreate,
     AcRawMaterialTypeOut,
@@ -114,6 +116,7 @@ from app.schemas.mes_core.schemas import (
     QualityCheckOut,
     ResourceCreate,
     ResourceOut,
+    ResourceUpdate,
     TrnDispatchCreate,
     TrnDispatchOut,
     TrnDispatchUpdate,
@@ -126,6 +129,7 @@ from app.services.industry.activated_carbon import users as ac_users
 from app.services.industry.activated_carbon import kiln_parameters_catalog as ac_kiln_catalog
 from app.services.industry.activated_carbon import raw_material_types as ac_raw_material_types
 from app.services.industry.activated_carbon import inbound_admin as ac_inbound_admin
+from app.services.industry.activated_carbon import isa95_rag as ac_isa95_rag
 from app.services.industry.activated_carbon import inbound_workflow as ac_inbound_workflow
 from app.services.industry.activated_carbon import routing_workflow as ac_routing
 from app.services.mes_core import dispatch_workflow as mes_core_dispatch
@@ -262,6 +266,21 @@ def ac_create_resource(
         raise ValidationError(str(exc)) from exc
 
 
+@router.put(
+    "/masters/resources/{resource_id}",
+    response_model=ResourceOut,
+    summary="Update plant resource monthly designed capacity",
+)
+def ac_update_resource(
+    resource_id: UUID,
+    payload: ResourceUpdate,
+    db: Session = Depends(get_mes_core_db),
+    tenant: TenantContext = Depends(_AC_MASTERS),
+    _user=require_nyra_services(),
+):
+    return ac_adapter.update_plant_resource(db, tenant, resource_id, payload)
+
+
 @router.get(
     "/lots/{lot_code}/routing-plan",
     summary="Preview active product routing and work-order state for a lot",
@@ -340,7 +359,7 @@ def ac_create_customer(
     payload: CustomerCreate,
     db: Session = Depends(get_mes_core_db),
     tenant: TenantContext = Depends(_AC_MASTERS),
-    _user=require_nyra_services(),
+    _user=require_plant_admin(),
 ):
     return ac_adapter.create_ac_customer(db, tenant, payload)
 
@@ -367,7 +386,7 @@ def ac_create_supplier(
     payload: SupplierCreate,
     db: Session = Depends(get_mes_core_db),
     tenant: TenantContext = Depends(_AC_MASTERS),
-    _user=require_nyra_services(),
+    _user=require_plant_admin(),
 ):
     return ac_adapter.create_ac_supplier(db, tenant, payload)
 
@@ -888,6 +907,32 @@ def put_inbound_admin(
     _user=require_nyra_services(),
 ):
     return ac_inbound_admin.save_inbound_admin(db, tenant, payload.model_dump())
+
+
+@router.get(
+    "/masters/utilization-rag",
+    response_model=AcIsa95UtilizationRagOut,
+    summary="ISA-95 red/amber/green limits for machine monthly output vs designed",
+)
+def get_utilization_rag(
+    db: Session = Depends(get_mes_core_db),
+    tenant: TenantContext = Depends(_AC_MASTERS),
+):
+    return ac_isa95_rag.get_utilization_rag(db, tenant)
+
+
+@router.put(
+    "/masters/utilization-rag",
+    response_model=AcIsa95UtilizationRagOut,
+    summary="Save ISA-95 red/amber/green limits for machine utilization",
+)
+def put_utilization_rag(
+    payload: AcIsa95UtilizationRagUpdate,
+    db: Session = Depends(get_mes_core_db),
+    tenant: TenantContext = Depends(_AC_MASTERS),
+    _user=require_nyra_services(),
+):
+    return ac_isa95_rag.save_utilization_rag(db, tenant, payload.model_dump())
 
 
 @router.post(

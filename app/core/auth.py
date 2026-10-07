@@ -377,19 +377,12 @@ def require_plant_admin():
     """Users screen — Administrator may create plant users."""
 
     def _dependency(user: UserContext = Depends(get_current_user)) -> UserContext:
-        if not settings.auth_enabled:
-            if user.is_plant_admin() or user.is_nyra_services():
-                return user
-            raise ForbiddenError(
-                "Only an Administrator may create users.",
-                details={"required_roles": [MES_ADMIN], "your_roles": user.roles},
-            )
-        if not user.is_plant_admin():
-            raise ForbiddenError(
-                "Only an Administrator may create users.",
-                details={"required_roles": [MES_ADMIN], "your_roles": user.roles},
-            )
-        return user
+        if user.is_plant_admin() or user.is_nyra_services():
+            return user
+        raise ForbiddenError(
+            "Only an Administrator may create users.",
+            details={"required_roles": [MES_ADMIN], "your_roles": user.roles},
+        )
 
     return Depends(_dependency)
 
