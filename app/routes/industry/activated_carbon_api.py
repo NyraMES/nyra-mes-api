@@ -9,18 +9,30 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, Query, status
 from sqlalchemy.orm import Session
 
+from app.core.config import settings
 from app.core.ac_privileges import (
+    assert_can_complete_inbound_step,
+    assert_quality_records_lab,
+    assert_supervisor_raises_debit_note,
+    assert_rms_engineer_records_bags,
+    assert_rms_engineer_records_outward,
     require_ac_activation_qc,
     require_ac_activation_run,
+    require_ac_destoning_ctc,
     require_ac_dispatch,
     require_ac_post_qc,
     require_ac_post_run,
     require_ac_quality,
+    require_ac_gate_receipt,
     require_ac_rms,
+    user_can_see_supplier,
+    visible_supplier_row,
+    visible_supplier_rows,
 )
 from app.core.capability_guard import require_any_capability, require_capability
 from app.core.dependencies import (
     UserContext,
+    get_current_user,
     get_mes_core_db,
     get_tenant_context,
     require_nyra_services,
@@ -37,6 +49,14 @@ from app.schemas.mes_core.schemas import (
     AcKilnFeedBagQcOut,
     AcKilnOutputBagQcCreate,
     AcKilnOutputBagQcOut,
+    AcDestonerCreate,
+    AcDestonerDailyCtcOut,
+    AcDestonerDailyCtcSave,
+    AcKilnSetpointsOut,
+    AcKilnSetpointsSave,
+    AcWorkOrderCreate,
+    AcWorkOrderListOut,
+    AcWorkOrderOut,
     AcDestoningLoadCreate,
     AcDestoningOutputCreate,
     AcDestoningStateOut,
@@ -59,6 +79,8 @@ from app.schemas.mes_core.schemas import (
     AcKilnParametersCreate,
     AcKilnParameterReadingOut,
     AcMastersOut,
+    AcMaterialTraceOptionsOut,
+    AcMaterialTraceOut,
     AcQualityTestCreate,
     AcCustomerSalesOrderCreate,
     AcCustomerSalesOrderCreateResponse,
@@ -66,11 +88,15 @@ from app.schemas.mes_core.schemas import (
     AcDispatchFromOrderResponse,
     AcGradeStockOut,
     AcInStockBagOut,
+    AcInStockWorkOrderMove,
+    AcInStockWorkOrderMoveOut,
     AcOpenCustomerOrderOut,
     AcStockedLotOut,
     AcTenantUserCreate,
     AcTenantUserCreateResponse,
+    AcTenantUserNicknameSave,
     AcTenantUserOut,
+    AcUserNicknameOut,
     AcDeliveryCommitmentOut,
     AcFinishedGoodsStockOut,
     AcMakeToStockCreate,
@@ -82,12 +108,14 @@ from app.schemas.mes_core.schemas import (
     AcRawMaterialQcOut,
     AcInboundStepCompleteCreate,
     AcInboundExecutionOut,
+    AcDebitNoteCreate,
     AcRawMaterialCrushCreate,
     AcRawMaterialCrushOut,
     AcInitialQcCreate,
     AcInitialQcOut,
     AcInboundWorkflowOut,
     AcInwardBagCreate,
+    AcInwardBagAutoCreate,
     AcInwardBagOut,
     AcInwardBagReconcileCreate,
     AcInwardGradeSeparationCreate,
@@ -98,6 +126,10 @@ from app.schemas.mes_core.schemas import (
     AcInboundAdminUpdate,
     AcIsa95UtilizationRagOut,
     AcIsa95UtilizationRagUpdate,
+    AcProcessRulesOut,
+    AcProcessRulesUpdate,
+    AcMeshGradeMapOut,
+    AcMeshGradeMapUpdate,
     AcInwardBagFeedCreate,
     AcRawMaterialTypeCreate,
     AcRawMaterialTypeOut,
@@ -125,11 +157,14 @@ from app.schemas.mes_core.schemas import (
 from app.schemas.dispatch import DispatchCreate, DispatchOut
 from app.schemas.traceability import TraceabilityResponse
 from app.services.industry.activated_carbon import adapter as ac_adapter
+from app.services.industry.activated_carbon import post_activation as ac_post_activation
 from app.services.industry.activated_carbon import users as ac_users
 from app.services.industry.activated_carbon import kiln_parameters_catalog as ac_kiln_catalog
 from app.services.industry.activated_carbon import raw_material_types as ac_raw_material_types
 from app.services.industry.activated_carbon import inbound_admin as ac_inbound_admin
 from app.services.industry.activated_carbon import isa95_rag as ac_isa95_rag
+from app.services.industry.activated_carbon import process_rules as ac_process_rules
+from app.services.industry.activated_carbon import mesh_grade as ac_mesh_grade
 from app.services.industry.activated_carbon import inbound_workflow as ac_inbound_workflow
 from app.services.industry.activated_carbon import routing_workflow as ac_routing
 from app.services.mes_core import dispatch_workflow as mes_core_dispatch
@@ -168,8 +203,9 @@ _AC_MASTERS = require_any_capability(
 def raw_material_inward(
     db: Session = Depends(get_mes_core_db),
     tenant: TenantContext = Depends(_AC_RAW),
+    user: UserContext = Depends(get_current_user),
 ):
-    return ac_adapter.list_raw_material_inward(db, tenant)
+    return visible_supplier_rows(user, ac_adapter.list_raw_material_inward(db, tenant))
 
 
 @router.get(
@@ -240,6 +276,26 @@ def ac_create_kiln(
 ):
     try:
         return ac_adapter.create_kiln(db, tenant, payload)
+    except ValidationError:
+        raise
+    except ConflictError as exc:
+        raise ValidationError(str(exc)) from exc
+
+
+@router.post(
+    "/masters/destoners",
+    response_model=ResourceOut,
+    status_code=status.HTTP_201_CREATED,
+    summary="Register destoning machine",
+)
+def ac_create_destoner(
+    payload: AcDestonerCreate,
+    db: Session = Depends(get_mes_core_db),
+    tenant: TenantContext = Depends(_AC_MASTERS),
+    _user=require_nyra_services(),
+):
+    try:
+        return ac_adapter.create_destoner(db, tenant, payload)
     except ValidationError:
         raise
     except ConflictError as exc:
@@ -372,7 +428,10 @@ def ac_create_customer(
 def ac_list_suppliers(
     db: Session = Depends(get_mes_core_db),
     tenant: TenantContext = Depends(_AC_MASTERS),
+    user: UserContext = Depends(get_current_user),
 ):
+    if not user_can_see_supplier(user):
+        return []
     return mes_core_entities.list_suppliers(db, tenant)
 
 
@@ -564,7 +623,7 @@ def create_raw_material_inward(
     payload: AcRawMaterialInwardCreate,
     db: Session = Depends(get_mes_core_db),
     tenant: TenantContext = Depends(_AC_RAW),
-    _user=require_ac_rms(),
+    _user=require_ac_gate_receipt(),
 ):
     return ac_adapter.create_raw_material_inward(db, tenant, payload)
 
@@ -669,7 +728,7 @@ def list_stocked_lots(
 @router.get(
     "/in-stock-bags",
     response_model=List[AcInStockBagOut],
-    summary="Bags marked In Stock and available for customer dispatch",
+    summary="Bags marked In Stock and available for work-order dispatch",
 )
 def list_in_stock_bags(
     db: Session = Depends(get_mes_core_db),
@@ -679,10 +738,30 @@ def list_in_stock_bags(
 
 
 @router.post(
+    "/in-stock/reassign-work-order",
+    response_model=AcInStockWorkOrderMoveOut,
+    summary="Move an In Stock bag to another work order of the same grade",
+)
+def reassign_in_stock_work_order(
+    payload: AcInStockWorkOrderMove,
+    db: Session = Depends(get_mes_core_db),
+    tenant: TenantContext = Depends(_AC_MASTERS),
+    user: UserContext = require_ac_destoning_ctc(),
+):
+    return ac_post_activation.reassign_in_stock_work_order(
+        db,
+        tenant,
+        bag_code=payload.bag_code,
+        work_order_code=payload.work_order_code,
+        user_id=user.username,
+    )
+
+
+@router.post(
     "/dispatch-from-order",
     response_model=AcDispatchFromOrderResponse,
     status_code=status.HTTP_201_CREATED,
-    summary="Ship against a customer PO from in-stock lots by grade",
+    summary="Ship from In Stock bags by work order, optionally against a historical PO",
 )
 def create_dispatch_from_order(
     payload: AcDispatchFromOrderCreate,
@@ -718,8 +797,9 @@ def backfill_inward_production_orders(
 def list_raw_material_qc(
     db: Session = Depends(get_mes_core_db),
     tenant: TenantContext = Depends(_AC_RAW_QC),
+    user: UserContext = Depends(get_current_user),
 ):
-    return ac_adapter.list_raw_material_qc(db, tenant)
+    return visible_supplier_rows(user, ac_adapter.list_raw_material_qc(db, tenant))
 
 
 @router.post(
@@ -732,9 +812,11 @@ def create_raw_material_qc(
     payload: AcRawMaterialQcCreate,
     db: Session = Depends(get_mes_core_db),
     tenant: TenantContext = Depends(_AC_RAW_QC),
-    _user=require_ac_rms(),
+    user: UserContext = Depends(get_current_user),
 ):
-    return ac_adapter.create_raw_material_qc(db, tenant, payload)
+    if settings.auth_enabled:
+        assert_quality_records_lab(user)
+    return visible_supplier_row(user, ac_adapter.create_raw_material_qc(db, tenant, payload))
 
 
 @router.get(
@@ -745,8 +827,9 @@ def create_raw_material_qc(
 def list_inbound_execution(
     db: Session = Depends(get_mes_core_db),
     tenant: TenantContext = Depends(_AC_RAW),
+    user: UserContext = Depends(get_current_user),
 ):
-    return ac_adapter.list_inbound_execution(db, tenant)
+    return visible_supplier_rows(user, ac_adapter.list_inbound_execution(db, tenant))
 
 
 @router.post(
@@ -759,12 +842,34 @@ def complete_inbound_execution_step(
     payload: AcInboundStepCompleteCreate,
     db: Session = Depends(get_mes_core_db),
     tenant: TenantContext = Depends(_AC_RAW),
-    _user=require_ac_rms(),
+    user: UserContext = Depends(get_current_user),
 ):
+    if settings.auth_enabled:
+        assert_can_complete_inbound_step(user, payload.operation_code)
     try:
-        return ac_adapter.complete_inbound_execution_step(db, tenant, payload)
+        row = ac_adapter.complete_inbound_execution_step(db, tenant, payload)
     except ValueError as exc:
         raise ValidationError(str(exc)) from exc
+    return visible_supplier_row(user, row)
+
+
+@router.post(
+    "/raw-material-inbound-execution/{customer_order_id}/debit-note",
+    response_model=AcInboundExecutionOut,
+    status_code=status.HTTP_201_CREATED,
+    summary="Raise a supplier debit note for short weight or high moisture",
+)
+def raise_inward_debit_note(
+    customer_order_id: UUID,
+    payload: AcDebitNoteCreate,
+    db: Session = Depends(get_mes_core_db),
+    tenant: TenantContext = Depends(_AC_RAW),
+    user: UserContext = Depends(get_current_user),
+):
+    if settings.auth_enabled:
+        assert_supervisor_raises_debit_note(user)
+    row = ac_adapter.raise_inward_debit_note(db, tenant, customer_order_id, payload)
+    return visible_supplier_row(user, row)
 
 
 @router.get(
@@ -775,8 +880,9 @@ def complete_inbound_execution_step(
 def list_raw_material_crushing(
     db: Session = Depends(get_mes_core_db),
     tenant: TenantContext = Depends(_AC_RAW),
+    user: UserContext = Depends(get_current_user),
 ):
-    return ac_adapter.list_raw_material_crushing(db, tenant)
+    return visible_supplier_rows(user, ac_adapter.list_raw_material_crushing(db, tenant))
 
 
 @router.post(
@@ -789,9 +895,9 @@ def create_raw_material_crushing(
     payload: AcRawMaterialCrushCreate,
     db: Session = Depends(get_mes_core_db),
     tenant: TenantContext = Depends(_AC_RAW),
-    _user=require_ac_rms(),
+    user: UserContext = require_ac_rms(),
 ):
-    return ac_adapter.create_raw_material_crush(db, tenant, payload)
+    return visible_supplier_row(user, ac_adapter.create_raw_material_crush(db, tenant, payload))
 
 
 @router.get(
@@ -816,8 +922,10 @@ def create_raw_material_initial_qc(
     payload: AcInitialQcCreate,
     db: Session = Depends(get_mes_core_db),
     tenant: TenantContext = Depends(_AC_RAW_QC),
-    _user=require_ac_rms(),
+    user: UserContext = Depends(get_current_user),
 ):
+    if settings.auth_enabled:
+        assert_quality_records_lab(user)
     return ac_inbound_workflow.create_initial_qc(db, tenant, payload)
 
 
@@ -838,6 +946,23 @@ def list_inward_bags(
 
 
 @router.post(
+    "/inward-bags/auto-rms",
+    response_model=List[AcInwardBagOut],
+    status_code=status.HTTP_201_CREATED,
+    summary="Automatically split inward weight into 500 kg RMS bags",
+)
+def auto_create_rms_bags(
+    payload: AcInwardBagAutoCreate,
+    db: Session = Depends(get_mes_core_db),
+    tenant: TenantContext = Depends(_AC_RAW),
+    user: UserContext = require_ac_rms(),
+):
+    if settings.auth_enabled:
+        assert_rms_engineer_records_bags(user)
+    return ac_inbound_workflow.auto_create_rms_bags(db, tenant, payload.customer_order_id)
+
+
+@router.post(
     "/inward-bags",
     response_model=AcInwardBagOut,
     status_code=status.HTTP_201_CREATED,
@@ -847,8 +972,13 @@ def create_inward_bag(
     payload: AcInwardBagCreate,
     db: Session = Depends(get_mes_core_db),
     tenant: TenantContext = Depends(_AC_RAW),
-    _user=require_ac_rms(),
+    user: UserContext = require_ac_rms(),
 ):
+    if settings.auth_enabled:
+        if (payload.grade or "").strip():
+            assert_rms_engineer_records_outward(user)
+        else:
+            assert_rms_engineer_records_bags(user)
     return ac_inbound_workflow.create_inward_bag(db, tenant, payload)
 
 
@@ -862,8 +992,10 @@ def delete_inward_bag(
     customer_order_id: UUID = Query(...),
     db: Session = Depends(get_mes_core_db),
     tenant: TenantContext = Depends(_AC_RAW),
-    _user=require_ac_rms(),
+    user: UserContext = require_ac_rms(),
 ):
+    if settings.auth_enabled:
+        assert_rms_engineer_records_outward(user)
     return ac_inbound_workflow.delete_inward_bag(
         db, tenant, customer_order_id=customer_order_id, bag_id=bag_id
     )
@@ -933,6 +1065,58 @@ def put_utilization_rag(
     _user=require_nyra_services(),
 ):
     return ac_isa95_rag.save_utilization_rag(db, tenant, payload.model_dump())
+
+
+@router.get(
+    "/masters/process-rules",
+    response_model=AcProcessRulesOut,
+    summary="Bag, moisture, CTC, and destoning routing rules",
+)
+def get_process_rules(
+    db: Session = Depends(get_mes_core_db),
+    tenant: TenantContext = Depends(_AC_MASTERS),
+):
+    return ac_process_rules.get_process_rules(db, tenant)
+
+
+@router.put(
+    "/masters/process-rules",
+    response_model=AcProcessRulesOut,
+    summary="Save bag, moisture, CTC, and destoning routing rules",
+)
+def put_process_rules(
+    payload: AcProcessRulesUpdate,
+    db: Session = Depends(get_mes_core_db),
+    tenant: TenantContext = Depends(_AC_MASTERS),
+    _user=require_nyra_services(),
+):
+    return ac_process_rules.save_process_rules(db, tenant, payload.model_dump())
+
+
+@router.get(
+    "/masters/mesh-grade-map",
+    response_model=AcMeshGradeMapOut,
+    summary="Mesh-to-grade mapping (empty until GR Carbons supplies it)",
+)
+def get_mesh_grade_map(
+    db: Session = Depends(get_mes_core_db),
+    tenant: TenantContext = Depends(_AC_MASTERS),
+):
+    return ac_mesh_grade.get_mesh_grade_map(db, tenant)
+
+
+@router.put(
+    "/masters/mesh-grade-map",
+    response_model=AcMeshGradeMapOut,
+    summary="Save mesh-to-grade mapping when GR Carbons supplies it",
+)
+def put_mesh_grade_map(
+    payload: AcMeshGradeMapUpdate,
+    db: Session = Depends(get_mes_core_db),
+    tenant: TenantContext = Depends(_AC_MASTERS),
+    _user=require_nyra_services(),
+):
+    return ac_mesh_grade.save_mesh_grade_map(db, tenant, payload.model_dump())
 
 
 @router.post(
@@ -1047,7 +1231,7 @@ def create_kiln_output(
     tenant: TenantContext = Depends(_AC_KILN_FEED),
     _user=require_ac_activation_run(),
 ):
-    return ac_adapter.create_kiln_output_bag(db, tenant, payload)
+    return ac_adapter.create_kiln_output_bag(db, tenant, payload, _user)
 
 
 @router.post(
@@ -1089,6 +1273,99 @@ def save_kiln_output_bag_qc(
     _user=require_ac_activation_qc(),
 ):
     return ac_adapter.save_kiln_output_bag_qc(db, tenant, payload)
+
+
+@router.get(
+    "/destoning/daily-ctc",
+    response_model=AcDestonerDailyCtcOut,
+    summary="Supervisor daily CTC plan per destoner",
+)
+def destoning_daily_ctc(
+    db: Session = Depends(get_mes_core_db),
+    tenant: TenantContext = Depends(_AC_MASTERS),
+):
+    return ac_adapter.get_destoner_daily_ctc(db, tenant)
+
+
+@router.put(
+    "/destoning/daily-ctc",
+    response_model=AcDestonerDailyCtcOut,
+    summary="Save today's destoner CTC assignment",
+)
+def save_destoning_daily_ctc(
+    payload: AcDestonerDailyCtcSave,
+    db: Session = Depends(get_mes_core_db),
+    tenant: TenantContext = Depends(_AC_MASTERS),
+    user: UserContext = require_ac_destoning_ctc(),
+):
+    return ac_adapter.save_destoner_daily_ctc(db, tenant, payload, user=user)
+
+
+@router.get(
+    "/kiln/setpoints",
+    response_model=AcKilnSetpointsOut,
+    summary="Standing kiln parameters (residence time and setpoints)",
+)
+def kiln_setpoints(
+    db: Session = Depends(get_mes_core_db),
+    tenant: TenantContext = Depends(_AC_MASTERS),
+):
+    return ac_adapter.get_kiln_setpoints(db, tenant)
+
+
+@router.put(
+    "/kiln/setpoints",
+    response_model=AcKilnSetpointsOut,
+    summary="Save standing kiln parameters. Values stay until changed.",
+)
+def save_kiln_setpoints(
+    payload: AcKilnSetpointsSave,
+    db: Session = Depends(get_mes_core_db),
+    tenant: TenantContext = Depends(_AC_MASTERS),
+    user: UserContext = require_ac_destoning_ctc(),
+):
+    return ac_adapter.save_kiln_setpoints(db, tenant, payload, user=user)
+
+
+@router.get(
+    "/work-orders",
+    response_model=AcWorkOrderListOut,
+    summary="Activation work orders (grade, CTC, quantity)",
+)
+def list_work_orders(
+    db: Session = Depends(get_mes_core_db),
+    tenant: TenantContext = Depends(_AC_KILN_FEED),
+):
+    return ac_adapter.list_activation_work_orders(db, tenant)
+
+
+@router.post(
+    "/work-orders",
+    response_model=AcWorkOrderOut,
+    status_code=status.HTTP_201_CREATED,
+    summary="Create an activation work order",
+)
+def create_work_order(
+    payload: AcWorkOrderCreate,
+    db: Session = Depends(get_mes_core_db),
+    tenant: TenantContext = Depends(_AC_MASTERS),
+    user: UserContext = require_ac_destoning_ctc(),
+):
+    return ac_adapter.create_activation_work_order(db, tenant, payload, user=user)
+
+
+@router.delete(
+    "/work-orders/{work_order_code}",
+    response_model=AcWorkOrderOut,
+    summary="Delete an unused activation work order",
+)
+def delete_work_order(
+    work_order_code: str,
+    db: Session = Depends(get_mes_core_db),
+    tenant: TenantContext = Depends(_AC_MASTERS),
+    user: UserContext = require_ac_destoning_ctc(),
+):
+    return ac_adapter.delete_activation_work_order(db, tenant, work_order_code)
 
 
 @router.get(
@@ -1142,7 +1419,7 @@ def destoning_output(
     tenant: TenantContext = Depends(_AC_KILN_FEED),
     _user=require_ac_activation_run(),
 ):
-    return ac_adapter.create_destoning_output_bag(db, tenant, payload)
+    return ac_adapter.create_destoning_output_bag(db, tenant, payload, _user)
 
 
 @router.get(
@@ -1177,10 +1454,11 @@ def save_destoning_bag_qc(
     summary="Post-activation quality bags by process",
 )
 def post_activation_quality(
+    scope: str = Query("today"),
     db: Session = Depends(get_mes_core_db),
     tenant: TenantContext = Depends(_AC_KILN_FEED),
 ):
-    return ac_adapter.list_post_activation_quality(db, tenant)
+    return ac_adapter.list_post_activation_quality(db, tenant, scope=scope)
 
 
 @router.post(
@@ -1204,10 +1482,11 @@ def save_post_activation_quality(
 )
 def post_activation_state(
     process: str,
+    scope: str = Query("today"),
     db: Session = Depends(get_mes_core_db),
     tenant: TenantContext = Depends(_AC_KILN_FEED),
 ):
-    return ac_adapter.get_post_activation_state(db, tenant, process)
+    return ac_adapter.get_post_activation_state(db, tenant, process, scope=scope)
 
 
 @router.post(
@@ -1252,7 +1531,7 @@ def post_activation_output(
     tenant: TenantContext = Depends(_AC_KILN_FEED),
     _user=require_ac_post_run(),
 ):
-    return ac_adapter.create_post_activation_output_bag(db, tenant, process, payload)
+    return ac_adapter.create_post_activation_output_bag(db, tenant, process, payload, _user)
 
 
 @router.get(
@@ -1399,6 +1678,40 @@ def traceability(
 
 
 @router.get(
+    "/material-trace",
+    response_model=AcMaterialTraceOut,
+    summary="Supplier-mapped material trace (work order, bag, inward, or dispatch)",
+)
+def material_trace(
+    q: str = Query(..., min_length=1, description="WO-AC-*, bag code, ORD-AC-*, or DISP-AC-*"),
+    db: Session = Depends(get_mes_core_db),
+    tenant: TenantContext = Depends(_AC_MASTERS),
+    user: UserContext = Depends(get_current_user),
+):
+    return visible_supplier_row(user, ac_adapter.lookup_material_trace(db, tenant, q))
+
+
+@router.get(
+    "/material-trace/options",
+    response_model=AcMaterialTraceOptionsOut,
+    summary="Traceability lookup codes for the current month",
+)
+def material_trace_options(
+    kind: str = Query("work_order", description="work_order, bag, inward, or dispatch"),
+    month: Optional[str] = Query(None, description="YYYY-MM; defaults to the current month"),
+    db: Session = Depends(get_mes_core_db),
+    tenant: TenantContext = Depends(_AC_MASTERS),
+    user: UserContext = Depends(get_current_user),
+):
+    row = ac_adapter.list_material_trace_options(db, tenant, kind, month)
+    if user_can_see_supplier(user):
+        return row
+    return row.model_copy(
+        update={"options": [opt.model_copy(update={"label": opt.code}) for opt in row.options]}
+    )
+
+
+@router.get(
     "/knowledge-graph/triples",
     response_model=List[TripleOut],
     summary="Knowledge graph triple staging rows",
@@ -1459,4 +1772,35 @@ def ac_create_user(
         email=payload.email,
         display_name=payload.display_name,
         role_code=payload.role_code,
+        password=payload.password,
+    )
+
+
+@router.get(
+    "/users/nicknames",
+    response_model=List[AcUserNicknameOut],
+    summary="Nicknames for people on this plant",
+)
+def ac_user_nicknames(
+    db: Session = Depends(get_mes_core_db),
+    tenant: TenantContext = Depends(get_tenant_context),
+    _user: UserContext = Depends(get_current_user),
+):
+    return ac_users.list_plant_nicknames(db, tenant)
+
+
+@router.put(
+    "/users/{user_id}/nickname",
+    response_model=AcTenantUserOut,
+    summary="Change a plant user's nickname",
+)
+def ac_update_user_nickname(
+    user_id: UUID,
+    payload: AcTenantUserNicknameSave,
+    db: Session = Depends(get_mes_core_db),
+    tenant: TenantContext = Depends(get_tenant_context),
+    _user: UserContext = require_plant_admin(),
+):
+    return ac_users.update_tenant_user_nickname(
+        db, tenant, user_id, payload.display_name
     )

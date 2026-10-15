@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import re
 from datetime import date, datetime, timedelta, timezone
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from uuid import UUID, uuid4
 from typing import Any, List, Optional
 
@@ -43,11 +43,24 @@ from app.schemas.mes_core.schemas import (
     AcDestoningBagOut,
     AcDestoningLoadEventOut,
     AcDestoningKilnGroupOut,
+    AcDestonerCreate,
+    AcDestonerDailyCtcOut,
+    AcDestonerDailyCtcRow,
+    AcDestonerDailyCtcSave,
+    AcKilnSetpointChange,
+    AcKilnSetpointRow,
+    AcKilnSetpointsOut,
+    AcKilnSetpointsSave,
+    AcWorkOrderCreate,
+    AcWorkOrderListOut,
+    AcWorkOrderOut,
+    AcDestonerMachineOut,
     AcDestoningStateOut,
     AcDestoningLoadCreate,
     AcDestoningOutputCreate,
     AcDestoningBagQcCreate,
     AcDestoningBagQcOut,
+    AcKilnFeedChipOut,
     AcKilnOutputListOut,
     AcKilnCreate,
     AcKilnOut,
@@ -112,6 +125,7 @@ from app.services.industry.activated_carbon.codes import (
     kiln_output_id_prefix,
     next_destoning_bag_code,
     next_kiln_output_bag_code,
+    plant_today,
     resolve_ac_business_code,
     sync_ac_sequences,
 )
@@ -127,6 +141,7 @@ from app.services.industry.activated_carbon.kiln_parameters_catalog import (
     list_kiln_parameter_definitions,
 )
 from app.services.industry.activated_carbon import raw_material_types as ac_raw_material_types
+from app.services.industry.activated_carbon import inbound_admin as ac_inbound_admin
 from app.services.industry.activated_carbon import inbound_execution as ac_inbound_execution
 from app.services.industry.activated_carbon import inbound_workflow as ac_inbound_workflow
 from app.services.industry.activated_carbon import isa95_rag as ac_isa95_rag
@@ -226,7 +241,10 @@ def create_ac_supplier(
     """Create supplier with SUP-AC-* code when code is omitted."""
     sync_ac_sequences(db, tenant.tenant_id)
     code = resolve_ac_business_code(
-        db, provided=payload.supplier_code, entity="ac_supplier"
+        db,
+        provided=payload.supplier_code,
+        entity="ac_supplier",
+        tenant_id=tenant.tenant_id,
     )
     return mes_core_entities.create_supplier(
         db,
@@ -429,6 +447,8 @@ def _routing_master_summary(db: Session, tenant: TenantContext) -> Optional[AcRo
             product_code = finished.product_code
             product_name = finished.product_name
 
+    from app.services.industry.activated_carbon import process_rules as ac_process_rules
+
     ops = (
         repo.query(RoutingOperation)
         .filter(RoutingOperation.routing_id == routing.routing_id)
@@ -450,6 +470,12 @@ def _routing_master_summary(db: Session, tenant: TenantContext) -> Optional[AcRo
                 else op.operation_type,
             )
             for op in ops
+            if not ac_process_rules.is_kiln_feed_bag_qc_step(
+                {
+                    "operation_code": op.operation_code,
+                    "operation_name": op.operation_name,
+                }
+            )
         ],
     )
 
@@ -685,7 +711,7 @@ def evaluate_delivery_commitment(
     qty = Decimal(str(quantity))
     shortfall = max(qty - stock, Decimal("0"))
     raw_avail = ac_stock.available_raw_material_kg(db, tenant)
-    today = date.today()
+    today = plant_today(tenant.timezone)
 
     if shortfall <= 0:
         return AcDeliveryCommitmentOut(
@@ -1013,6 +1039,8 @@ def _ensure_customer_sales_po_codes(db: Session, tenant: TenantContext) -> None:
 def list_in_stock_bags_for_dispatch(
     db: Session, tenant: TenantContext
 ) -> list[AcInStockBagOut]:
+    from app.services.industry.activated_carbon import work_orders as ac_work_orders
+
     repo = _repo(db, tenant)
     products = {p.product_id: p for p in repo.query(Product).all()}
     mapping = _lot_finished_product_map(db, tenant)
@@ -1021,6 +1049,7 @@ def list_in_stock_bags_for_dispatch(
         lot_code = str(bag.get("lot_code") or "")
         product_id = mapping.get(lot_code) if lot_code else None
         product = products.get(product_id) if product_id else None
+        wo_code = str(bag.get("work_order_code") or "").strip() or None
         rows.append(
             AcInStockBagOut(
                 bag_code=str(bag.get("bag_code") or ""),
@@ -1028,6 +1057,8 @@ def list_in_stock_bags_for_dispatch(
                 quantity_kg=Decimal(str(bag.get("quantity_kg") or 0)),
                 grade=bag.get("grade"),
                 lot_code=bag.get("lot_code"),
+                work_order_code=wo_code,
+                work_order_ctc=ac_work_orders.lookup_work_order_ctc(db, tenant, wo_code),
                 product_id=product_id,
                 product_code=product.product_code if product else None,
                 source=bag.get("source"),
@@ -1124,9 +1155,272 @@ def _stocked_lot_for_product(
     )
 
 
+def _in_stock_bags_for_work_order(
+    db: Session, tenant: TenantContext, work_order_code: str
+) -> list[dict]:
+    wanted = (work_order_code or "").strip()
+    return [
+        bag
+        for bag in ac_post_activation.list_available_in_stock_bags(db, tenant)
+        if ac_post_activation.bag_matches_work_order(bag, wanted)
+    ]
+
+
+def assert_dispatch_within_selected(
+    quantity_kg: Decimal,
+    selected_kg: Decimal,
+    *,
+    bag_code: str | None = None,
+) -> None:
+    """A shipment cannot take kilograms from a bag that was not selected."""
+    if quantity_kg <= selected_kg:
+        return
+    if bag_code:
+        raise ValidationError(
+            f"Bag {bag_code} has {selected_kg} KG remaining. Requested {quantity_kg} KG."
+        )
+    raise ValidationError(
+        f"Selected bags have {selected_kg} KG. Requested {quantity_kg} KG."
+    )
+
+
+def assert_rms_outward_before_release(meta: dict, order_code: str) -> None:
+    separation = meta.get("grade_separation") if isinstance(meta.get("grade_separation"), dict) else {}
+    if str(separation.get("status") or "").upper() != "COMPLETED":
+        raise ValidationError(
+            f"Complete RMS outward on {order_code} before release to production."
+        )
+
+
+def assert_destoner_output_within_load(loaded_kg: Decimal, already: Decimal, out_kg: Decimal) -> None:
+    remaining = loaded_kg - already
+    if loaded_kg <= 0 or remaining <= Decimal("0.001"):
+        raise ValidationError("Load bags onto the destoner first.")
+    if out_kg > remaining + Decimal("0.001"):
+        raise ValidationError(
+            f"Destoner output cannot exceed loaded ({loaded_kg} KG). Remaining: {remaining} KG."
+        )
+
+
+def _consume_work_order_stock(
+    db: Session,
+    tenant: TenantContext,
+    *,
+    work_order_code: str,
+    quantity_kg: Decimal,
+    bag_code: str | None,
+    bag_codes: list[str] | None = None,
+) -> list[dict]:
+    bags = _in_stock_bags_for_work_order(db, tenant, work_order_code)
+    wanted: list[str] = []
+    for raw in bag_codes or []:
+        code = str(raw or "").strip()
+        if code and code not in wanted:
+            wanted.append(code)
+    single = (bag_code or "").strip()
+    if single and single not in wanted:
+        wanted.insert(0, single)
+    by_code = {str(bag.get("bag_code") or ""): bag for bag in bags}
+    if wanted:
+        chosen = []
+        for code in wanted:
+            bag = by_code.get(code)
+            if bag is None:
+                raise ValidationError(
+                    f"Bag '{code}' is not in stock for work order {work_order_code}."
+                )
+            chosen.append(bag)
+        order = {str(bag.get("bag_code") or ""): index for index, bag in enumerate(bags)}
+        chosen.sort(key=lambda bag: order.get(str(bag.get("bag_code") or ""), 0))
+    elif bags:
+        chosen = [bags[0]]
+    else:
+        chosen = []
+    if not chosen:
+        raise ValidationError(f"Work order {work_order_code} has no bags in stock.")
+    selected_kg = sum(
+        (Decimal(str(bag.get("remaining_kg") or 0)) for bag in chosen),
+        Decimal("0"),
+    )
+    assert_dispatch_within_selected(
+        quantity_kg,
+        selected_kg,
+        bag_code=str(chosen[0].get("bag_code") or "") if len(chosen) == 1 else None,
+    )
+    consumed = ac_post_activation.consume_in_stock_bags(
+        db,
+        tenant,
+        quantity_kg,
+        bag_codes={str(bag.get("bag_code") or "") for bag in chosen},
+        work_order_code=work_order_code,
+    )
+    taken = sum(
+        (Decimal(str(row.get("consumed_kg") or 0)) for row in consumed),
+        Decimal("0"),
+    )
+    if taken + Decimal("0.001") < quantity_kg:
+        raise ValidationError(
+            f"Selected bags can supply {taken} KG. Requested {quantity_kg} KG."
+        )
+    return consumed
+
+
+def _lot_from_consumed_bags(
+    db: Session, tenant: TenantContext, consumed: list[dict], lot_code: str | None = None
+) -> ProductionLot | None:
+    repo = _repo(db, tenant)
+    wanted = (lot_code or "").strip()
+    codes: list[str] = []
+    if wanted:
+        codes.append(wanted)
+    for bag in consumed:
+        code = str(bag.get("lot_code") or "").strip()
+        if code and code not in codes:
+            codes.append(code)
+    for code in codes:
+        lot = repo.query(ProductionLot).filter(ProductionLot.lot_code == code).first()
+        if lot is not None:
+            return lot
+    return None
+
+
+def _create_ac_dispatch_from_work_order(
+    db: Session, tenant: TenantContext, payload: AcDispatchFromOrderCreate
+) -> AcDispatchFromOrderResponse:
+    from app.services.industry.activated_carbon import work_orders as ac_work_orders
+
+    sync_ac_sequences(db, tenant.tenant_id)
+    repo = _repo(db, tenant)
+    wo_code = (payload.work_order_code or "").strip()
+    work_order = ac_work_orders.get_work_order(db, tenant, wo_code)
+    qty = Decimal(str(payload.quantity_kg))
+    ordered = Decimal(str(work_order.get("quantity_kg") or 0))
+    already = _dispatch_kg_by_work_order(db, tenant).get(wo_code, Decimal("0"))
+    pending = ac_work_orders.pending_dispatch_kg(ordered, already)
+    if qty > pending:
+        raise ValidationError(
+            f"Work order {wo_code} has {pending} KG pending. "
+            f"Already dispatched {already} KG. Requested {qty} KG."
+        )
+    consumed = _consume_work_order_stock(
+        db,
+        tenant,
+        work_order_code=wo_code,
+        quantity_kg=qty,
+        bag_code=payload.bag_code,
+        bag_codes=list(payload.bag_codes or []),
+    )
+    lot = _lot_from_consumed_bags(db, tenant, consumed, payload.lot_code)
+    if lot is None:
+        raise ValidationError(
+            f"No production lot on in-stock bags for {wo_code}. Complete activation first."
+        )
+    lot_meta = lot.metadata_ if isinstance(lot.metadata_, dict) else {}
+    now_iso = datetime.now(timezone.utc).isoformat()
+    lot.metadata_ = {**lot_meta, "last_dispatch_kg": str(qty), "last_dispatch_at": now_iso}
+
+    order = None
+    order_meta: dict = {}
+    order_status = "SHIPPED"
+    order_code = wo_code
+    remaining_after = max(pending - qty, Decimal("0"))
+    dispatch_code = resolve_ac_business_code(db, provided=None, entity="ac_dispatch")
+    if payload.customer_order_id:
+        order = repo.get_by_pk(
+            CustomerOrder, CustomerOrder.customer_order_id, payload.customer_order_id
+        )
+        order_meta = order.metadata_ if isinstance(order.metadata_, dict) else {}
+        if order_meta.get("flow") == "CUSTOMER_SALES":
+            lines = (
+                repo.query(CustomerOrderLine)
+                .filter(CustomerOrderLine.order_id == order.customer_order_id)
+                .all()
+            )
+            line = lines[0] if lines else None
+            ordered = Decimal(str(order_meta.get("ordered_kg") or (line.quantity if line else 0) or 0))
+            dispatched = Decimal(str(order_meta.get("dispatched_kg") or 0))
+            remaining = max(ordered - dispatched, Decimal("0"))
+            if qty > remaining:
+                raise ValidationError(
+                    f"Dispatch quantity {qty} KG exceeds remaining PO quantity {remaining} KG"
+                )
+            dispatched += qty
+            remaining_po = max(ordered - dispatched, Decimal("0"))
+            order.status = "CLOSED" if remaining_po <= 0 else "PARTIAL"
+            order.metadata_ = {
+                **order_meta,
+                "dispatched_kg": str(dispatched),
+                "last_dispatch_id": dispatch_code,
+                "last_dispatch_lot": lot.lot_code,
+                "last_dispatch_kg": str(qty),
+            }
+            remaining_after = remaining_po
+            order_status = order.status or "OPEN"
+            order_code = order.order_code
+
+    customer = None
+    if order is not None and order.customer_id:
+        customer = repo.get_by_pk(Customer, Customer.customer_id, order.customer_id)
+    grade_code = payload.grade_code or work_order.get("grade") or (consumed[0].get("grade") if consumed else None)
+    dispatch_meta = {
+        "customer_id": customer.customer_code if customer else None,
+        "order_id": order_code,
+        "customer_order_id": str(order.customer_order_id) if order is not None else None,
+        "work_order_code": wo_code,
+        "grade_code": grade_code,
+        "vehicle_number": payload.vehicle_number,
+        "transporter_name": payload.transporter_name,
+        "dispatch_status": "Shipped",
+        "dispatch_date": datetime.now(timezone.utc).isoformat(),
+        "remarks": payload.remarks,
+        "lines": [
+            {
+                "lot_id": lot.lot_code,
+                "part_id": grade_code,
+                "dispatch_quantity": str(qty),
+                "accepted_quantity": str(qty),
+                "rejected_quantity": "0",
+                "bag_codes": [str(row.get("bag_code") or "") for row in consumed if row.get("bag_code")],
+            }
+        ],
+    }
+    repo.add(
+        QualityCheck(
+            check_code=dispatch_code,
+            production_lot_id=lot.production_lot_id,
+            check_type="DISPATCH",
+            status="Shipped",
+            metadata_=dispatch_meta,
+        )
+    )
+    repo.db.commit()
+    stock_after = sum(
+        (
+            Decimal(str(bag.get("remaining_kg") or 0))
+            for bag in _in_stock_bags_for_work_order(db, tenant, wo_code)
+        ),
+        Decimal("0"),
+    )
+    return AcDispatchFromOrderResponse(
+        dispatch_id=dispatch_code,
+        order_code=order_code,
+        work_order_code=wo_code,
+        lot_code=lot.lot_code,
+        grade_code=grade_code,
+        quantity_kg=qty,
+        remaining_on_order_kg=remaining_after,
+        order_status=order_status,
+        stock_on_hand_after_kg=stock_after,
+    )
+
+
 def create_ac_dispatch_from_order(
     db: Session, tenant: TenantContext, payload: AcDispatchFromOrderCreate
 ) -> AcDispatchFromOrderResponse:
+    if (payload.work_order_code or "").strip():
+        return _create_ac_dispatch_from_work_order(db, tenant, payload)
+    if payload.customer_order_id is None:
+        raise ValidationError("Choose a work order number.")
     sync_ac_sequences(db, tenant.tenant_id)
     repo = _repo(db, tenant)
     order = repo.get_by_pk(
@@ -1319,6 +1613,7 @@ def create_ac_dispatch_from_order(
     return AcDispatchFromOrderResponse(
         dispatch_id=dispatch_code,
         order_code=order.order_code,
+        work_order_code=(payload.work_order_code or "").strip() or None,
         lot_code=lot.lot_code,
         grade_code=payload.grade_code or grade_code,
         quantity_kg=qty,
@@ -1341,6 +1636,18 @@ def create_make_to_stock_production_order(
         )
         inward = _require_raw_material_inward_order(db, tenant, inward)
         meta = inward.metadata_ if isinstance(inward.metadata_, dict) else {}
+        already_allocated = Decimal(str(meta.get("allocated_to_production_kg") or 0))
+        already_lots = meta.get("released_lots") if isinstance(meta.get("released_lots"), list) else []
+        if already_allocated > 0 or already_lots or meta.get("released_to_production_at"):
+            raise ValidationError(
+                f"Inward {inward.order_code} is already released to production."
+            )
+        separation = (
+            meta.get("grade_separation")
+            if isinstance(meta.get("grade_separation"), dict)
+            else {}
+        )
+        assert_rms_outward_before_release(meta, inward.order_code)
 
         release_qty = Decimal(str(payload.quantity))
         remaining = ac_stock.allocate_raw_from_inward(
@@ -1481,21 +1788,27 @@ def create_make_to_stock_production_order(
             )
             outward_src = ac_inbound_workflow._kiln_feed_outward_bags(meta)
             if grade_label:
+                wanted = ac_inbound_admin._canonical_outward_grade(grade_label)
                 matched = [
                     bag
                     for bag in outward_src
-                    if (bag.get("grade") or "").strip() == grade_label
+                    if ac_inbound_admin._canonical_outward_grade(
+                        bag.get("grade") or bag.get("grade_label") or ""
+                    )
+                    == wanted
                 ]
-            elif len(split_entries) == 1:
-                matched = list(outward_src)
+                if not matched:
+                    matched = list(outward_src)
             else:
-                matched = []
+                matched = list(outward_src)
             outward_bags = [
                 {
                     "bag_code": bag.get("bag_code"),
-                    "grade_label": grade_label or bag.get("grade"),
+                    "grade": grade_label or bag.get("grade"),
+                    "grade_label": grade_label or bag.get("grade") or bag.get("grade_label"),
                     "rotary": bag.get("rotary"),
                     "quantity_kg": bag.get("weight_kg") or bag.get("quantity_kg"),
+                    "weight_kg": bag.get("weight_kg") or bag.get("quantity_kg"),
                 }
                 for bag in matched
                 if bag.get("bag_code")
@@ -1503,6 +1816,7 @@ def create_make_to_stock_production_order(
             lot_row.metadata_ = {
                 **(lot_row.metadata_ if isinstance(lot_row.metadata_, dict) else {}),
                 "source_inward_order_id": str(source_inward_id),
+                "source_inward_order_code": inward.order_code,
                 **({"crusher_grade": grade_label} if grade_label else {}),
                 **({"crusher_outward_bags": outward_bags} if outward_bags else {}),
                 **(
@@ -1763,6 +2077,20 @@ def get_lot_traceability(
     return mes_core_traceability.get_traceability(db, tenant, lot_code)
 
 
+def lookup_material_trace(db: Session, tenant: TenantContext, query: str):
+    from app.services.industry.activated_carbon import material_trace as ac_material_trace
+
+    return ac_material_trace.lookup_material_trace(db, tenant, query)
+
+
+def list_material_trace_options(
+    db: Session, tenant: TenantContext, kind: str, month: str | None = None
+):
+    from app.services.industry.activated_carbon import material_trace as ac_material_trace
+
+    return ac_material_trace.list_material_trace_options(db, tenant, kind, month)
+
+
 def list_knowledge_graph_triples(
     db: Session, tenant: TenantContext, limit: int = 100
 ) -> List[TripleOut]:
@@ -1784,6 +2112,9 @@ def get_masters(db: Session, tenant: TenantContext) -> AcMastersOut:
     obsolete_product_ids = {
         t.product_id for t in raw_material_types if t.is_obsolete
     }
+    active_type_ids = {
+        t.product_id for t in raw_material_types if not t.is_obsolete
+    }
     raw_products = [
         p
         for p in products
@@ -1794,7 +2125,9 @@ def get_masters(db: Session, tenant: TenantContext) -> AcMastersOut:
         and (p.status or "").upper() != "OBSOLETE"
         and p.product_id not in obsolete_product_ids
     ]
-    if not raw_products:
+    if active_type_ids:
+        raw_products = [p for p in raw_products if p.product_id in active_type_ids]
+    elif not raw_products:
         raw_products = products
     finished_ids: list = []
     seen_finished: set = set()
@@ -1830,16 +2163,30 @@ def get_masters(db: Session, tenant: TenantContext) -> AcMastersOut:
     production_lots = mes_core_entities.list_production_lots(db, tenant)
     kiln_rows = _list_tenant_kiln_resources(db, tenant)
     from app.services.industry.activated_carbon.station_machines import ensure_station_machines
+    from app.services.industry.activated_carbon import plant_equipment as ac_plant_equipment
+    from app.services.industry.activated_carbon import process_rules as ac_process_rules
+    from app.services.industry.activated_carbon import mesh_grade as ac_mesh_grade
 
     ensure_station_machines(db, tenant)
+    ac_plant_equipment.ensure_plant_equipment(db, tenant)
+    ac_process_rules.ensure_process_rules(db, tenant)
+    ac_process_rules.ensure_inbound_catalog(db, tenant)
+    ac_mesh_grade.ensure_mesh_grade_map(db, tenant)
     repo = _repo(db, tenant)
     all_resource_rows = repo.query(Resource).order_by(Resource.resource_code).all()
+    destoner_rows = [
+        _resource_out(r) for r in ac_plant_equipment.list_destoner_resources(db, tenant)
+    ]
+    destoner_ids = {r.resource_id for r in ac_plant_equipment.list_destoner_resources(db, tenant)}
     machine_rows = [
         _resource_out(r)
         for r in all_resource_rows
         if (r.resource_type or "").upper() == "MACHINE"
         and not (r.resource_code or "").upper().startswith("RES-KILN")
         and str((r.metadata_ or {}).get("role") or "").lower() != "post_activation"
+        and str((r.metadata_ or {}).get("station") or "").lower() != "fg_qc"
+        and "finished goods" not in (r.resource_name or "").lower()
+        and r.resource_id not in destoner_ids
     ]
     tool_rows = [
         _resource_out(r) for r in all_resource_rows if (r.resource_type or "").upper() == "TOOL"
@@ -1858,6 +2205,7 @@ def get_masters(db: Session, tenant: TenantContext) -> AcMastersOut:
         production_orders=production_orders,
         production_lots=production_lots,
         kilns=[_resource_out(r) for r in kiln_rows],
+        destoners=destoner_rows,
         machines=machine_rows,
         tools=tool_rows,
         labor_pools=labor_rows,
@@ -2040,6 +2388,334 @@ def update_plant_resource(
     return _resource_out(resource)
 
 
+def create_destoner(
+    db: Session, tenant: TenantContext, payload: AcDestonerCreate
+) -> ResourceOut:
+    from app.services.industry.activated_carbon import plant_equipment as ac_plant_equipment
+
+    kwargs: dict[str, Any] = {"name": payload.destoner_name}
+    if payload.unit_count is not None:
+        kwargs["unit_count"] = int(payload.unit_count)
+    if payload.monthly_capacity_kg is not None:
+        kwargs["monthly_capacity_kg"] = int(payload.monthly_capacity_kg)
+    resource = ac_plant_equipment.create_destoner_resource(db, tenant, **kwargs)
+    if payload.status:
+        resource.status = payload.status
+        _repo(db, tenant).commit_refresh(resource)
+    return _resource_out(resource)
+
+
+def get_destoner_daily_ctc(db: Session, tenant: TenantContext) -> AcDestonerDailyCtcOut:
+    from app.services.industry.activated_carbon import plant_equipment as ac_plant_equipment
+
+    from app.services.industry.activated_carbon import mesh_grade as ac_mesh_grade
+
+    today = plant_today(tenant.timezone)
+    destoners = _list_destoner_resources(db, tenant)
+    plan = ac_plant_equipment.tenant_daily_ctc_plan(db, tenant, today)
+    catalog = ac_mesh_grade.get_mesh_grade_map(db, tenant)
+    return AcDestonerDailyCtcOut(
+        assignment_date=str(today),
+        destoners=[
+            AcDestonerDailyCtcRow(
+                resource_code=str(row.resource_code or ""),
+                resource_name=str(row.resource_name or row.resource_code or ""),
+                **ac_plant_equipment.destoner_plan_meta(row, plan, today),
+            )
+            for row in destoners
+        ],
+        mesh_configurations=catalog.get("configurations") or [],
+    )
+
+
+def save_destoner_daily_ctc(
+    db: Session,
+    tenant: TenantContext,
+    payload: AcDestonerDailyCtcSave,
+    user: Any = None,
+) -> AcDestonerDailyCtcOut:
+    from app.services.industry.activated_carbon import plant_equipment as ac_plant_equipment
+    from app.services.industry.activated_carbon import process_rules as ac_process_rules
+
+    destoners = {str(row.resource_code or ""): row for row in _list_destoner_resources(db, tenant)}
+    today = plant_today(tenant.timezone)
+    user_id = None
+    if user is not None:
+        user_id = getattr(user, "username", None) or getattr(user, "email", None) or getattr(
+            user, "sub", None
+        )
+    assignments: dict[str, dict] = {}
+    for row in payload.destoners or []:
+        code = (row.resource_code or "").strip()
+        machine = destoners.get(code)
+        if machine is None:
+            raise ValidationError(f"Destoner '{code}' was not found.")
+        rounded = None
+        if row.assigned_ctc not in (None, ""):
+            rounded = ac_process_rules.round_ctc(row.assigned_ctc)
+            if rounded is None:
+                raise ValidationError(f"CTC for {code} must be a number.")
+        ac_plant_equipment.set_destoner_daily_ctc(
+            machine,
+            str(rounded) if rounded is not None else None,
+            mesh=None,
+            user_id=str(user_id) if user_id else None,
+            today=today,
+        )
+        if rounded is not None:
+            assignments[code] = {
+                "ctc": str(rounded),
+                "mesh": None,
+                "by": str(user_id) if user_id else None,
+            }
+            _stage_triple(
+                db,
+                tenant,
+                TripleCreate(
+                    subject_uri=f"urn:nyra:ac:destoner:{machine.resource_code}",
+                    predicate_uri="urn:nyra:predicate:captures",
+                    object_uri="urn:nyra:ac:parameter:CTC",
+                    object_literal=str(rounded),
+                    object_datatype="http://www.w3.org/2001/XMLSchema#decimal",
+                    source_table="cfg.tenant",
+                    source_id=tenant.tenant_id,
+                ),
+            )
+    ac_plant_equipment.save_tenant_daily_ctc_plan(
+        db, tenant, assignments, today=today
+    )
+    _repo(db, tenant).db.commit()
+    return get_destoner_daily_ctc(db, tenant)
+
+
+def get_kiln_setpoints(db: Session, tenant: TenantContext) -> AcKilnSetpointsOut:
+    from app.services.industry.activated_carbon import plant_equipment as ac_plant_equipment
+    from app.services.industry.activated_carbon.kiln_parameters_catalog import (
+        list_kiln_parameter_definitions,
+    )
+    from app.services.industry.activated_carbon.station_machines import monthly_capacity_kg_of
+
+    plan = ac_plant_equipment.kiln_setpoint_plan(db, tenant)
+    definitions = list_kiln_parameter_definitions(db, tenant)
+    rows: list[AcKilnSetpointRow] = []
+    for kiln in _list_tenant_kiln_resources(db, tenant):
+        code = str(kiln.resource_code or "")
+        entry = plan.get(code) or {}
+        params = dict(entry.get("parameters") or {})
+        monthly = monthly_capacity_kg_of(kiln)
+        residence = ac_plant_equipment.residence_minutes_for(plan, code)
+        rows.append(
+            AcKilnSetpointRow(
+                resource_code=code,
+                resource_name=str(kiln.resource_name or code),
+                monthly_capacity_kg=monthly,
+                residence_time_min=residence,
+                designed_monthly_kg=ac_plant_equipment.designed_monthly_kg_for_residence(
+                    monthly, residence
+                ),
+                parameters=params,
+                updated_at=entry.get("updated_at"),
+                updated_by=entry.get("by"),
+            )
+        )
+    return AcKilnSetpointsOut(
+        reference_residence_min=ac_plant_equipment.REFERENCE_RESIDENCE_MIN,
+        definitions=definitions,
+        kilns=rows,
+        history=[
+            AcKilnSetpointChange(
+                kiln_resource_code=str(item.get("kiln_resource_code") or ""),
+                at=item.get("at"),
+                by=item.get("by"),
+                parameters=item.get("parameters") if isinstance(item.get("parameters"), dict) else {},
+            )
+            for item in ac_plant_equipment.kiln_setpoint_history(db, tenant)
+            if item.get("kiln_resource_code")
+        ],
+    )
+
+
+def save_kiln_setpoints(
+    db: Session,
+    tenant: TenantContext,
+    payload: AcKilnSetpointsSave,
+    user: Any = None,
+) -> AcKilnSetpointsOut:
+    from app.services.industry.activated_carbon import plant_equipment as ac_plant_equipment
+    from app.services.industry.activated_carbon.kiln_parameters_catalog import (
+        list_kiln_parameter_definitions,
+    )
+
+    kilns = {str(row.resource_code or ""): row for row in _list_tenant_kiln_resources(db, tenant)}
+    allowed = {row.key for row in list_kiln_parameter_definitions(db, tenant)}
+    user_id = None
+    if user is not None:
+        user_id = getattr(user, "username", None) or getattr(user, "email", None) or getattr(
+            user, "sub", None
+        )
+    assignments: dict[str, dict] = {}
+    for row in payload.kilns or []:
+        code = (row.resource_code or "").strip()
+        machine = kilns.get(code)
+        if machine is None:
+            raise ValidationError(f"Kiln '{code}' was not found.")
+        cleaned: dict[str, float] = {}
+        for key, value in (row.parameters or {}).items():
+            if key not in allowed:
+                raise ValidationError(f"Unknown kiln parameter '{key}'.")
+            if value in (None, ""):
+                continue
+            try:
+                number = float(value)
+            except (TypeError, ValueError):
+                raise ValidationError(f"{key} for {code} must be a number.") from None
+            if number < 0:
+                raise ValidationError(f"{key} for {code} cannot be negative.")
+            if key == "residence_time_min" and number <= 0:
+                raise ValidationError(f"Residence time for {code} must be greater than 0.")
+            cleaned[key] = number
+        assignments[code] = {
+            "parameters": cleaned,
+            "by": str(user_id) if user_id else None,
+        }
+        for key, number in cleaned.items():
+            _stage_triple(
+                db,
+                tenant,
+                TripleCreate(
+                    subject_uri=f"urn:nyra:ac:kiln:{code}",
+                    predicate_uri="urn:nyra:predicate:captures",
+                    object_uri=f"urn:nyra:ac:parameter:{key}",
+                    object_literal=str(number),
+                    object_datatype="http://www.w3.org/2001/XMLSchema#decimal",
+                    source_table="cfg.tenant",
+                    source_id=tenant.tenant_id,
+                ),
+            )
+    ac_plant_equipment.save_kiln_setpoint_plan(db, tenant, assignments)
+    _repo(db, tenant).db.commit()
+    return get_kiln_setpoints(db, tenant)
+
+
+def _dispatch_kg_by_work_order(db: Session, tenant: TenantContext) -> dict[str, Decimal]:
+    from app.services.mes_core.dispatch_workflow import dispatch_quantity_kg
+
+    totals: dict[str, Decimal] = {}
+    rows = (
+        _repo(db, tenant)
+        .query(QualityCheck)
+        .filter(QualityCheck.check_type == "DISPATCH")
+        .all()
+    )
+    for row in rows:
+        meta = row.metadata_ if isinstance(row.metadata_, dict) else {}
+        code = str(meta.get("work_order_code") or "").strip()
+        if not code:
+            continue
+        totals[code] = totals.get(code, Decimal("0")) + dispatch_quantity_kg(meta)
+    return totals
+
+
+def _work_order_out(
+    row: dict,
+    dispatched_kg: Decimal | None = None,
+    output_kg: Decimal | None = None,
+) -> AcWorkOrderOut:
+    ordered = Decimal(str(row.get("quantity_kg") or 0))
+    dispatched = (
+        Decimal(str(dispatched_kg))
+        if dispatched_kg is not None
+        else Decimal(str(row.get("dispatched_kg") or 0))
+    )
+    from app.services.industry.activated_carbon import work_orders as ac_work_orders
+
+    pending = ac_work_orders.pending_dispatch_kg(ordered, dispatched)
+    outputted = (
+        Decimal(str(output_kg))
+        if output_kg is not None
+        else Decimal(str(row.get("output_kg") or 0))
+    )
+    return AcWorkOrderOut(
+        work_order_code=str(row.get("work_order_code") or ""),
+        grade=row.get("grade"),
+        ctc=row.get("ctc"),
+        quantity_kg=ordered,
+        loaded_kg=Decimal(str(row.get("loaded_kg") or 0)),
+        output_kg=outputted,
+        fulfilled_kg=Decimal(str(row.get("fulfilled_kg") or 0)),
+        dispatched_kg=dispatched,
+        pending_kg=pending,
+        status=str(row.get("status") or "OPEN"),
+        created_at=row.get("created_at"),
+        created_by=row.get("created_by"),
+        kiln_resource_code=row.get("kiln_resource_code"),
+    )
+
+
+def list_activation_work_orders(db: Session, tenant: TenantContext) -> AcWorkOrderListOut:
+    from app.services.industry.activated_carbon import work_orders as ac_work_orders
+
+    dispatched = _dispatch_kg_by_work_order(db, tenant)
+    output_kg = ac_work_orders.kiln_output_kg_by_work_order(db, tenant)
+    return AcWorkOrderListOut(
+        work_orders=[
+            _work_order_out(
+                row,
+                dispatched.get(str(row.get("work_order_code") or ""), Decimal("0")),
+                output_kg.get(str(row.get("work_order_code") or ""), Decimal("0")),
+            )
+            for row in ac_work_orders.list_work_orders(db, tenant)
+        ],
+        grades=ac_work_orders.kiln_feed_grade_options(db, tenant),
+    )
+
+
+def create_activation_work_order(
+    db: Session,
+    tenant: TenantContext,
+    payload: AcWorkOrderCreate,
+    user: Any = None,
+) -> AcWorkOrderOut:
+    from app.services.industry.activated_carbon import work_orders as ac_work_orders
+
+    user_id = None
+    if user is not None:
+        user_id = getattr(user, "username", None) or getattr(user, "email", None) or getattr(
+            user, "sub", None
+        )
+    row = ac_work_orders.create_work_order(
+        db,
+        tenant,
+        grade=payload.grade,
+        ctc=payload.ctc,
+        quantity_kg=payload.quantity_kg,
+        user_id=str(user_id) if user_id else None,
+    )
+    _stage_triple(
+        db,
+        tenant,
+        TripleCreate(
+            subject_uri=f"urn:nyra:ac:workOrder:{row['work_order_code']}",
+            predicate_uri="urn:nyra:predicate:captures",
+            object_uri="urn:nyra:ac:parameter:CTC",
+            object_literal=str(row.get("ctc") or ""),
+            object_datatype="http://www.w3.org/2001/XMLSchema#decimal",
+            source_table="cfg.tenant",
+            source_id=tenant.tenant_id,
+        ),
+    )
+    _repo(db, tenant).db.commit()
+    return _work_order_out(row)
+
+
+def delete_activation_work_order(
+    db: Session, tenant: TenantContext, work_order_code: str
+) -> AcWorkOrderOut:
+    from app.services.industry.activated_carbon import work_orders as ac_work_orders
+
+    return _work_order_out(ac_work_orders.delete_work_order(db, tenant, work_order_code))
+
+
 def create_kiln(db: Session, tenant: TenantContext, payload: AcKilnCreate) -> AcKilnOut:
     """Register an activation kiln (machine resource + linked equipment)."""
     repo = _repo(db, tenant)
@@ -2164,8 +2840,11 @@ def _raw_material_status(db: Session, tenant: TenantContext) -> AcRawMaterialSta
 
 
 def _kiln_status_rows(db: Session, tenant: TenantContext) -> list[AcKilnStatusOut]:
+    from app.services.industry.activated_carbon import plant_equipment as ac_plant_equipment
+
     repo = _repo(db, tenant)
     kiln_rows = _list_tenant_kiln_resources(db, tenant)
+    kiln_setpoints = ac_plant_equipment.kiln_setpoint_plan(db, tenant)
     executions = (
         repo.query(OperationExecution)
         .order_by(OperationExecution.created_at.desc())
@@ -2255,6 +2934,8 @@ def _kiln_status_rows(db: Session, tenant: TenantContext) -> list[AcKilnStatusOu
             seen.add(key)
             unique_events.append(ev)
         loaded_kg = sum(Decimal(str(ev.get("kg") or 0)) for ev in unique_events)
+        monthly = ac_station_machines.monthly_capacity_kg_of(kiln)
+        residence = ac_plant_equipment.residence_minutes_for(kiln_setpoints, code)
         rows.append(
             AcKilnStatusOut(
                 resource_code=code,
@@ -2263,7 +2944,11 @@ def _kiln_status_rows(db: Session, tenant: TenantContext) -> list[AcKilnStatusOu
                 active_lot_code=lot.lot_code if lot else None,
                 active_lot_kg=loaded_kg if unique_events else (lot.lot_quantity if lot else None),
                 loaded_kg=loaded_kg if unique_events else None,
-                monthly_capacity_kg=ac_station_machines.monthly_capacity_kg_of(kiln),
+                monthly_capacity_kg=monthly,
+                residence_time_min=residence,
+                designed_monthly_kg=ac_plant_equipment.designed_monthly_kg_for_residence(
+                    monthly, residence
+                ),
                 feed_events=unique_events,
                 last_reading_at=last_at,
             )
@@ -2340,8 +3025,39 @@ def _lot_pipeline_stage(
     return lot_status or "Unknown"
 
 
+def _dispatched_kg_by_lot_id(db: Session, tenant: TenantContext) -> dict:
+    from app.services.mes_core.dispatch_workflow import dispatch_quantity_kg
+
+    totals: dict = {}
+    rows = (
+        _repo(db, tenant)
+        .query(QualityCheck)
+        .filter(QualityCheck.check_type == "DISPATCH")
+        .all()
+    )
+    for row in rows:
+        lot_id = row.production_lot_id
+        if lot_id is None:
+            continue
+        meta = row.metadata_ if isinstance(row.metadata_, dict) else {}
+        totals[lot_id] = totals.get(lot_id, Decimal("0")) + dispatch_quantity_kg(meta)
+    return totals
+
+
+def _in_stock_kg_by_lot_code(db: Session, tenant: TenantContext) -> dict[str, Decimal]:
+    totals: dict[str, Decimal] = {}
+    for bag in ac_post_activation.list_available_in_stock_bags(db, tenant):
+        code = str(bag.get("lot_code") or "").strip()
+        if not code:
+            continue
+        totals[code] = totals.get(code, Decimal("0")) + Decimal(str(bag.get("remaining_kg") or 0))
+    return totals
+
+
 def _lot_line_rows(db: Session, tenant: TenantContext) -> list[AcLotLineOut]:
     repo = _repo(db, tenant)
+    dispatched_by_lot = _dispatched_kg_by_lot_id(db, tenant)
+    in_stock_by_lot = _in_stock_kg_by_lot_code(db, tenant)
     orders = repo.query(CustomerOrder).all()
     line_to_order: dict = {}
     for order in orders:
@@ -2376,6 +3092,8 @@ def _lot_line_rows(db: Session, tenant: TenantContext) -> list[AcLotLineOut]:
                 production_order_code=po.production_order_code if po else None,
                 lot_code=lot.lot_code,
                 lot_quantity=lot.lot_quantity,
+                dispatched_kg=dispatched_by_lot.get(lot.production_lot_id, Decimal("0")),
+                in_stock_kg=in_stock_by_lot.get(lot.lot_code, Decimal("0")),
                 status=lot.status,
                 feasibility_status=feas,
                 pipeline_stage=stage,
@@ -2610,6 +3328,7 @@ def _dispatch_dashboard_summary(
                 AcRecentDispatchOut(
                     dispatch_id=row.check_code,
                     order_code=meta.get("order_id"),
+                    work_order_code=meta.get("work_order_code"),
                     lot_code=lot.lot_code if lot else None,
                     quantity_kg=line_qty,
                     dispatch_date=parsed_dt or row.created_at,
@@ -2994,6 +3713,10 @@ def create_raw_material_inward(
         raise ValidationError("Our weight (KG) is required on gate receipt.")
     if payload.our_weight_kg is not None:
         payload.quantity = payload.our_weight_kg
+    if payload.quantity is None or payload.quantity <= 0:
+        raise ValidationError("Our weight (KG) must be greater than zero.")
+    if payload.supplier_weight_kg is not None and payload.quantity > payload.supplier_weight_kg:
+        raise ValidationError("Our weight cannot be greater than the supplier weight.")
     ac_raw_material_types.assert_raw_material_active_for_inward(
         db, tenant, payload.product_id
     )
@@ -3067,7 +3790,48 @@ def create_raw_material_inward(
         order=order_resp.order,
         line=order_resp.line,
         production_order=po_out,
+        bags=[],
     )
+
+
+def _debit_note_for_order(
+    db: Session,
+    tenant: TenantContext,
+    meta: dict,
+    *,
+    our_weight_fallback=None,
+    supplier_name=None,
+    supplier_code=None,
+):
+    from app.services.industry.activated_carbon import debit_notes as ac_debit_notes
+    from app.services.industry.activated_carbon import process_rules as ac_process_rules
+
+    return ac_debit_notes.evaluate_debit_note(
+        meta,
+        ac_process_rules.get_process_rules(db, tenant),
+        our_weight_fallback=our_weight_fallback,
+        supplier_name=supplier_name,
+        supplier_code=supplier_code,
+    )
+
+
+def raise_inward_debit_note(
+    db: Session,
+    tenant: TenantContext,
+    customer_order_id,
+    payload,
+    *,
+    raised_by: str | None = None,
+):
+    from app.services.industry.activated_carbon import debit_notes as ac_debit_notes
+
+    ac_debit_notes.raise_debit_note(
+        db, tenant, customer_order_id, payload, raised_by=raised_by
+    )
+    order = _repo(db, tenant).get_by_pk(
+        CustomerOrder, CustomerOrder.customer_order_id, customer_order_id
+    )
+    return _raw_material_qc_from_order(db, tenant, order)
 
 
 def _raw_material_qc_from_order(
@@ -3091,6 +3855,15 @@ def _raw_material_qc_from_order(
 
     line, product = raw_line
     meta = order.metadata_ if isinstance(order.metadata_, dict) else {}
+    initial_qc = meta.get("initial_qc") if isinstance(meta.get("initial_qc"), dict) else {}
+    supplier = None
+    if getattr(order, "supplier_id", None):
+        try:
+            supplier = repo.get_by_pk(Supplier, Supplier.supplier_id, order.supplier_id)
+        except NotFoundError:
+            supplier = None
+    supplier_code = getattr(supplier, "supplier_code", None)
+    supplier_name = getattr(supplier, "supplier_name", None)
     qc = meta.get("raw_material_qc") if isinstance(meta.get("raw_material_qc"), dict) else {}
     crush = (
         meta.get("raw_material_crush")
@@ -3120,7 +3893,24 @@ def _raw_material_qc_from_order(
             material_type, meta
         )
     except NotFoundError:
-        inbound_prep_complete = True
+        from types import SimpleNamespace
+        from app.services.industry.activated_carbon import process_rules as ac_process_rules
+
+        material_type = SimpleNamespace(
+            inbound_operations=ac_process_rules.normalized_inbound_operations([])
+        )
+        inbound_steps = ac_inbound_execution.build_inbound_step_statuses(
+            material_type, meta
+        )
+        inbound_prep_complete = ac_inbound_execution.mandatory_inbound_prep_complete(
+            material_type, meta
+        )
+        next_inbound_step = ac_inbound_execution.next_inbound_process_step(
+            material_type, meta
+        )
+        next_inbound_operation_code = ac_inbound_execution.next_inbound_operation_code(
+            material_type, meta
+        )
 
     return AcRawMaterialQcOut(
         customer_order_id=order.customer_order_id,
@@ -3135,7 +3925,9 @@ def _raw_material_qc_from_order(
             and meta["inward_receipt"].get("our_weight_kg") is not None
             else line.quantity
         ),
-        moisture_pct=qc.get("moisture_pct"),
+        moisture_pct=initial_qc.get("moisture_pct") or qc.get("moisture_pct"),
+        dust_pct=initial_qc.get("dust_pct"),
+        volatility=initial_qc.get("volatility"),
         ash_pct=qc.get("ash_pct"),
         foreign_matter_pct=qc.get("foreign_matter_pct"),
         stones_kg=qc.get("stones_kg"),
@@ -3158,6 +3950,17 @@ def _raw_material_qc_from_order(
             else None
         )
         or qc.get("operator_remarks"),
+        supplier_id=order.supplier_id,
+        supplier_code=supplier_code,
+        supplier_name=supplier_name,
+        debit_note=_debit_note_for_order(
+            db,
+            tenant,
+            meta,
+            our_weight_fallback=line.quantity,
+            supplier_name=supplier_name,
+            supplier_code=supplier_code,
+        ),
     )
 
 
@@ -3356,6 +4159,9 @@ def _stage_crushing_triples(
 def list_inbound_execution(
     db: Session, tenant: TenantContext
 ) -> List[AcInboundExecutionOut]:
+    from app.services.industry.activated_carbon import process_rules as ac_process_rules
+
+    ac_process_rules.ensure_inbound_catalog(db, tenant)
     rows = list_raw_material_qc(db, tenant)
     return [AcInboundExecutionOut.model_validate(row.model_dump()) for row in rows]
 
@@ -3542,6 +4348,20 @@ def _kiln_feed_event_list(meta: dict) -> list[dict]:
     return [dict(row) for row in raw if isinstance(row, dict)] if isinstance(raw, list) else []
 
 
+def _assert_bag_not_already_in_kiln(db: Session, tenant: TenantContext, bag_code: Optional[str]) -> None:
+    """A bag already charged to any kiln cannot be entered again."""
+    code = (bag_code or "").strip()
+    if not code:
+        return
+    from app.services.industry.activated_carbon import plant_equipment as ac_plant_equipment
+
+    for row in ac_plant_equipment.ensure_six_kilns(db, tenant):
+        meta = row.metadata_ if isinstance(row.metadata_, dict) else {}
+        for event in _kiln_feed_event_list(meta):
+            if str(event.get("bag_code") or "") == code:
+                raise WorkflowError(f"Bag '{code}' is already loaded into the kiln")
+
+
 def _next_kiln_feed_bag(meta: dict, requested_bag: Optional[str] = None) -> Optional[dict]:
     bags = meta.get("crusher_outward_bags")
     bags = [row for row in bags if isinstance(row, dict)] if isinstance(bags, list) else []
@@ -3558,7 +4378,9 @@ def _next_kiln_feed_bag(meta: dict, requested_bag: Optional[str] = None) -> Opti
         for bag in bags:
             if str(bag.get("bag_code") or "") == code:
                 return bag
-        return {"bag_code": code, "quantity_kg": None}
+        raise ValidationError(
+            f"Bag '{code}' is not available for kiln feed. Unburnt and Stones stay off the kiln."
+        )
     for bag in bags:
         code = str(bag.get("bag_code") or "")
         if code and code not in fed:
@@ -3566,13 +4388,22 @@ def _next_kiln_feed_bag(meta: dict, requested_bag: Optional[str] = None) -> Opti
     return None
 
 
+def _kiln_resource(db: Session, tenant: TenantContext, kiln_code: str) -> Optional[Resource]:
+    """Kilns are plant-wide. Match the code shown on Execution, not one workspace."""
+    code = (kiln_code or "").strip()
+    if not code:
+        return None
+    return (
+        _tenant_resources(db, tenant)
+        .filter(Resource.resource_code == code)
+        .first()
+    )
+
+
 def _append_kiln_resource_feed(
     db: Session, tenant: TenantContext, kiln_code: str, event: dict
 ) -> None:
-    repo = _repo(db, tenant)
-    resource = (
-        repo.query(Resource).filter(Resource.resource_code == kiln_code).first()
-    )
+    resource = _kiln_resource(db, tenant, kiln_code)
     if resource is None:
         return
     meta = resource.metadata_ if isinstance(resource.metadata_, dict) else {}
@@ -3586,6 +4417,8 @@ def _append_kiln_resource_feed(
         "kiln_feed_events": events,
         "active_lot_codes": lot_codes,
         "active_lot_code": event.get("lot_code") or meta.get("active_lot_code"),
+        "current_work_order_code": event.get("work_order_code")
+        or meta.get("current_work_order_code"),
         "loaded_kg": str(sum(Decimal(str(ev.get("kg") or 0)) for ev in events)),
     }
     flag_modified(resource, "metadata_")
@@ -3595,65 +4428,160 @@ def _kiln_output_prefix(resource: Resource) -> str:
     return kiln_output_id_prefix(resource.resource_name or "", resource.resource_code or "")
 
 
+def _merged_kiln_feed_meta(db: Session, tenant: TenantContext, resource: Resource) -> dict:
+    """Kiln resource feed plus any loads stored only on the production lot."""
+    meta = dict(resource.metadata_ if isinstance(resource.metadata_, dict) else {})
+    code = str(resource.resource_code or "")
+    merged: list[dict] = []
+    seen: set[tuple] = set()
+
+    def _take(event: dict, lot_code: str | None = None) -> None:
+        row = dict(event)
+        if lot_code and not row.get("lot_code"):
+            row["lot_code"] = lot_code
+        if code and not row.get("kiln_resource_code"):
+            row["kiln_resource_code"] = code
+        key = (
+            str(row.get("lot_code") or ""),
+            str(row.get("bag_code") or ""),
+            str(row.get("loaded_at") or ""),
+            str(row.get("work_order_code") or ""),
+            str(row.get("kg") or row.get("quantity_kg") or ""),
+        )
+        if key in seen:
+            return
+        seen.add(key)
+        merged.append(row)
+
+    for event in _kiln_feed_event_list(meta):
+        _take(event)
+    for lot in _repo(db, tenant).query(ProductionLot).all():
+        lot_meta = lot.metadata_ if isinstance(lot.metadata_, dict) else {}
+        if str(lot_meta.get("kiln_resource_code") or "") != code:
+            continue
+        for event in _kiln_feed_event_list(lot_meta):
+            event_kiln = str(event.get("kiln_resource_code") or code)
+            if event_kiln != code:
+                continue
+            _take(event, lot.lot_code)
+    meta["kiln_feed_events"] = merged
+    return meta
+
+
 def list_kiln_output_bags(
     db: Session, tenant: TenantContext, kiln_resource_code: str
 ) -> AcKilnOutputListOut:
-    repo = _repo(db, tenant)
-    resource = (
-        repo.query(Resource)
-        .filter(Resource.resource_code == kiln_resource_code.strip())
-        .first()
-    )
+    resource = _kiln_resource(db, tenant, kiln_resource_code)
     if resource is None:
         raise ValidationError(f"Kiln '{kiln_resource_code}' was not found")
     meta = resource.metadata_ if isinstance(resource.metadata_, dict) else {}
     raw = meta.get("kiln_output_bags")
     bags = [row for row in raw if isinstance(row, dict)] if isinstance(raw, list) else []
+    from app.services.industry.activated_carbon import plant_equipment as ac_plant_equipment
+
+    current = (ac_plant_equipment.kiln_setpoint_plan(db, tenant).get(kiln_resource_code) or {})
     items = [
         AcKilnOutputBagOut(
             bag_code=str(row.get("bag_code") or ""),
             quantity_kg=Decimal(str(row.get("quantity_kg") or 0)),
             kiln_resource_code=kiln_resource_code,
             lot_code=row.get("lot_code"),
+            work_order_code=row.get("work_order_code"),
             created_at=row.get("created_at"),
+            created_by=row.get("created_by"),
+            kiln_parameters=row.get("kiln_parameters") if isinstance(row.get("kiln_parameters"), dict) else {},
+            kiln_parameters_at=row.get("kiln_parameters_at"),
         )
         for row in bags
         if row.get("bag_code")
     ]
     total = sum((row.quantity_kg for row in items), Decimal("0"))
+    from app.services.industry.activated_carbon import work_orders as ac_work_orders
+
+    balance = _merged_kiln_feed_meta(db, tenant, resource)
+    loaded = ac_work_orders.kiln_total_feed_kg(balance)
+    remaining = ac_work_orders.kiln_remaining_output_kg(balance)
+    work_order_code = ac_work_orders.kiln_current_work_order_code(balance)
+    feed_events = [
+        AcKilnFeedChipOut(
+            bag_code=str(event.get("bag_code") or "") or None,
+            kg=Decimal(str(event.get("kg") or event.get("quantity_kg") or 0)),
+            loaded_at=event.get("loaded_at"),
+            lot_code=event.get("lot_code"),
+            work_order_code=event.get("work_order_code"),
+            kiln_resource_code=str(event.get("kiln_resource_code") or kiln_resource_code),
+        )
+        for event in (balance.get("kiln_feed_events") or [])
+        if isinstance(event, dict)
+    ]
     return AcKilnOutputListOut(
         kiln_resource_code=kiln_resource_code,
+        current_parameters=current.get("parameters") if isinstance(current.get("parameters"), dict) else {},
+        current_parameters_at=current.get("updated_at"),
         bags=items,
         bag_count=len(items),
         total_kg=total,
+        loaded_kg=loaded,
+        remaining_kg=remaining,
+        work_order_code=work_order_code,
+        feed_events=feed_events,
     )
 
 
+def _session_actor(user: Any) -> str | None:
+    if user is None:
+        return None
+    raw = getattr(user, "username", None) or getattr(user, "email", None)
+    text = str(raw or "").strip()
+    return text or None
+
+
 def create_kiln_output_bag(
-    db: Session, tenant: TenantContext, payload: AcKilnOutputBagCreate
+    db: Session, tenant: TenantContext, payload: AcKilnOutputBagCreate, user: Any = None
 ) -> AcKilnOutputBagOut:
     repo = _repo(db, tenant)
     kiln_code = payload.kiln_resource_code.strip()
-    resource = repo.query(Resource).filter(Resource.resource_code == kiln_code).first()
+    resource = _kiln_resource(db, tenant, kiln_code)
     if resource is None:
         raise ValidationError(f"Kiln '{kiln_code}' was not found")
-    meta = resource.metadata_ if isinstance(resource.metadata_, dict) else {}
-    raw = meta.get("kiln_output_bags")
+    stored = resource.metadata_ if isinstance(resource.metadata_, dict) else {}
+    raw = stored.get("kiln_output_bags")
     bags = [dict(row) for row in raw if isinstance(row, dict)] if isinstance(raw, list) else []
+    balance = _merged_kiln_feed_meta(db, tenant, resource)
     now_iso = datetime.now(timezone.utc).isoformat()
-    lot_code = (payload.lot_code or meta.get("active_lot_code") or "").strip() or None
+    lot_code = (payload.lot_code or balance.get("active_lot_code") or "").strip() or None
+    from app.services.industry.activated_carbon import work_orders as ac_work_orders
+
+    ac_work_orders.assert_kiln_output_within_load(balance, payload.quantity_kg)
+    work_order_code = ac_work_orders.kiln_output_target_work_order(balance, payload.quantity_kg)
+    if not work_order_code:
+        raise ValidationError("Load a work order on this kiln before adding kiln output.")
+    work_order_ctc = None
+    try:
+        work_order_ctc = ac_work_orders.get_work_order(db, tenant, work_order_code).get("ctc")
+    except ValidationError:
+        work_order_ctc = None
     prefix = _kiln_output_prefix(resource)
-    bag_code = next_kiln_output_bag_code(repo.db, prefix)
-    meta["kiln_output_seq"] = int(bag_code.rsplit("_", 1)[-1])
+    bag_code = next_kiln_output_bag_code(repo.db, prefix, tenant.timezone)
+    balance["kiln_output_seq"] = int(bag_code.rsplit("_", 1)[-1])
+    from app.services.industry.activated_carbon import plant_equipment as ac_plant_equipment
+
+    setpoint = ac_plant_equipment.kiln_setpoint_plan(db, tenant).get(kiln_code) or {}
+    kiln_parameters = setpoint.get("parameters") if isinstance(setpoint.get("parameters"), dict) else {}
     row = {
         "bag_code": bag_code,
         "quantity_kg": float(payload.quantity_kg),
         "kiln_resource_code": kiln_code,
         "lot_code": lot_code,
+        "work_order_code": work_order_code,
+        "work_order_ctc": work_order_ctc,
         "created_at": now_iso,
+        "created_by": _session_actor(user),
+        "kiln_parameters": kiln_parameters,
+        "kiln_parameters_at": setpoint.get("updated_at"),
     }
     bags.append(row)
-    resource.metadata_ = {**meta, "kiln_output_bags": bags}
+    resource.metadata_ = {**balance, "kiln_output_bags": bags}
     flag_modified(resource, "metadata_")
     mes_core_entities.create_triple(
         db,
@@ -3684,7 +4612,11 @@ def create_kiln_output_bag(
         quantity_kg=payload.quantity_kg,
         kiln_resource_code=kiln_code,
         lot_code=lot_code,
+        work_order_code=work_order_code,
         created_at=now_iso,
+        created_by=_session_actor(user),
+        kiln_parameters=kiln_parameters,
+        kiln_parameters_at=setpoint.get("updated_at"),
     )
 
 
@@ -3729,8 +4661,12 @@ def list_kiln_output_qc_bags(
                     kiln_resource_code=str(resource.resource_code or bag.get("kiln_resource_code") or ""),
                     quantity_kg=Decimal(str(bag.get("quantity_kg") or 0)),
                     lot_code=bag.get("lot_code"),
+                    work_order_code=bag.get("work_order_code"),
+                    work_order_ctc=bag.get("work_order_ctc"),
+                    ctc_match=bag.get("work_order_ctc_match"),
                     created_at=bag.get("created_at"),
-                    user_id=qc.get("user_id") or bag.get("created_by"),
+                    created_by=bag.get("created_by"),
+                    user_id=qc.get("user_id"),
                     values=qc.get("values") if isinstance(qc.get("values"), dict) else {},
                     saved_at=qc.get("saved_at"),
                 )
@@ -3773,15 +4709,42 @@ def save_kiln_output_bag_qc(
             continue
         values[str(key)] = text
     now = datetime.now(timezone.utc).isoformat()
+    from app.services.industry.activated_carbon import process_rules as ac_process_rules
+    from app.services.industry.activated_carbon import work_orders as ac_work_orders
+
+    wo_code = str(bag.get("work_order_code") or "").strip() or None
+    wo_ctc = bag.get("work_order_ctc")
+    if wo_code and wo_ctc in (None, ""):
+        try:
+            wo_ctc = ac_work_orders.get_work_order(db, tenant, wo_code).get("ctc")
+        except ValidationError:
+            wo_ctc = None
+    actual_ctc = ac_process_rules.ctc_from_values(values)
+    ctc_match = bool(wo_code and ac_work_orders.work_order_ctc_matches(wo_ctc, actual_ctc))
     qc = {
         "values": values,
         "user_id": (payload.user_id or "").strip() or None,
         "saved_at": now,
         "lot_code": (payload.lot_code or bag.get("lot_code") or "").strip() or None,
+        "work_order_ctc_match": ctc_match,
     }
     bag["kiln_output_qc"] = qc
+    bag["work_order_ctc_match"] = ctc_match
+    if wo_ctc not in (None, ""):
+        bag["work_order_ctc"] = wo_ctc
     resource.metadata_ = {**meta, "kiln_output_bags": bags}
     flag_modified(resource, "metadata_")
+    if wo_code:
+        ac_work_orders.record_work_order_output(
+            db,
+            tenant,
+            work_order_code=wo_code,
+            quantity_kg=bag.get("quantity_kg") or 0,
+            bag_code=code,
+            kiln_resource_code=str(resource.resource_code or ""),
+            ctc_match=ctc_match,
+            commit=False,
+        )
     ac_triples.stage_captures_for_values(
         db,
         tenant,
@@ -3800,7 +4763,11 @@ def save_kiln_output_bag_qc(
         kiln_resource_code=str(resource.resource_code or ""),
         quantity_kg=Decimal(str(bag.get("quantity_kg") or 0)),
         lot_code=bag.get("lot_code"),
+        work_order_code=wo_code,
+        work_order_ctc=str(wo_ctc) if wo_ctc not in (None, "") else None,
+        ctc_match=ctc_match,
         created_at=bag.get("created_at"),
+        created_by=bag.get("created_by"),
         user_id=qc.get("user_id"),
         values=values,
         saved_at=now,
@@ -3811,36 +4778,108 @@ DESTONING_LOADER_CAPACITY = 6
 
 
 def _ensure_destoner_resource(db: Session, tenant: TenantContext) -> Resource:
-    repo = _repo(db, tenant)
-    destoner = (
-        _tenant_resources(db, tenant)
-        .filter(Resource.resource_code == "RES-DESTON-01")
-        .first()
+    from app.services.industry.activated_carbon import plant_equipment as ac_plant_equipment
+
+    destoners = ac_plant_equipment.ensure_four_destoners(db, tenant)
+    if not destoners:
+        raise ValidationError("No destoner machines are registered.")
+    return destoners[0]
+
+
+def _list_destoner_resources(db: Session, tenant: TenantContext) -> list[Resource]:
+    from app.services.industry.activated_carbon import plant_equipment as ac_plant_equipment
+
+    return ac_plant_equipment.ensure_four_destoners(db, tenant)
+
+
+def _resolve_destoner(
+    db: Session, tenant: TenantContext, resource_code: Optional[str] = None
+) -> Resource:
+    destoners = _list_destoner_resources(db, tenant)
+    wanted = (resource_code or "").strip()
+    if wanted:
+        found = next((row for row in destoners if str(row.resource_code or "") == wanted), None)
+        if found is None:
+            raise ValidationError(f"Destoner '{wanted}' was not found.")
+        return found
+    return destoners[0]
+
+
+def _destoner_loader_capacity(resource: Resource) -> int:
+    from app.services.industry.activated_carbon.station_machines import _unit_count
+
+    return max(_unit_count(resource), 1)
+
+
+def _kiln_output_qc_saved(bag: dict) -> bool:
+    qc = bag.get("kiln_output_qc") if isinstance(bag.get("kiln_output_qc"), dict) else {}
+    return bool(qc.get("saved_at"))
+
+
+def _kiln_bag_ctc(bag: dict) -> Any:
+    from app.services.industry.activated_carbon import process_rules as ac_process_rules
+
+    qc = bag.get("kiln_output_qc") if isinstance(bag.get("kiln_output_qc"), dict) else {}
+    values = qc.get("values") if isinstance(qc.get("values"), dict) else {}
+    rounded = ac_process_rules.round_ctc(ac_process_rules.ctc_from_values(values))
+    return str(rounded) if rounded is not None else None
+
+
+def _destoner_load_ctc(loaded: list[dict]) -> Any:
+    for row in loaded:
+        raw = row.get("ctc")
+        if raw not in (None, ""):
+            return raw
+    return None
+
+
+def _destoning_qc_saved(bag: dict) -> bool:
+    qc = bag.get("destoning_qc") if isinstance(bag.get("destoning_qc"), dict) else {}
+    return bool(qc.get("saved_at"))
+
+
+def _destoning_qc_values(bag: dict) -> dict:
+    qc = bag.get("destoning_qc") if isinstance(bag.get("destoning_qc"), dict) else {}
+    values = qc.get("values") if isinstance(qc.get("values"), dict) else {}
+    return values
+
+
+def _destoning_bag_ctc(bag: dict) -> Any:
+    from app.services.industry.activated_carbon import process_rules as ac_process_rules
+
+    rounded = ac_process_rules.round_ctc(bag.get("ctc"))
+    if rounded is not None:
+        return str(rounded)
+    values = _destoning_qc_values(bag)
+    rounded = ac_process_rules.round_ctc(ac_process_rules.ctc_from_values(values))
+    return str(rounded) if rounded is not None else None
+
+
+def _is_destoning_rework_bag(bag: dict) -> bool:
+    from app.services.industry.activated_carbon import process_rules as ac_process_rules
+
+    if not _destoning_qc_saved(bag):
+        return False
+    values = _destoning_qc_values(bag)
+    dest = (
+        values.get("deston_qc_destination")
+        or bag.get("deston_qc_destination")
+        or bag.get("destination")
+        or ""
     )
-    if destoner is not None:
-        return destoner
-    for resource in _tenant_resources(db, tenant).all():
-        code = (resource.resource_code or "").upper()
-        name = (resource.resource_name or "").upper()
-        meta = resource.metadata_ if isinstance(resource.metadata_, dict) else {}
-        role = str(meta.get("role") or "").lower()
-        if "DESTON" in code or "DESTON" in name or role == "destoning":
-            return resource
-    row = Resource(
-        resource_code="RES-DESTON-01",
-        resource_name="De-Stoner",
-        resource_type="MACHINE",
-        status="ACTIVE",
-        metadata_={"role": "destoning"},
-    )
-    repo.add(row)
-    repo.db.flush()
-    return row
+    if ac_process_rules.is_destoning_rework_destination(dest):
+        return True
+    try:
+        return bool(ac_process_rules.destoning_stones_present(
+            ac_process_rules.destoning_stones_from_values(values)
+        ))
+    except ValidationError:
+        return False
 
 
 def _destoning_kiln_letter(resource: Resource, bag_code: str) -> str:
     code = str(bag_code or "").upper()
-    prefix = re.match(r"^(KA|KB|KC|KOA|KOB|KOC)(?:_|-|\d)", code)
+    prefix = re.match(r"^(K[A-F]|KO[A-F])(?:_|-|\d)", code)
     if prefix:
         return prefix.group(1)[-1]
     blob = " ".join(
@@ -3849,7 +4888,7 @@ def _destoning_kiln_letter(resource: Resource, bag_code: str) -> str:
             str(getattr(resource, "resource_code", "") or ""),
         ]
     ).upper()
-    match = re.search(r"KILN[-_\s]*([A-C])\b", blob)
+    match = re.search(r"KILN[-_\s]*([A-F])\b", blob)
     if match:
         return match.group(1)
     return "A"
@@ -3861,8 +4900,13 @@ def _deston_bag(row: dict, kiln_code: Optional[str] = None) -> AcDestoningBagOut
         quantity_kg=Decimal(str(row.get("quantity_kg") or 0)),
         kiln_resource_code=kiln_code or row.get("kiln_resource_code"),
         lot_code=row.get("lot_code"),
+        work_order_code=str(row.get("work_order_code") or "").strip() or None,
         created_at=row.get("created_at"),
+        created_by=row.get("created_by"),
         input_bag_codes=[str(c) for c in (row.get("input_bag_codes") or []) if c],
+        destoner_resource_code=row.get("destoner_resource_code"),
+        ctc=str(row.get("ctc")) if row.get("ctc") not in (None, "") else None,
+        kiln_output_qc_saved=bool(row.get("kiln_output_qc_saved")),
     )
 
 
@@ -3876,6 +4920,19 @@ def _destoning_events(meta: dict) -> list[dict]:
     return [dict(row) for row in (meta.get("destoning_load_events") or []) if isinstance(row, dict)]
 
 
+def _deston_output_kg_against_load(loaded: list[dict], outputs: list[dict]) -> Decimal:
+    """Kilograms already bagged from the bags sitting on the destoner now."""
+    codes = {str(row.get("bag_code") or "") for row in loaded if row.get("bag_code")}
+    if not codes:
+        return Decimal("0")
+    total = Decimal("0")
+    for row in outputs:
+        inputs = {str(code) for code in (row.get("input_bag_codes") or []) if code}
+        if inputs & codes:
+            total += Decimal(str(row.get("quantity_kg") or 0))
+    return total
+
+
 def _deston_event(row: dict) -> AcDestoningLoadEventOut:
     return AcDestoningLoadEventOut(
         bag_code=row.get("bag_code"),
@@ -3883,21 +4940,72 @@ def _deston_event(row: dict) -> AcDestoningLoadEventOut:
         kg=Decimal(str(row.get("kg") or row.get("quantity_kg") or 0)),
         loaded_at=row.get("loaded_at") or row.get("created_at"),
         kiln_resource_code=row.get("kiln_resource_code"),
+        destoner_resource_code=row.get("destoner_resource_code"),
     )
 
 
 def _destoning_state_from(
     db: Session, tenant: TenantContext, destoner: Resource
 ) -> AcDestoningStateOut:
-    dest_meta = destoner.metadata_ if isinstance(destoner.metadata_, dict) else {}
-    loaded, outputs = _destoning_lists(dest_meta)
-    loaded_codes = {str(row.get("bag_code") or "") for row in loaded if row.get("bag_code")}
-    consumed = {
-        str(code)
-        for out in outputs
-        for code in (out.get("input_bag_codes") or [])
-        if code
-    }
+    from app.services.industry.activated_carbon import plant_equipment as ac_plant_equipment
+
+    destoners = _list_destoner_resources(db, tenant)
+    ctc_plan = ac_plant_equipment.tenant_daily_ctc_plan(db, tenant)
+    selected = destoner or destoners[0]
+    loaded_all: list[dict] = []
+    outputs_all: list[dict] = []
+    events_all: list[dict] = []
+    destoner_outs: list[AcDestonerMachineOut] = []
+    loaded_codes: set[str] = set()
+    consumed: set[str] = set()
+    for machine in destoners:
+        meta = machine.metadata_ if isinstance(machine.metadata_, dict) else {}
+        loaded, outputs = _destoning_lists(meta)
+        events = _destoning_events(meta)
+        if not events:
+            events = [
+                {
+                    "bag_code": row.get("bag_code"),
+                    "lot_code": row.get("lot_code"),
+                    "kg": row.get("quantity_kg") or 0,
+                    "loaded_at": row.get("loaded_at") or row.get("created_at"),
+                    "kiln_resource_code": row.get("kiln_resource_code"),
+                    "destoner_resource_code": machine.resource_code,
+                }
+                for row in loaded
+                if row.get("bag_code")
+            ]
+        for row in loaded:
+            row.setdefault("destoner_resource_code", machine.resource_code)
+            if row.get("bag_code"):
+                loaded_codes.add(str(row.get("bag_code")))
+        for out in outputs:
+            out.setdefault("destoner_resource_code", machine.resource_code)
+            for code in out.get("input_bag_codes") or []:
+                if code:
+                    consumed.add(str(code))
+        loaded_kg = sum((Decimal(str(row.get("quantity_kg") or 0)) for row in loaded), Decimal("0"))
+        plan = ac_plant_equipment.destoner_plan_meta(machine, ctc_plan, plant_today(tenant.timezone))
+        destoner_outs.append(
+            AcDestonerMachineOut(
+                resource_code=str(machine.resource_code or ""),
+                resource_name=str(machine.resource_name or machine.resource_code or ""),
+                loaded=[_deston_bag(row) for row in loaded if row.get("bag_code")],
+                loaded_kg=loaded_kg,
+                loader_count=len(loaded),
+                loader_capacity=_destoner_loader_capacity(machine),
+                load_ctc=str(_destoner_load_ctc(loaded)) if _destoner_load_ctc(loaded) not in (None, "") else None,
+                assigned_ctc=plan.get("assigned_ctc"),
+                assigned_mesh=plan.get("assigned_mesh"),
+                assigned_date=plan.get("assigned_date"),
+                output_bags=[_deston_bag(row) for row in outputs if row.get("bag_code")],
+                load_events=[_deston_event(row) for row in events if row.get("bag_code") or row.get("loaded_at")],
+            )
+        )
+        if str(machine.resource_code or "") == str(selected.resource_code or ""):
+            loaded_all = loaded
+            outputs_all = outputs
+            events_all = events
     seen_bags: set[str] = set()
     grouped: dict[str, AcDestoningKilnGroupOut] = {
         letter: AcDestoningKilnGroupOut(
@@ -3905,12 +5013,14 @@ def _destoning_state_from(
             kiln_name=f"Kiln {letter}",
             bags=[],
         )
-        for letter in ("A", "B")
+        for letter in ("A", "B", "C", "D", "E", "F")
     }
     for resource, _meta, bags in _iter_kiln_output_resources(db, tenant):
         for bag in bags:
             code = str(bag.get("bag_code") or "")
             if not code or code in seen_bags or code in loaded_codes or code in consumed:
+                continue
+            if not _kiln_output_qc_saved(bag):
                 continue
             seen_bags.add(code)
             letter = _destoning_kiln_letter(resource, code)
@@ -3920,30 +5030,57 @@ def _destoning_state_from(
                     kiln_name=f"Kiln {letter}",
                     bags=[],
                 )
-            grouped[letter].bags.append(_deston_bag(bag, resource.resource_code))
-    kiln_groups = [grouped[key] for key in sorted(grouped.keys()) if key in {"A", "B", "C"}]
-    loaded_kg = sum((Decimal(str(row.get("quantity_kg") or 0)) for row in loaded), Decimal("0"))
-    events = _destoning_events(dest_meta)
-    if not events:
-        events = [
-            {
-                "bag_code": row.get("bag_code"),
-                "lot_code": row.get("lot_code"),
-                "kg": row.get("quantity_kg") or 0,
-                "loaded_at": row.get("loaded_at") or row.get("created_at"),
-                "kiln_resource_code": row.get("kiln_resource_code"),
-            }
-            for row in loaded
-            if row.get("bag_code")
-        ]
+            grouped[letter].bags.append(
+                _deston_bag(
+                    {
+                        **bag,
+                        "ctc": _kiln_bag_ctc(bag),
+                        "kiln_output_qc_saved": True,
+                    },
+                    resource.resource_code,
+                )
+            )
+    kiln_groups = [grouped[key] for key in ("A", "B", "C", "D", "E", "F")]
+    rework_bags: list[AcDestoningBagOut] = []
+    for machine in destoners:
+        meta = machine.metadata_ if isinstance(machine.metadata_, dict) else {}
+        _loaded, outputs = _destoning_lists(meta)
+        for bag in outputs:
+            code = str(bag.get("bag_code") or "")
+            if not code or code in seen_bags or code in loaded_codes or code in consumed:
+                continue
+            if not _is_destoning_rework_bag(bag):
+                continue
+            seen_bags.add(code)
+            rework_bags.append(
+                _deston_bag(
+                    {
+                        **bag,
+                        "ctc": _destoning_bag_ctc(bag),
+                        "kiln_output_qc_saved": True,
+                    },
+                    bag.get("kiln_resource_code") or machine.resource_code,
+                )
+            )
+    if rework_bags:
+        kiln_groups.append(
+            AcDestoningKilnGroupOut(
+                kiln_resource_code="DESTONING-REWORK",
+                kiln_name="Destoning rework",
+                bags=rework_bags,
+            )
+        )
+    loaded_kg = sum((Decimal(str(row.get("quantity_kg") or 0)) for row in loaded_all), Decimal("0"))
     return AcDestoningStateOut(
         kilns=kiln_groups,
-        loaded=[_deston_bag(row) for row in loaded if row.get("bag_code")],
+        loaded=[_deston_bag(row) for row in loaded_all if row.get("bag_code")],
         loaded_kg=loaded_kg,
-        loader_count=len(loaded),
-        loader_capacity=ac_station_machines.station_machine_capacity(db, tenant, "destoning"),
-        output_bags=[_deston_bag(row) for row in outputs if row.get("bag_code")],
-        load_events=[_deston_event(row) for row in events if row.get("bag_code") or row.get("loaded_at")],
+        loader_count=len(loaded_all),
+        loader_capacity=_destoner_loader_capacity(selected),
+        output_bags=[_deston_bag(row) for row in outputs_all if row.get("bag_code")],
+        load_events=[_deston_event(row) for row in events_all if row.get("bag_code") or row.get("loaded_at")],
+        destoners=destoner_outs,
+        selected_destoner_code=str(selected.resource_code or "") or None,
     )
 
 
@@ -3955,8 +5092,10 @@ def get_destoning_state(db: Session, tenant: TenantContext) -> AcDestoningStateO
 def load_destoning_bag(
     db: Session, tenant: TenantContext, payload: AcDestoningLoadCreate
 ) -> AcDestoningStateOut:
+    from app.services.industry.activated_carbon import process_rules as ac_process_rules
+
     repo = _repo(db, tenant)
-    destoner = _ensure_destoner_resource(db, tenant)
+    destoner = _resolve_destoner(db, tenant, payload.destoner_resource_code)
     dest_meta = destoner.metadata_ if isinstance(destoner.metadata_, dict) else {}
     loaded, outputs = _destoning_lists(dest_meta)
     events = _destoning_events(dest_meta)
@@ -3965,15 +5104,22 @@ def load_destoning_bag(
         raise ValidationError("Bag number is required.")
     if any(str(row.get("bag_code") or "") == code for row in loaded):
         raise ValidationError(f"Bag '{code}' is already on the de-stoner.")
-    deston_capacity = ac_station_machines.station_machine_capacity(db, tenant, "destoning")
+    deston_capacity = _destoner_loader_capacity(destoner)
     if len(loaded) >= deston_capacity:
-        raise ValidationError(f"De-stoner loader is full ({deston_capacity} machines).")
+        raise ValidationError(f"De-stoner loader is full ({deston_capacity} bags).")
     consumed = {
-        str(c) for out in outputs for c in (out.get("input_bag_codes") or []) if c
+        str(c)
+        for machine in _list_destoner_resources(db, tenant)
+        for out in _destoning_lists(
+            machine.metadata_ if isinstance(machine.metadata_, dict) else {}
+        )[1]
+        for c in (out.get("input_bag_codes") or [])
+        if c
     }
     if code in consumed:
         raise ValidationError(f"Bag '{code}' has already been destoned.")
     found = None
+    rework = False
     for resource, _meta, bags in _iter_kiln_output_resources(db, tenant):
         for bag in bags:
             if str(bag.get("bag_code") or "") == code:
@@ -3982,17 +5128,66 @@ def load_destoning_bag(
         if found:
             break
     if found is None:
-        raise ValidationError(f"Kiln output bag '{code}' was not found.")
+        for machine in _list_destoner_resources(db, tenant):
+            meta = machine.metadata_ if isinstance(machine.metadata_, dict) else {}
+            _loaded_rows, output_rows = _destoning_lists(meta)
+            match = next(
+                (row for row in output_rows if str(row.get("bag_code") or "") == code),
+                None,
+            )
+            if match is not None and _is_destoning_rework_bag(match):
+                found = (machine, match)
+                rework = True
+                break
+    if found is None:
+        raise ValidationError(
+            f"Bag '{code}' was not found among kiln output or destoning rework bags."
+        )
     resource, bag = found
+    rules = ac_process_rules.get_process_rules(db, tenant)
+    if (
+        not rework
+        and rules.get("kiln_output_qc_required_for_destoning")
+        and not _kiln_output_qc_saved(bag)
+    ):
+        raise ValidationError(
+            f"Save kiln output QC for bag '{code}' before destoning load."
+        )
+    incoming_ctc = _destoning_bag_ctc(bag) if rework else _kiln_bag_ctc(bag)
+    decimals = int(rules.get("ctc_decimals") or 1)
+    from app.services.industry.activated_carbon import plant_equipment as ac_plant_equipment
+
+    assigned = ac_plant_equipment.destoner_plan_meta(
+        destoner,
+        ac_plant_equipment.tenant_daily_ctc_plan(db, tenant),
+        plant_today(tenant.timezone),
+    ).get("assigned_ctc")
+    if rework and incoming_ctc in (None, ""):
+        incoming_ctc = assigned
+    ac_process_rules.assert_destoner_plan_ctc(
+        assigned,
+        incoming_ctc,
+        decimals=decimals,
+    )
+    ac_process_rules.assert_same_ctc(
+        _destoner_load_ctc(loaded),
+        incoming_ctc,
+        decimals=decimals,
+        missing_blocks=bool(rules.get("ctc_missing_blocks_load", True)),
+    )
     now = datetime.now(timezone.utc).isoformat()
     loaded.append(
         {
             "bag_code": code,
             "quantity_kg": float(bag.get("quantity_kg") or 0),
-            "kiln_resource_code": resource.resource_code,
+            "kiln_resource_code": bag.get("kiln_resource_code") or resource.resource_code,
             "lot_code": bag.get("lot_code"),
+            "work_order_code": bag.get("work_order_code"),
             "created_at": bag.get("created_at"),
             "loaded_at": now,
+            "ctc": incoming_ctc if incoming_ctc not in (None, "") else None,
+            "destoner_resource_code": destoner.resource_code,
+            "rework": rework,
         }
     )
     events.append(
@@ -4001,7 +5196,8 @@ def load_destoning_bag(
             "lot_code": bag.get("lot_code"),
             "kg": float(bag.get("quantity_kg") or 0),
             "loaded_at": now,
-            "kiln_resource_code": resource.resource_code,
+            "kiln_resource_code": bag.get("kiln_resource_code") or resource.resource_code,
+            "destoner_resource_code": destoner.resource_code,
         }
     )
     destoner.metadata_ = {
@@ -4011,6 +5207,35 @@ def load_destoning_bag(
         "destoning_load_events": events,
     }
     flag_modified(destoner, "metadata_")
+    _stage_triple(
+        db,
+        tenant,
+        TripleCreate(
+            subject_uri=(
+                f"urn:nyra:ac:destonBag:{code}" if rework else f"urn:nyra:ac:kilnOutBag:{code}"
+            ),
+            predicate_uri="urn:nyra:predicate:usedEquipment",
+            object_uri=f"urn:nyra:ac:destoner:{destoner.resource_code}",
+            source_table="cfg.resource",
+            source_id=destoner.resource_id,
+        ),
+    )
+    if incoming_ctc not in (None, ""):
+        _stage_triple(
+            db,
+            tenant,
+            TripleCreate(
+                subject_uri=(
+                    f"urn:nyra:ac:destonBag:{code}" if rework else f"urn:nyra:ac:kilnOutBag:{code}"
+                ),
+                predicate_uri="urn:nyra:predicate:captures",
+                object_uri="urn:nyra:ac:parameter:CTC",
+                object_literal=str(incoming_ctc),
+                object_datatype="http://www.w3.org/2001/XMLSchema#decimal",
+                source_table="cfg.resource",
+                source_id=destoner.resource_id,
+            ),
+        )
     repo.db.commit()
     repo.db.refresh(destoner)
     return _destoning_state_from(db, tenant, destoner)
@@ -4020,7 +5245,14 @@ def unload_destoning_bag(
     db: Session, tenant: TenantContext, payload: AcDestoningLoadCreate
 ) -> AcDestoningStateOut:
     repo = _repo(db, tenant)
-    destoner = _ensure_destoner_resource(db, tenant)
+    destoner = _resolve_destoner(db, tenant, payload.destoner_resource_code)
+    if payload.destoner_resource_code is None:
+        for machine in _list_destoner_resources(db, tenant):
+            meta = machine.metadata_ if isinstance(machine.metadata_, dict) else {}
+            loaded, _outputs = _destoning_lists(meta)
+            if any(str(row.get("bag_code") or "") == (payload.bag_code or "").strip() for row in loaded):
+                destoner = machine
+                break
     dest_meta = destoner.metadata_ if isinstance(destoner.metadata_, dict) else {}
     loaded, outputs = _destoning_lists(dest_meta)
     events = _destoning_events(dest_meta)
@@ -4046,12 +5278,12 @@ def unload_destoning_bag(
 
 
 def create_destoning_output_bag(
-    db: Session, tenant: TenantContext, payload: AcDestoningOutputCreate
+    db: Session, tenant: TenantContext, payload: AcDestoningOutputCreate, user: Any = None
 ) -> AcDestoningStateOut:
     from app.services.industry.activated_carbon import triplet_capture as ac_triples
 
     repo = _repo(db, tenant)
-    destoner = _ensure_destoner_resource(db, tenant)
+    destoner = _resolve_destoner(db, tenant, payload.destoner_resource_code)
     dest_meta = destoner.metadata_ if isinstance(destoner.metadata_, dict) else {}
     loaded, outputs = _destoning_lists(dest_meta)
     existing_code = (payload.bag_code or "").strip()
@@ -4061,6 +5293,20 @@ def create_destoning_output_bag(
         None,
     )
     now = datetime.now(timezone.utc).isoformat()
+    work_order_code = next(
+        (str(row.get("work_order_code")) for row in loaded if row.get("work_order_code")),
+        None,
+    )
+    loaded_kg = sum(
+        (Decimal(str(row.get("quantity_kg") or 0)) for row in loaded),
+        Decimal("0"),
+    )
+    if not existing_code:
+        assert_destoner_output_within_load(
+            loaded_kg,
+            _deston_output_kg_against_load(loaded, outputs),
+            Decimal(str(payload.quantity_kg)),
+        )
     if existing_code:
         found = next(
             (row for row in outputs if str(row.get("bag_code") or "") == existing_code),
@@ -4069,6 +5315,13 @@ def create_destoning_output_bag(
         if found is None:
             raise ValidationError(f"Destoning output '{existing_code}' was not found.")
         found["quantity_kg"] = float(payload.quantity_kg)
+        if loaded_kg > 0:
+            covered = _deston_output_kg_against_load(loaded, outputs)
+            if covered > loaded_kg + Decimal("0.001"):
+                raise ValidationError(
+                    f"Destoner output cannot exceed loaded ({loaded_kg} KG). "
+                    f"Remaining: {max(loaded_kg - (covered - Decimal(str(payload.quantity_kg))), Decimal('0'))} KG."
+                )
         if lot_code:
             found["lot_code"] = lot_code
         bag_code = existing_code
@@ -4079,7 +5332,20 @@ def create_destoning_output_bag(
             "destoning_load_events": _destoning_events(dest_meta),
         }
     else:
-        bag_code = next_destoning_bag_code(repo.db)
+        bag_code = next_destoning_bag_code(repo.db, tenant.timezone)
+        from app.services.industry.activated_carbon import plant_equipment as ac_plant_equipment
+
+        load_ctc = _destoner_load_ctc(loaded)
+        if load_ctc in (None, ""):
+            load_ctc = ac_plant_equipment.destoner_plan_meta(
+                destoner,
+                ac_plant_equipment.tenant_daily_ctc_plan(db, tenant),
+                plant_today(tenant.timezone),
+            ).get("assigned_ctc")
+        kiln_code = next(
+            (str(row.get("kiln_resource_code")) for row in loaded if row.get("kiln_resource_code")),
+            None,
+        )
         outputs.append(
             {
                 "bag_code": bag_code,
@@ -4087,13 +5353,26 @@ def create_destoning_output_bag(
                 "lot_code": lot_code,
                 "created_at": now,
                 "input_bag_codes": input_codes,
+                "ctc": str(load_ctc) if load_ctc not in (None, "") else None,
+                "kiln_resource_code": kiln_code,
+                "work_order_code": work_order_code,
+                "destoner_resource_code": destoner.resource_code,
+                "created_by": _session_actor(user),
             }
         )
+        covered = _deston_output_kg_against_load(loaded, outputs)
+        events = _destoning_events(dest_meta)
+        if covered + Decimal("0.001") >= loaded_kg:
+            finished = {str(row.get("bag_code") or "") for row in loaded if row.get("bag_code")}
+            events = [row for row in events if str(row.get("bag_code") or "") not in finished]
+            next_loaded: list[dict] = []
+        else:
+            next_loaded = loaded
         destoner.metadata_ = {
             **dest_meta,
-            "destoning_loaded_bags": [],
+            "destoning_loaded_bags": next_loaded,
             "destoning_output_bags": outputs,
-            "destoning_load_events": _destoning_events(dest_meta),
+            "destoning_load_events": events,
         }
     flag_modified(destoner, "metadata_")
     if not existing_code:
@@ -4108,6 +5387,17 @@ def create_destoning_output_bag(
                 source_id=destoner.resource_id,
             ),
         )
+        _stage_triple(
+            db,
+            tenant,
+            TripleCreate(
+                subject_uri=f"urn:nyra:ac:destonBag:{bag_code}",
+                predicate_uri="urn:nyra:predicate:usedEquipment",
+                object_uri=f"urn:nyra:ac:destoner:{destoner.resource_code}",
+                source_table="cfg.resource",
+                source_id=destoner.resource_id,
+            ),
+        )
         for src in input_codes:
             _stage_triple(
                 db,
@@ -4116,6 +5406,18 @@ def create_destoning_output_bag(
                     subject_uri=f"urn:nyra:ac:destonBag:{bag_code}",
                     predicate_uri="urn:nyra:predicate:generatedFrom",
                     object_uri=f"urn:nyra:ac:kilnOutBag:{src}",
+                    source_table="cfg.resource",
+                    source_id=destoner.resource_id,
+                ),
+            )
+        if work_order_code:
+            _stage_triple(
+                db,
+                tenant,
+                TripleCreate(
+                    subject_uri=f"urn:nyra:ac:destonBag:{bag_code}",
+                    predicate_uri="urn:nyra:predicate:assignedTo",
+                    object_uri=f"urn:nyra:ac:workOrder:{work_order_code}",
                     source_table="cfg.resource",
                     source_id=destoner.resource_id,
                 ),
@@ -4161,27 +5463,41 @@ def create_destoning_output_bag(
 
 
 def list_destoning_qc_bags(db: Session, tenant: TenantContext) -> list[AcDestoningBagQcOut]:
-    destoner = _ensure_destoner_resource(db, tenant)
-    dest_meta = destoner.metadata_ if isinstance(destoner.metadata_, dict) else {}
-    _loaded, outputs = _destoning_lists(dest_meta)
+    from app.services.industry.activated_carbon import plant_equipment as ac_plant_equipment
+    from app.services.industry.activated_carbon import work_orders as ac_work_orders
+
+    plan = ac_plant_equipment.tenant_daily_ctc_plan(db, tenant)
     rows: list[AcDestoningBagQcOut] = []
-    for bag in outputs:
-        code = str(bag.get("bag_code") or "")
-        if not code:
-            continue
-        qc = bag.get("destoning_qc") if isinstance(bag.get("destoning_qc"), dict) else {}
-        rows.append(
-            AcDestoningBagQcOut(
-                bag_code=code,
-                quantity_kg=Decimal(str(bag.get("quantity_kg") or 0)),
-                lot_code=bag.get("lot_code"),
-                created_at=bag.get("created_at"),
-                user_id=qc.get("user_id") or bag.get("created_by"),
-                input_bag_codes=[str(c) for c in (bag.get("input_bag_codes") or []) if c],
-                values=qc.get("values") if isinstance(qc.get("values"), dict) else {},
-                saved_at=qc.get("saved_at"),
+    ctc_cache: dict[str, str | None] = {}
+    for destoner in _list_destoner_resources(db, tenant):
+        dest_meta = destoner.metadata_ if isinstance(destoner.metadata_, dict) else {}
+        _loaded, outputs = _destoning_lists(dest_meta)
+        assigned_mesh = ac_plant_equipment.destoner_plan_meta(
+            destoner, plan, plant_today(tenant.timezone)
+        ).get("assigned_mesh")
+        for bag in outputs:
+            code = str(bag.get("bag_code") or "")
+            if not code:
+                continue
+            qc = bag.get("destoning_qc") if isinstance(bag.get("destoning_qc"), dict) else {}
+            wo_code = str(bag.get("work_order_code") or "").strip() or None
+            rows.append(
+                AcDestoningBagQcOut(
+                    bag_code=code,
+                    quantity_kg=Decimal(str(bag.get("quantity_kg") or 0)),
+                    lot_code=bag.get("lot_code"),
+                    work_order_code=wo_code,
+                    work_order_ctc=ac_work_orders.lookup_work_order_ctc(db, tenant, wo_code, ctc_cache),
+                    created_at=bag.get("created_at"),
+                    created_by=bag.get("created_by"),
+                    user_id=qc.get("user_id"),
+                    input_bag_codes=[str(c) for c in (bag.get("input_bag_codes") or []) if c],
+                    destoner_resource_code=str(destoner.resource_code or "") or None,
+                    assigned_mesh=assigned_mesh,
+                    values=qc.get("values") if isinstance(qc.get("values"), dict) else {},
+                    saved_at=qc.get("saved_at"),
+                )
             )
-        )
     rows.sort(key=lambda row: str(row.created_at or ""), reverse=True)
     return rows
 
@@ -4189,19 +5505,30 @@ def list_destoning_qc_bags(db: Session, tenant: TenantContext) -> list[AcDestoni
 def save_destoning_bag_qc(
     db: Session, tenant: TenantContext, payload: AcDestoningBagQcCreate
 ) -> AcDestoningBagQcOut:
+    from app.services.industry.activated_carbon import plant_equipment as ac_plant_equipment
+    from app.services.industry.activated_carbon import process_rules as ac_process_rules
     from app.services.industry.activated_carbon import triplet_capture as ac_triples
+    from app.services.industry.activated_carbon import work_orders as ac_work_orders
 
     repo = _repo(db, tenant)
-    destoner = _ensure_destoner_resource(db, tenant)
-    dest_meta = destoner.metadata_ if isinstance(destoner.metadata_, dict) else {}
-    loaded, outputs = _destoning_lists(dest_meta)
     code = (payload.bag_code or "").strip()
+    destoner = None
+    dest_meta: dict = {}
+    loaded: list[dict] = []
+    outputs: list[dict] = []
     found = None
-    for bag in outputs:
-        if str(bag.get("bag_code") or "") == code:
-            found = bag
+    for machine in _list_destoner_resources(db, tenant):
+        meta = machine.metadata_ if isinstance(machine.metadata_, dict) else {}
+        loaded_rows, output_rows = _destoning_lists(meta)
+        match = next((bag for bag in output_rows if str(bag.get("bag_code") or "") == code), None)
+        if match is not None:
+            destoner = machine
+            dest_meta = meta
+            loaded = loaded_rows
+            outputs = output_rows
+            found = match
             break
-    if found is None:
+    if found is None or destoner is None:
         raise ValidationError(f"Destoning bag '{code}' was not found.")
     existing = found.get("destoning_qc") if isinstance(found.get("destoning_qc"), dict) else None
     if existing and existing.get("saved_at"):
@@ -4216,6 +5543,28 @@ def save_destoning_bag_qc(
         if text == "":
             continue
         values[str(key)] = text
+    assigned_mesh = ac_plant_equipment.destoner_plan_meta(
+        destoner, ac_plant_equipment.tenant_daily_ctc_plan(db, tenant), plant_today(tenant.timezone)
+    ).get("assigned_mesh")
+    if assigned_mesh:
+        values["deston_qc_mesh_config"] = assigned_mesh
+    dest = ac_process_rules.destoning_destination_from_stones(
+        ac_process_rules.destoning_stones_from_values(values)
+    )
+    stones_yes = ac_process_rules.destoning_stones_present(
+        ac_process_rules.destoning_stones_from_values(values)
+    )
+    values["deston_qc_stones"] = "yes" if stones_yes else "no"
+    values["deston_qc_destination"] = dest
+    allowed = ac_process_rules.get_process_rules(db, tenant).get("destoning_destinations") or [
+        ac_process_rules.SCREENING_DESTINATION,
+        ac_process_rules.DESTONING_REWORK_DESTINATION,
+    ]
+    if dest not in allowed:
+        raise ValidationError(
+            "Destoning destination must be Destoning or Screening. "
+            "In Stock is set later in post-activation."
+        )
     now = datetime.now(timezone.utc).isoformat()
     qc = {
         "values": values,
@@ -4224,6 +5573,8 @@ def save_destoning_bag_qc(
         "copy_from_bag_code": (payload.copy_from_bag_code or "").strip() or None,
     }
     found["destoning_qc"] = qc
+    found["destination"] = dest
+    found["deston_qc_destination"] = dest
     destoner.metadata_ = {**dest_meta, "destoning_loaded_bags": loaded, "destoning_output_bags": outputs}
     flag_modified(destoner, "metadata_")
     ac_triples.stage_captures_for_values(
@@ -4239,16 +5590,49 @@ def save_destoning_bag_qc(
         operation_code="OP-DESTON-QC",
     )
     repo.db.commit()
+    wo_code = str(found.get("work_order_code") or "").strip() or None
     return AcDestoningBagQcOut(
         bag_code=code,
         quantity_kg=Decimal(str(found.get("quantity_kg") or 0)),
         lot_code=found.get("lot_code"),
+        work_order_code=wo_code,
+        work_order_ctc=ac_work_orders.lookup_work_order_ctc(db, tenant, wo_code),
         created_at=found.get("created_at"),
+        created_by=found.get("created_by"),
         user_id=qc.get("user_id"),
         input_bag_codes=[str(c) for c in (found.get("input_bag_codes") or []) if c],
+        destoner_resource_code=str(destoner.resource_code or "") or None,
+        assigned_mesh=assigned_mesh,
         values=values,
         saved_at=now,
     )
+
+
+def _reject_kiln_byproduct_bag(
+    db: Session, tenant: TenantContext, bag_code: Optional[str]
+) -> None:
+    code = (bag_code or "").strip()
+    if not code:
+        return
+    meta = _inward_meta_for_bag(db, tenant, code)
+    for row in meta.get("inward_bags") or []:
+        if not isinstance(row, dict) or str(row.get("bag_code") or "") != code:
+            continue
+        if row.get("grade") and not ac_inbound_workflow._is_kiln_feed_bag(row):
+            raise ValidationError("Unburnt and Stones stay off the kiln.")
+        return
+
+
+def _inward_meta_for_bag(db: Session, tenant: TenantContext, bag_code: Optional[str]) -> dict:
+    code = (bag_code or "").strip()
+    if not code:
+        return {}
+    for order in _repo(db, tenant).query(CustomerOrder).all():
+        meta = order.metadata_ if isinstance(order.metadata_, dict) else {}
+        for bag in meta.get("inward_bags") or []:
+            if isinstance(bag, dict) and str(bag.get("bag_code") or "") == code:
+                return meta
+    return {}
 
 
 def create_kiln_feed_lot(
@@ -4279,10 +5663,44 @@ def create_kiln_feed_lot(
         kiln_code = (payload.kiln_resource_code or lot_meta.get("kiln_resource_code") or "").strip()
         if not kiln_code:
             raise ValidationError("Select a kiln")
+        wo_code = (payload.work_order_code or "").strip()
+        if not wo_code:
+            raise ValidationError("Select a work order before kiln feed.")
+        from app.services.industry.activated_carbon import plant_equipment as ac_plant_equipment
+        from app.services.industry.activated_carbon import work_orders as ac_work_orders
+
+        work_order = ac_work_orders.get_work_order(db, tenant, wo_code)
+        kiln_rows = ac_plant_equipment.ensure_six_kilns(db, tenant)
+        kiln_row = next((row for row in kiln_rows if str(row.resource_code or "") == kiln_code), None)
+        if kiln_row is None:
+            raise ValidationError(f"Kiln '{kiln_code}' was not found.")
+        kiln_meta = kiln_row.metadata_ if isinstance(kiln_row.metadata_, dict) else {}
+
+        def _lookup_work_order(code: str):
+            try:
+                return ac_work_orders.get_work_order(db, tenant, code)
+            except ValidationError:
+                return None
+
+        output_so_far = ac_work_orders.work_order_output_kg_across_kilns(db, tenant, wo_code)
+        if ac_work_orders.work_order_kiln_output_done(
+            work_order.get("quantity_kg"), output_so_far, work_order.get("status")
+        ):
+            raise ValidationError(
+                f"Kiln output for work order {wo_code} is complete. Choose another work order."
+            )
+        ac_work_orders.assert_kiln_accepts_work_order(
+            kiln_meta,
+            wo_code,
+            incoming=work_order,
+            lookup=_lookup_work_order,
+        )
         assigned = (lot_meta.get("kiln_resource_code") or "").strip()
-        if assigned and assigned != kiln_code:
+        if assigned and assigned != kiln_code and not wo_code:
             raise WorkflowError(f"Lot '{lot.lot_code}' is already assigned to {assigned}")
 
+        _reject_kiln_byproduct_bag(db, tenant, payload.bag_code)
+        _assert_bag_not_already_in_kiln(db, tenant, payload.bag_code)
         bag = _next_kiln_feed_bag(lot_meta, payload.bag_code)
         if bag is not None:
             bag_code = (bag.get("bag_code") or payload.bag_code or "").strip() or None
@@ -4301,10 +5719,17 @@ def create_kiln_feed_lot(
             feed_kg = Decimal(str(payload.quantity_kg or remaining))
             bag_code = (payload.bag_code or lot_meta.get("crusher_bag_code") or "").strip() or None
 
+        _assert_bag_not_already_in_kiln(db, tenant, bag_code)
         if feed_kg <= 0:
             raise ValidationError("Load quantity must be greater than zero")
         if lot_qty > 0 and loaded_kg + feed_kg > lot_qty + Decimal("0.001"):
             raise ValidationError("Load would exceed the lot quantity")
+        from app.services.industry.activated_carbon import process_rules as ac_process_rules
+
+        ac_process_rules.assert_drying_before_kiln(
+            _inward_meta_for_bag(db, tenant, bag_code),
+            ac_process_rules.get_process_rules(db, tenant),
+        )
 
         now_iso = datetime.now(timezone.utc).isoformat()
         first_feed = len(events) == 0
@@ -4322,6 +5747,7 @@ def create_kiln_feed_lot(
             "kg": float(feed_kg),
             "loaded_at": now_iso,
             "kiln_resource_code": kiln_code,
+            "work_order_code": wo_code,
         }
         events = events + [event]
         loaded_kg = loaded_kg + feed_kg
@@ -4360,6 +5786,17 @@ def create_kiln_feed_lot(
                     source_id=lot.production_lot_id,
                 ),
             )
+            _stage_triple(
+                db,
+                tenant,
+                TripleCreate(
+                    subject_uri=f"urn:nyra:ac:lot:{lot.lot_code}",
+                    predicate_uri="urn:nyra:predicate:usedEquipment",
+                    object_uri=f"urn:nyra:ac:kiln:{kiln_code}",
+                    source_table="trn.production_lot",
+                    source_id=lot.production_lot_id,
+                ),
+            )
         _stage_triple(
             db,
             tenant,
@@ -4385,6 +5822,27 @@ def create_kiln_feed_lot(
                     source_id=lot.production_lot_id,
                 ),
             )
+        ac_work_orders.record_work_order_load(
+            db,
+            tenant,
+            work_order_code=wo_code,
+            quantity_kg=feed_kg,
+            kiln_resource_code=kiln_code,
+            bag_code=bag_code,
+            lot_code=lot.lot_code,
+            commit=False,
+        )
+        _stage_triple(
+            db,
+            tenant,
+            TripleCreate(
+                subject_uri=f"urn:nyra:ac:workOrder:{wo_code}",
+                predicate_uri="urn:nyra:predicate:assignedTo",
+                object_uri=f"urn:nyra:ac:kiln:{kiln_code}",
+                source_table="trn.production_lot",
+                source_id=lot.production_lot_id,
+            ),
+        )
         repo.db.commit()
         repo.db.refresh(lot)
         return mes_core_entities._production_lot_out(db, tenant, lot)
@@ -4421,6 +5879,13 @@ def create_kiln_feed_lot(
             share=True,
         )
         feed_kg = Decimal(str(payload.quantity_kg or payload.lot_quantity or lot_row.lot_quantity or 0))
+        from app.services.industry.activated_carbon import process_rules as ac_process_rules
+
+        _reject_kiln_byproduct_bag(db, tenant, payload.bag_code)
+        ac_process_rules.assert_drying_before_kiln(
+            _inward_meta_for_bag(db, tenant, (payload.bag_code or "").strip() or None),
+            ac_process_rules.get_process_rules(db, tenant),
+        )
         event = {
             "lot_code": lot_row.lot_code,
             "bag_code": (payload.bag_code or "").strip() or None,

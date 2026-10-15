@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import re
-from datetime import datetime
+from datetime import date, datetime
 from typing import Optional
 from uuid import UUID
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from sqlalchemy import text
 from sqlalchemy.orm import Session
@@ -23,6 +24,8 @@ AC_CODE_SPECS: dict[str, tuple[str, str]] = {
     "ac_routing": ("core.routing_code_seq", "RT-AC-"),
     "ac_customer_order": ("core.customer_order_code_seq", "ORD-AC-"),
     "ac_customer_po": ("core.ac_customer_po_seq", "CUST_PO_"),
+    "ac_work_order": ("core.ac_work_order_seq", "WO-AC-"),
+    "ac_debit_note": ("core.ac_debit_note_seq", "DN-AC-"),
     "ac_customer_order_line": ("core.customer_order_line_code_seq", "ORDL-AC-"),
     "ac_production_order": ("core.production_order_code_seq", "PO-AC-"),
     "ac_production_lot": ("core.lot_code_seq", "LOT-AC-"),
@@ -50,6 +53,8 @@ ALL_CORE_CODE_SEQUENCES: tuple[str, ...] = (
     "core.ncr_code_seq",
     "core.dispatch_code_seq",
     "core.ac_customer_po_seq",
+    "core.ac_work_order_seq",
+    "core.ac_debit_note_seq",
 )
 
 # Shop-floor bag sequences — created on first use, one per process prefix.
@@ -80,6 +85,7 @@ AC_SEQUENCE_FLOORS: dict[str, int] = {
     "core.schedule_code_seq": 0,
     "core.dispatch_code_seq": 0,
     "core.ac_customer_po_seq": 0,
+    "core.ac_work_order_seq": 0,
     "core.routing_code_seq": 0,
     "core.product_code_seq": 0,
 }
@@ -153,10 +159,31 @@ def generate_ac_business_code(
     if entity not in AC_CODE_SPECS:
         raise ValueError(f"Unknown AC entity for ID generation: {entity}")
     sequence, prefix = AC_CODE_SPECS[entity]
-    if entity == "ac_customer_po":
+    if entity in {"ac_customer_po", "ac_work_order", "ac_debit_note"}:
         db.execute(text(f"CREATE SEQUENCE IF NOT EXISTS {sequence}"))
     for _ in range(32):
         n = _nextval(db, sequence)
+        if entity == "ac_supplier" and tenant_id is not None:
+            max_used = _max_numeric_suffix(
+                db, "mst.supplier", "supplier_code", tenant_id, f"{prefix}%"
+            )
+            if n <= max_used:
+                db.execute(
+                    text(f"SELECT setval('{sequence}', :value, true)"),
+                    {"value": max_used},
+                )
+                n = _nextval(db, sequence)
+            code = f"{prefix}{n}"
+            taken = db.execute(
+                text(
+                    "SELECT 1 FROM mst.supplier "
+                    "WHERE tenant_id = :tenant_id AND supplier_code = :code LIMIT 1"
+                ),
+                {"tenant_id": str(tenant_id), "code": code},
+            ).scalar()
+            if taken:
+                continue
+            return code
         code = f"{prefix}{n}"
         if entity == "ac_customer_po":
             taken = db.execute(
@@ -182,6 +209,21 @@ def generate_ac_business_code(
             if not taken:
                 return code
             continue
+        if entity == "ac_work_order" and tenant_id is not None:
+            from app.models.mes_core.platform import Tenant
+
+            tenant = db.get(Tenant, tenant_id)
+            block = tenant.metadata_ if tenant is not None and isinstance(tenant.metadata_, dict) else {}
+            rows = block.get("ac_activation_work_orders")
+            taken = False
+            if isinstance(rows, list):
+                taken = any(
+                    isinstance(item, dict) and str(item.get("work_order_code") or "") == code
+                    for item in rows
+                )
+            if not taken:
+                return code
+            continue
         return code
     raise ValueError(f"Could not allocate unique code for {entity}")
 
@@ -189,7 +231,7 @@ def generate_ac_business_code(
 def kiln_plant_letter(resource_name: str = "", resource_code: str = "") -> str:
     """Kiln A / RES-KILN-01 → A; Kiln B / Klin 02 / RES-KILN-0002 → B."""
     blob = f"{resource_name or ''} {resource_code or ''}".upper()
-    match = re.search(r"\bK(?:ILN|LIN)?[-_\s]*([A-C])\b", blob)
+    match = re.search(r"\bK(?:ILN|LIN)?[-_\s]*([A-F])\b", blob)
     if match:
         return match.group(1)
     digits = re.search(r"(\d+)$", str(resource_code or ""))
@@ -219,7 +261,28 @@ def next_process_bag_code(db: Session, process_prefix: str) -> str:
     return f"{token}_BAG_{n:03d}"
 
 
-def next_kiln_output_bag_code(db: Session, prefix: str) -> str:
+def plant_now(tz_name: Optional[str] = None) -> datetime:
+    """Current time in the customer's plant timezone from core.tenant.timezone.
+
+    Stored audit times stay in UTC. Bag serial dates and the plant day use this clock.
+    The machine clock is not used. A blank or unknown timezone stays on UTC.
+    """
+    name = (tz_name or "").strip() or "UTC"
+    try:
+        return datetime.now(ZoneInfo(name))
+    except (ZoneInfoNotFoundError, ValueError):
+        return datetime.now(ZoneInfo("UTC"))
+
+
+def plant_today(tz_name: Optional[str] = None) -> date:
+    return plant_now(tz_name).date()
+
+
+def _business_stamp(tz_name: Optional[str] = None) -> str:
+    return plant_now(tz_name).strftime("%d%m%y")
+
+
+def next_kiln_output_bag_code(db: Session, prefix: str, tz_name: Optional[str] = None) -> str:
     """KA_DDMMYY_##### using a Postgres sequence per kiln prefix."""
     token = str(prefix or "KA").upper()
     if not re.fullmatch(r"K[A-Z]", token):
@@ -227,20 +290,18 @@ def next_kiln_output_bag_code(db: Session, prefix: str) -> str:
     seq_name = f"core.ac_kiln_out_{token.lower()}_seq"
     db.execute(text(f"CREATE SEQUENCE IF NOT EXISTS {seq_name}"))
     n = int(db.execute(text(f"SELECT nextval('{seq_name}')")).scalar() or 1)
-    stamp = datetime.now().strftime("%d%m%y")
-    return f"{token}_{stamp}_{n:05d}"
+    return f"{token}_{_business_stamp(tz_name)}_{n:05d}"
 
 
-def next_destoning_bag_code(db: Session) -> str:
+def next_destoning_bag_code(db: Session, tz_name: Optional[str] = None) -> str:
     """DS_DDMMYY_##### using a Postgres sequence."""
     seq_name = "core.ac_deston_ds_seq"
     db.execute(text(f"CREATE SEQUENCE IF NOT EXISTS {seq_name}"))
     n = int(db.execute(text(f"SELECT nextval('{seq_name}')")).scalar() or 1)
-    stamp = datetime.now().strftime("%d%m%y")
-    return f"DS_{stamp}_{n:05d}"
+    return f"DS_{_business_stamp(tz_name)}_{n:05d}"
 
 
-def next_post_activation_bag_code(db: Session, prefix: str) -> str:
+def next_post_activation_bag_code(db: Session, prefix: str, tz_name: Optional[str] = None) -> str:
     """SC/CR/DD/DM/BL/FG_DDMMYY_##### using a Postgres sequence per process."""
     token = str(prefix or "PA").upper()
     if not re.fullmatch(r"[A-Z]{2}", token):
@@ -248,8 +309,7 @@ def next_post_activation_bag_code(db: Session, prefix: str) -> str:
     seq_name = f"core.ac_post_{token.lower()}_seq"
     db.execute(text(f"CREATE SEQUENCE IF NOT EXISTS {seq_name}"))
     n = int(db.execute(text(f"SELECT nextval('{seq_name}')")).scalar() or 1)
-    stamp = datetime.now().strftime("%d%m%y")
-    return f"{token}_{stamp}_{n:05d}"
+    return f"{token}_{_business_stamp(tz_name)}_{n:05d}"
 
 
 def resolve_ac_business_code(

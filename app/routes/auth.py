@@ -9,7 +9,10 @@ from app.core.config import settings
 from app.core.exceptions import NotFoundError
 from app.core.host_config import resolve_host_binding
 from app.core.openapi_tags import Tags
+from app.db.mes_core_database import get_mes_core_db
 from app.schemas.auth import AuthConfigOut, HostBindingOut, UserContextOut
+from app.services.industry.activated_carbon import users as ac_users
+from sqlalchemy.orm import Session
 
 router = APIRouter(tags=[Tags.AUTH])
 
@@ -33,11 +36,15 @@ def auth_config() -> AuthConfigOut:
     response_model=UserContextOut,
     summary="Current authenticated user and roles",
 )
-def auth_me(user: UserContext = Depends(get_current_user)) -> UserContextOut:
+def auth_me(
+    user: UserContext = Depends(get_current_user),
+    db: Session = Depends(get_mes_core_db),
+) -> UserContextOut:
     return UserContextOut(
         sub=user.sub,
         username=user.username,
         email=user.email,
+        display_name=ac_users.display_name_for_session(db, user),
         tenant_code=user.tenant_code,
         groups=user.groups,
         roles=user.roles,

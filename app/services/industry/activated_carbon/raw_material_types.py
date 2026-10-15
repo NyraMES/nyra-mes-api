@@ -24,6 +24,7 @@ from app.schemas.mes_core.schemas import (
     RoutingOperationCreate,
     RoutingWithOperationsCreate,
 )
+from app.services.industry.activated_carbon import process_rules as ac_process_rules
 from app.services.industry.activated_carbon.raw_material_usage import raw_material_usage
 from app.services.industry.activated_carbon.codes import (
     resolve_ac_business_code,
@@ -332,6 +333,7 @@ def _type_from_product(
         operations = _operations_from_routing(db, tenant, routing_id)
     else:
         operations = meta.get("operations") or []
+    operations = ac_process_rules.without_kiln_feed_bag_qc_operations(operations)
 
     usage_out = None
     if include_usage:
@@ -351,8 +353,12 @@ def _type_from_product(
         routing_code=meta.get("routing_code"),
         routing_id=routing_id,
         operations=operations,
-        inbound_operations=meta.get("inbound_operations") or [],
-        process_parameters=meta.get("process_parameters") or [],
+        inbound_operations=ac_process_rules.normalized_inbound_operations(
+            meta.get("inbound_operations") or []
+        ),
+        process_parameters=ac_process_rules.without_kiln_feed_bag_qc_parameters(
+            meta.get("process_parameters") or []
+        ),
         status=status,
         is_obsolete=is_obsolete,
         usage=usage_out,
@@ -373,7 +379,7 @@ def _legacy_type_out(
         product_name=row.product_name,
         finished_product_code=None,
         operations=[],
-        inbound_operations=[],
+        inbound_operations=ac_process_rules.normalized_inbound_operations([]),
         process_parameters=[],
         status="OBSOLETE" if is_obsolete else (row.status or "ACTIVE"),
         is_obsolete=is_obsolete,
@@ -498,8 +504,16 @@ def create_raw_material_type(
     fg_name = (payload.finished_product_name or payload.product_name).strip()
     if not fg_name:
         raise ValidationError("Finished product name is required")
-    if not payload.operations:
+    shop_ops = [
+        op for op in (payload.operations or []) if not ac_process_rules.is_kiln_feed_bag_qc_step(op)
+    ]
+    if not shop_ops:
         raise ValidationError("At least one routing operation is required")
+    shop_params = [
+        p
+        for p in (payload.process_parameters or [])
+        if not ac_process_rules.is_kiln_feed_bag_qc_parameter(p)
+    ]
 
     finished = None
     try:
@@ -533,13 +547,13 @@ def create_raw_material_type(
                     process_code=op.process_step,
                     process_type=op.process_step,
                 )
-                for op in payload.operations
+                for op in shop_ops
             ],
         ),
     )
     routing_id = routing_out.routing.routing_id
     routing_code = routing_out.routing.routing_code
-    _sync_routing_operations(db, tenant, routing_id, payload.operations)
+    _sync_routing_operations(db, tenant, routing_id, shop_ops)
 
     type_meta = {
         "ac_raw_material_type": True,
@@ -550,7 +564,7 @@ def create_raw_material_type(
         "routing_code": routing_code,
         "operations": _operations_from_routing(db, tenant, routing_id),
         "inbound_operations": [op.model_dump() for op in payload.inbound_operations],
-        "process_parameters": [p.model_dump() for p in payload.process_parameters],
+        "process_parameters": [p.model_dump() for p in shop_params],
     }
 
     try:
@@ -617,11 +631,32 @@ def update_raw_material_type(
             if routing_id
             else (meta.get("operations") or [])
         )
+        shop_ops = [
+            op
+            for op in payload.operations
+            if not ac_process_rules.is_kiln_feed_bag_qc_step(op)
+        ]
+        hidden_qc = [
+            AcRawMaterialTypeOperation(
+                operation_sequence=int(row.get("operation_sequence") or 1),
+                operation_name=str(row.get("operation_name") or row.get("operation_code") or "Kiln feed"),
+                operation_code=str(row.get("operation_code") or ""),
+                process_step=str(row.get("process_step") or "KILN_FEED"),
+                is_mandatory=row.get("is_mandatory", True),
+            )
+            for row in current_ops
+            if (
+                isinstance(row, dict)
+                and ac_process_rules.is_kiln_feed_bag_qc_step(row)
+                and str(row.get("operation_code") or "").strip()
+            )
+        ]
+        sync_ops = shop_ops + hidden_qc
         if usage.get("dispatch_completed"):
             raise ValidationError(
                 "This raw material has been dispatched. Shop-floor process steps cannot be changed."
             )
-        if routing_locked and _operation_codes(current_ops) != _operation_codes(payload.operations):
+        if routing_locked and _operation_codes(current_ops) != _operation_codes(sync_ops):
             raise ValidationError(
                 "Kiln production has started — you can reorder existing process steps, "
                 "but cannot add or remove them."
@@ -632,7 +667,7 @@ def update_raw_material_type(
                 tenant,
                 raw,
                 meta,
-                payload.operations,
+                sync_ops,
                 finished_product_name=payload.finished_product_name,
             )
             meta["routing_id"] = str(routing_id)
@@ -640,7 +675,7 @@ def update_raw_material_type(
             meta["finished_product_id"] = str(finished.product_id)
             meta["finished_product_code"] = finished.product_code
             meta["finished_product_name"] = finished.product_name
-        _sync_routing_operations(db, tenant, routing_id, payload.operations)
+        _sync_routing_operations(db, tenant, routing_id, sync_ops)
         meta["operations"] = _operations_from_routing(db, tenant, routing_id)
 
     if payload.inbound_operations is not None:
@@ -651,7 +686,11 @@ def update_raw_material_type(
         meta["inbound_operations"] = [op.model_dump() for op in payload.inbound_operations]
 
     if payload.process_parameters is not None and not routing_locked:
-        meta["process_parameters"] = [p.model_dump() for p in payload.process_parameters]
+        meta["process_parameters"] = [
+            p.model_dump()
+            for p in payload.process_parameters
+            if not ac_process_rules.is_kiln_feed_bag_qc_parameter(p)
+        ]
 
     if meta.get("ac_raw_material_type") or (raw.product_type or "").upper() in (
         "RAW_MATERIAL",

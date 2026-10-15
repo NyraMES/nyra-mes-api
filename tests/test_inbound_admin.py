@@ -141,27 +141,33 @@ def test_rm_outward_one_rotary_with_value_stones_unburnt():
     )
 
 
-def test_rm_outward_rejects_missing_stones_or_value():
+def test_rm_outward_allows_missing_stones():
+    validate_rm_outward_splits(
+        [
+            {"grade_label": "-20 1st Stage", "rotary": "Rotary B"},
+            {"grade_label": "Unburnt", "rotary": "Rotary B"},
+        ]
+    )
+
+
+def test_rm_outward_accepts_any_single_line():
+    validate_rm_outward_splits(
+        [{"grade_label": "-20 1st Stage", "rotary": "Rotary B"}]
+    )
+    validate_rm_outward_splits(
+        [{"grade_label": "Unburnt", "rotary": "Rotary A"}]
+    )
+    validate_rm_outward_splits(
+        [{"grade_label": "Stones", "rotary": "Rotary A"}]
+    )
+
+
+def test_rm_outward_rejects_an_empty_list():
     try:
-        validate_rm_outward_splits(
-            [
-                {"grade_label": "-20 1st Stage", "rotary": "Rotary B"},
-                {"grade_label": "Unburnt", "rotary": "Rotary B"},
-            ]
-        )
+        validate_rm_outward_splits([])
         raise AssertionError("expected ValidationError")
-    except ValidationError:
-        pass
-    try:
-        validate_rm_outward_splits(
-            [
-                {"grade_label": "Unburnt", "rotary": "Rotary A"},
-                {"grade_label": "Stones", "rotary": "Rotary A"},
-            ]
-        )
-        raise AssertionError("expected ValidationError")
-    except ValidationError:
-        pass
+    except ValidationError as exc:
+        assert "at least one" in exc.message.lower()
 
 
 def test_kiln_feed_bags_exclude_unburnt_and_stones():

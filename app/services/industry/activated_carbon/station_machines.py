@@ -18,6 +18,11 @@ STATION_SPECS = (
         "aliases": ("deston", "de-ston", "de ston"),
     },
     {
+        "key": "screening_after_destoning",
+        "label": "Screening after Destoning",
+        "aliases": ("screening after deston", "after deston"),
+    },
+    {
         "key": "screening",
         "label": "Screening",
         "aliases": ("screen",),
@@ -41,11 +46,6 @@ STATION_SPECS = (
         "key": "blending",
         "label": "Blending",
         "aliases": ("blend",),
-    },
-    {
-        "key": "fg_qc",
-        "label": "Finished Goods",
-        "aliases": ("finished goods", "fg_qc", "fg-qc", " fg "),
     },
 )
 
@@ -108,7 +108,11 @@ def station_of(resource: Resource) -> str | None:
     if raw in STATION_KEYS:
         return raw
     hay = f" {(resource.resource_code or '')} {(resource.resource_name or '')} ".lower()
+    if "screening after deston" in hay:
+        return "screening_after_destoning"
     for spec in STATION_SPECS:
+        if spec["key"] == "screening" and "screening after deston" in hay:
+            continue
         if any(alias in hay for alias in spec["aliases"]):
             return spec["key"]
     return None

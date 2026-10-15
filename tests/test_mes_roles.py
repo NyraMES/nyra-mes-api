@@ -23,6 +23,7 @@ from app.core.auth import (
     require_tenant_admin,
 )
 from app.core.ac_privileges import (
+    AC_ACTIVATION_QC_ROLES,
     AC_ACTIVATION_RUN_ROLES,
     AC_POST_QC_ROLES,
     AC_RMS_ROLES,
@@ -112,7 +113,10 @@ def test_quality_can_save_post_qc(monkeypatch):
     )
     dep = require_roles(*AC_POST_QC_ROLES).dependency
     assert dep(_user(MES_QUALITY)) is not None
-    assert dep(_user(MES_POST_ACTIVATION)) is not None
+    with pytest.raises(ForbiddenError):
+        dep(_user(MES_POST_ACTIVATION))
+    with pytest.raises(ForbiddenError):
+        require_roles(*AC_ACTIVATION_QC_ROLES).dependency(_user(MES_ACTIVATION))
 
 
 def test_manager_can_run_shop_not_blocked(monkeypatch):

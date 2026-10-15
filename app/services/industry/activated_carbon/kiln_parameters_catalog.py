@@ -22,6 +22,14 @@ def _normalize_key(key: str) -> str:
     return (key or "").strip().lower().replace(" ", "_")
 
 
+def is_scrap_kiln_parameter(key: str, label: str = "") -> bool:
+    return "scrap" in f"{key} {label}".lower()
+
+
+def without_scrap_parameters(definitions: List[AcKilnParameterDefinition]) -> List[AcKilnParameterDefinition]:
+    return [row for row in definitions if not is_scrap_kiln_parameter(row.key, row.label or "")]
+
+
 def list_kiln_parameter_definitions(
     db: Session, tenant: TenantContext
 ) -> List[AcKilnParameterDefinition]:
@@ -35,8 +43,10 @@ def list_kiln_parameter_definitions(
     meta = ws.metadata_ if isinstance(ws.metadata_, dict) else {}
     raw = meta.get("kiln_parameter_definitions")
     if isinstance(raw, list) and raw:
-        return [AcKilnParameterDefinition.model_validate(item) for item in raw]
-    return list(KILN_PARAMETER_DEFINITIONS)
+        return without_scrap_parameters(
+            [AcKilnParameterDefinition.model_validate(item) for item in raw]
+        )
+    return without_scrap_parameters(list(KILN_PARAMETER_DEFINITIONS))
 
 
 def _persist_definitions(
@@ -65,6 +75,8 @@ def add_kiln_parameter_definition(
     label = (payload.label or "").strip()
     if not label:
         raise ValidationError("Parameter label is required")
+    if is_scrap_kiln_parameter(key, label):
+        raise ValidationError("Scrap is not a kiln parameter.")
 
     definitions = list_kiln_parameter_definitions(db, tenant)
     if any(d.key == key for d in definitions):

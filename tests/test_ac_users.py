@@ -1,13 +1,22 @@
 import pytest
 
+from app.core.ac_privileges import (
+    assert_can_complete_inbound_step,
+    assert_quality_records_lab,
+    assert_rms_engineer_records_bags,
+    assert_rms_engineer_records_outward,
+    assert_supervisor_raises_debit_note,
+)
 from app.core.auth import (
     MES_ADMIN,
+    MES_MANAGER,
     MES_PLANNER,
+    MES_QUALITY,
     MES_RMS,
     MES_SUPER_ADMIN,
     UserContext,
 )
-from app.core.exceptions import ValidationError
+from app.core.exceptions import ForbiddenError, ValidationError
 from app.services.industry.activated_carbon.users import (
     ADMIN_ASSIGNABLE_ROLES,
     assert_actor_may_assign_role,
@@ -19,6 +28,46 @@ from app.services.industry.activated_carbon.users import (
 
 def _user(*groups: str) -> UserContext:
     return UserContext(sub="1", username="u", groups=list(groups))
+
+
+def test_bag_generation_is_the_rms_engineer():
+    assert_rms_engineer_records_bags(_user(MES_RMS))
+    assert_rms_engineer_records_bags(_user(MES_SUPER_ADMIN))
+    with pytest.raises(ForbiddenError):
+        assert_rms_engineer_records_bags(_user(MES_MANAGER))
+    with pytest.raises(ForbiddenError):
+        assert_rms_engineer_records_bags(_user(MES_ADMIN))
+
+
+def test_raw_material_lab_is_quality_only():
+    quality = _user(MES_QUALITY)
+    rms = _user(MES_RMS)
+    assert_quality_records_lab(quality)
+    assert_can_complete_inbound_step(quality, "IN-LAB")
+    with pytest.raises(ForbiddenError):
+        assert_quality_records_lab(rms)
+    with pytest.raises(ForbiddenError):
+        assert_can_complete_inbound_step(rms, "IN-LAB")
+    with pytest.raises(ForbiddenError):
+        assert_can_complete_inbound_step(_user(MES_MANAGER), "IN-LAB")
+    with pytest.raises(ForbiddenError):
+        assert_can_complete_inbound_step(quality, "IN-RM-OUT")
+    assert_can_complete_inbound_step(rms, "IN-RM-OUT")
+    assert_rms_engineer_records_outward(rms)
+    with pytest.raises(ForbiddenError):
+        assert_rms_engineer_records_outward(_user(MES_MANAGER))
+    with pytest.raises(ForbiddenError):
+        assert_can_complete_inbound_step(_user(MES_MANAGER), "IN-RM-OUT")
+
+
+def test_debit_note_is_raised_by_the_supervisor():
+    assert_supervisor_raises_debit_note(_user(MES_MANAGER))
+    assert_supervisor_raises_debit_note(_user(MES_PLANNER))
+    assert_supervisor_raises_debit_note(_user(MES_ADMIN))
+    with pytest.raises(ForbiddenError):
+        assert_supervisor_raises_debit_note(_user(MES_QUALITY))
+    with pytest.raises(ForbiddenError):
+        assert_supervisor_raises_debit_note(_user(MES_RMS))
 
 
 def test_admin_cannot_assign_super_admin():
@@ -49,6 +98,7 @@ def test_planner_not_in_users_screen_roles():
     assert MES_SUPER_ADMIN not in super_codes
     assert MES_PLANNER not in admin_codes
     assert MES_RMS in admin_codes
+    assert "MES_Security" in admin_codes
     assert "MES_Demo" not in admin_codes
 
 

@@ -774,12 +774,30 @@ def _production_lot_out(
     loaded_raw = lot_meta.get("kiln_loaded_kg")
     if loaded_raw is None and feed_events:
         loaded_raw = sum(Decimal(str(ev.get("kg") or 0)) for ev in feed_events if isinstance(ev, dict))
+    order_code = lot_meta.get("source_inward_order_code") or lot_meta.get("order_code")
+    if not order_code and po and po.order_line_id:
+        line = (
+            _repo(db, tenant)
+            .query(CustomerOrderLine)
+            .filter(CustomerOrderLine.order_line_id == po.order_line_id)
+            .first()
+        )
+        if line is not None:
+            inward = (
+                _repo(db, tenant)
+                .query(CustomerOrder)
+                .filter(CustomerOrder.customer_order_id == line.order_id)
+                .first()
+            )
+            if inward is not None:
+                order_code = inward.order_code
     return ProductionLotOut(
         production_lot_id=row.production_lot_id,
         tenant_id=row.tenant_id,
         lot_code=row.lot_code,
         production_order_id=row.production_order_id,
         production_order_code=po.production_order_code if po else None,
+        order_code=order_code,
         lot_quantity=row.lot_quantity,
         status=row.status,
         created_at=row.created_at,

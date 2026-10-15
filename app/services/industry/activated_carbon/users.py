@@ -10,6 +10,7 @@ from __future__ import annotations
 from typing import Any, Optional
 from uuid import UUID
 
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 from sqlalchemy.orm.attributes import flag_modified
 
@@ -30,8 +31,9 @@ ROLE_LABELS: dict[str, str] = {
     "MES_Manager": "Plant Manager",
     "MES_Planner": "Production Planner",
     "MES_Operator": "Shop Floor Operator",
-    "MES_Quality": "Quality",
-    "MES_RMS": "RMS",
+    "MES_Quality": "Quality Control",
+    "MES_RMS": "Raw-material section",
+    "MES_Security": "Plant Entry",
     "MES_Activation": "Activation",
     "MES_PostActivation": "Post Activation",
     "MES_Viewer": "Read-only Viewer",
@@ -43,12 +45,29 @@ ADMIN_ASSIGNABLE_ROLES: tuple[str, ...] = (
     "MES_Admin",
     "MES_Manager",
     "MES_RMS",
+    "MES_Security",
     "MES_Activation",
     "MES_PostActivation",
     "MES_Quality",
 )
 
 DEFAULT_PLANT_PASSWORD = "Welcome!123"
+
+
+def validate_plant_password(password: str) -> str:
+    value = password or ""
+    if (
+        len(value) < 8
+        or not any(char.islower() for char in value)
+        or not any(char.isupper() for char in value)
+        or not any(char.isdigit() for char in value)
+        or not any(not char.isalnum() for char in value)
+    ):
+        raise ValidationError(
+            "Password must be at least 8 characters and include an uppercase letter, "
+            "a lowercase letter, a number, and a symbol."
+        )
+    return value
 
 GR_CARBONS_TEST_USERS: tuple[dict[str, str], ...] = (
     {
@@ -154,6 +173,61 @@ def list_tenant_users(db: Session, tenant: TenantContext) -> list[dict[str, Any]
     ]
 
 
+def nickname_key(value: str | None) -> str:
+    return " ".join((value or "").strip().lower().split())
+
+
+def normalize_nickname(value: str | None) -> str:
+    name = " ".join((value or "").split())
+    if not name:
+        raise ValidationError("Enter a nickname.")
+    if len(name) > 64:
+        raise ValidationError("Nickname must be 64 characters or less.")
+    return name
+
+
+def nickname_is_taken(
+    names: list[tuple[object, str]],
+    candidate: str,
+    *,
+    except_user_id: object = None,
+) -> bool:
+    key = nickname_key(candidate)
+    if not key:
+        return False
+    for user_id, existing in names:
+        if except_user_id is not None and user_id == except_user_id:
+            continue
+        if nickname_key(existing) == key:
+            return True
+    return False
+
+
+def _plant_nicknames(db: Session, tenant: TenantContext) -> list[tuple[object, str]]:
+    rows = (
+        db.query(AppUser)
+        .join(UserTenantAccess, UserTenantAccess.user_id == AppUser.user_id)
+        .filter(UserTenantAccess.tenant_id == tenant.tenant_id)
+        .all()
+    )
+    return [(row.user_id, row.display_name or "") for row in rows]
+
+
+def _assert_nickname_available(
+    db: Session,
+    tenant: TenantContext,
+    nickname: str,
+    *,
+    except_user_id: object = None,
+) -> str:
+    name = normalize_nickname(nickname)
+    if nickname_is_taken(_plant_nicknames(db, tenant), name, except_user_id=except_user_id):
+        raise ConflictError(
+            f'Nickname "{name}" is already used in this plant. Choose a different nickname.'
+        )
+    return name
+
+
 def create_tenant_user(
     db: Session,
     tenant: TenantContext,
@@ -163,13 +237,15 @@ def create_tenant_user(
     email: str,
     display_name: Optional[str] = None,
     role_code: str,
+    password: str,
 ) -> dict[str, Any]:
     role = assert_actor_may_assign_role(actor, role_code)
+    chosen_password = validate_plant_password(password)
     login_username = normalize_login_username(username, tenant.tenant_code)
     if login_username.split("@", 1)[0] == "nyraservices":
         raise ValidationError("This user ID is reserved.")
     normalized_email = _normalize_email(email)
-    name = (display_name or "").strip() or login_username.split("@")[0]
+    name = _assert_nickname_available(db, tenant, display_name or "")
     if _login_username_taken(db, tenant, login_username):
         raise ConflictError(f"User ID {login_username} already exists for this plant.")
 
@@ -220,6 +296,7 @@ def create_tenant_user(
         email=normalized_email,
         role_code=role,
         tenant_code=tenant.tenant_code,
+        password=chosen_password,
     )
     if cognito.get("cognito_sub") and not user.cognito_sub:
         user.cognito_sub = cognito["cognito_sub"]
@@ -284,6 +361,82 @@ def ensure_known_directory_users(
         linked.append(_user_out(user, access))
     db.commit()
     return linked
+
+
+def update_tenant_user_nickname(
+    db: Session,
+    tenant: TenantContext,
+    user_id: UUID,
+    display_name: str,
+) -> dict[str, Any]:
+    access = (
+        db.query(UserTenantAccess)
+        .filter(
+            UserTenantAccess.user_id == user_id,
+            UserTenantAccess.tenant_id == tenant.tenant_id,
+        )
+        .first()
+    )
+    if access is None:
+        raise ValidationError("That user is not on this plant.")
+    user = db.query(AppUser).filter(AppUser.user_id == user_id).first()
+    if user is None:
+        raise ValidationError("That user is not on this plant.")
+    user.display_name = _assert_nickname_available(
+        db, tenant, display_name, except_user_id=user.user_id
+    )
+    db.commit()
+    db.refresh(user)
+    return _user_out(user, access)
+
+
+def list_plant_nicknames(db: Session, tenant: TenantContext) -> list[dict[str, str]]:
+    rows = (
+        db.query(AppUser)
+        .join(UserTenantAccess, UserTenantAccess.user_id == AppUser.user_id)
+        .filter(UserTenantAccess.tenant_id == tenant.tenant_id)
+        .all()
+    )
+    out: list[dict[str, str]] = []
+    for user in rows:
+        meta = user.metadata_ if isinstance(user.metadata_, dict) else {}
+        login = str(meta.get("login_username") or "").strip()
+        email = (user.email or "").strip()
+        name = (user.display_name or "").strip() or login or email
+        if not name:
+            continue
+        out.append(
+            {
+                "username": login,
+                "email": email,
+                "cognito_sub": str(user.cognito_sub or "").strip(),
+                "display_name": name,
+            }
+        )
+    return out
+
+
+def display_name_for_session(db: Session, user: UserContext) -> str | None:
+    row = None
+    sub = (user.sub or "").strip()
+    if sub:
+        row = db.query(AppUser).filter(AppUser.cognito_sub == sub).first()
+    email = (user.email or "").strip().lower()
+    if row is None and email:
+        row = db.query(AppUser).filter(func.lower(AppUser.email) == email).first()
+    username = (user.username or "").strip().lower()
+    if row is None and username:
+        for candidate in db.query(AppUser).all():
+            meta = candidate.metadata_ if isinstance(candidate.metadata_, dict) else {}
+            login = str(meta.get("login_username") or "").strip().lower()
+            mail = (candidate.email or "").strip().lower()
+            if username in {login, mail}:
+                row = candidate
+                break
+    if row is None:
+        return None
+    name = (row.display_name or "").strip()
+    return name or None
 
 
 def _is_nyra_services_login(user: AppUser) -> bool:
@@ -383,6 +536,7 @@ def _provision_cognito_login(
     email: str,
     role_code: str,
     tenant_code: str,
+    password: str,
 ) -> dict[str, Any]:
     pool_id = (settings.cognito_user_pool_id or "").strip()
     region = (settings.cognito_region or "").strip()
@@ -412,7 +566,6 @@ def _provision_cognito_login(
         }
 
     client = boto3.client("cognito-idp", region_name=region)
-    password = DEFAULT_PLANT_PASSWORD
     created = False
     cognito_sub = None
     try:
@@ -435,32 +588,68 @@ def _provision_cognito_login(
                 "provisioned": False,
                 "message": f"User saved. Cognito login could not be created: {exc}",
             }
+        attributes = [
+            {"Name": "email", "Value": email},
+            {"Name": "email_verified", "Value": "true"},
+            {"Name": "custom:tenant_code", "Value": tenant_code},
+        ]
+        emailed = False
         try:
             created_user = client.admin_create_user(
                 UserPoolId=pool_id,
                 Username=username,
-                UserAttributes=[
-                    {"Name": "email", "Value": email},
-                    {"Name": "email_verified", "Value": "true"},
-                    {"Name": "custom:tenant_code", "Value": tenant_code},
-                ],
-                MessageAction="SUPPRESS",
+                UserAttributes=attributes,
+                TemporaryPassword=password,
+                DesiredDeliveryMediums=["EMAIL"],
             )
-            created = True
-            cognito_sub = (created_user.get("User") or {}).get("Username")
-            attrs = (created_user.get("User") or {}).get("Attributes") or []
-            cognito_sub = _sub_from_cognito_attrs(attrs) or cognito_sub
-            client.admin_set_user_password(
-                UserPoolId=pool_id,
-                Username=username,
-                Password=password,
-                Permanent=True,
-            )
+            emailed = True
         except ClientError as create_exc:
-            return {
-                "provisioned": False,
-                "message": f"User saved. Cognito login could not be created: {create_exc}",
-            }
+            code = create_exc.response.get("Error", {}).get("Code")
+            detail = str(create_exc)
+            if code == "InvalidPasswordException":
+                return {
+                    "provisioned": False,
+                    "message": (
+                        "User saved in the plant, but the sign-in service rejected the password. "
+                        "Use 8 or more characters with upper and lower case, a number, and a symbol."
+                    ),
+                }
+            email_failed = code in {
+                "CodeDeliveryFailureException",
+                "InvalidEmailRoleAccessPolicyException",
+            } or "email" in detail.lower() or "message" in detail.lower()
+            if not email_failed:
+                return {
+                    "provisioned": False,
+                    "message": f"User saved. Cognito login could not be created: {create_exc}",
+                }
+            try:
+                created_user = client.admin_create_user(
+                    UserPoolId=pool_id,
+                    Username=username,
+                    UserAttributes=attributes,
+                    TemporaryPassword=password,
+                    MessageAction="SUPPRESS",
+                )
+            except ClientError as retry_exc:
+                return {
+                    "provisioned": False,
+                    "message": f"User saved. Cognito login could not be created: {retry_exc}",
+                }
+        created = True
+        cognito_sub = (created_user.get("User") or {}).get("Username")
+        attrs = (created_user.get("User") or {}).get("Attributes") or []
+        cognito_sub = _sub_from_cognito_attrs(attrs) or cognito_sub
+        if not emailed:
+            password_note = (
+                f"Login created for {username}. The invitation email could not be sent. "
+                "Give them the temporary password shown here. They set a new password at first sign-in."
+            )
+        else:
+            password_note = (
+                f"Login created. A temporary password was emailed to {email}. "
+                f"They sign in as {username} and set a new password."
+            )
 
     try:
         _ensure_cognito_group(client, pool_id, role_code)
@@ -485,9 +674,7 @@ def _provision_cognito_login(
             "provisioned": True,
             "temporary_password": password,
             "cognito_sub": cognito_sub,
-            "message": (
-                f"Login created. Sign in with {username}. Default password: {password}."
-            ),
+            "message": password_note,
         }
     return {
         "provisioned": True,

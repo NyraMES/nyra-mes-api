@@ -47,12 +47,26 @@ def _lot_code(db: Session, tenant: TenantContext, lot_pk) -> Optional[str]:
     return lot.lot_code if lot else None
 
 
+def dispatch_quantity_kg(meta: dict[str, Any]) -> Decimal:
+    from decimal import Decimal
+
+    total = Decimal("0")
+    for line in meta.get("lines") or []:
+        if isinstance(line, dict):
+            total += Decimal(str(line.get("dispatch_quantity") or 0))
+    if total <= 0:
+        total = Decimal(str(meta.get("last_dispatch_kg") or meta.get("quantity_kg") or 0))
+    return total
+
+
 def _to_dispatch_out(db: Session, tenant: TenantContext, row: QualityCheck) -> DispatchOut:
     meta = _meta(row)
     return DispatchOut(
         dispatch_id=row.check_code,
         customer_id=meta.get("customer_id"),
         order_id=meta.get("order_id"),
+        work_order_code=meta.get("work_order_code"),
+        quantity_kg=dispatch_quantity_kg(meta),
         dispatch_date=_parse_dt(meta.get("dispatch_date")) or row.created_at,
         vehicle_number=meta.get("vehicle_number"),
         transporter_name=meta.get("transporter_name"),

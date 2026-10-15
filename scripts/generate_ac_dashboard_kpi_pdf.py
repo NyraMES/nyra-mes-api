@@ -244,7 +244,7 @@ def main() -> int:
                 ],
                 [
                     "Kiln utilization",
-                    "Kilns marked RUNNING ÷ kiln count × 100.",
+                    "Month-to-date kiln output kg ÷ designed kg × 100. Designed kg is the Masters monthly capacity when residence is 60 minutes. A standing kiln residence (Admin — Kiln parameters) scales it: monthly capacity × (60 ÷ residence minutes). The kiln card cycle clock uses that same residence. Post-activation machines stay on Masters monthly capacity.",
                 ],
             ],
             styles,

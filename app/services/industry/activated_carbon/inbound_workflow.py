@@ -30,6 +30,7 @@ from app.schemas.mes_core.schemas import (
 )
 from app.services.industry.activated_carbon.codes import next_process_bag_code
 from app.services.industry.activated_carbon import inbound_admin as ac_inbound_admin
+from app.services.industry.activated_carbon import process_rules as ac_process_rules
 from app.services.mes_core import entities as mes_core_entities
 from app.services.mes_core.base import TenantRepository
 
@@ -222,8 +223,25 @@ def _bags(meta: dict) -> list[dict]:
     return list(rows) if isinstance(rows, list) else []
 
 
+def _bag_kind(bag: dict) -> str:
+    kind = str(bag.get("bag_kind") or "").strip().lower()
+    if kind:
+        return kind
+    if bag.get("grade"):
+        return "outward"
+    return "rms_500"
+
+
 def _rms_bags(meta: dict) -> list[dict]:
     return [row for row in _bags(meta) if not row.get("grade")]
+
+
+def _repack_bags(meta: dict) -> list[dict]:
+    return [row for row in _bags(meta) if _bag_kind(row) == "repack_500"]
+
+
+def _screening_feed_bags(meta: dict) -> list[dict]:
+    return _rms_bags(meta)
 
 
 def _outward_bags(meta: dict) -> list[dict]:
@@ -236,7 +254,10 @@ def _is_kiln_feed_grade(grade: str) -> bool:
 
 
 def _is_kiln_feed_bag(bag: dict) -> bool:
-    return _is_kiln_feed_grade(bag.get("grade") or bag.get("grade_label") or "")
+    label = bag.get("grade") or bag.get("grade_label") or ""
+    if ac_inbound_admin.is_outward_byproduct(label):
+        return False
+    return True
 
 
 def _kiln_feed_outward_bags(meta: dict) -> list[dict]:
@@ -514,6 +535,46 @@ def _stage_inward_bag_triples(
             source_id=source_id,
         ),
     )
+    for parent in bag.get("parent_bag_codes") or []:
+        parent_code = str(parent).strip()
+        if not parent_code:
+            continue
+        mes_core_entities.create_triple(
+            db,
+            tenant,
+            TripleCreate(
+                subject_uri=f"urn:nyra:ac:inwardBag:{parent_code}",
+                predicate_uri="urn:nyra:predicate:containedIn",
+                object_uri=subject,
+                source_table="trn.customer_order",
+                source_id=source_id,
+            ),
+        )
+        mes_core_entities.create_triple(
+            db,
+            tenant,
+            TripleCreate(
+                subject_uri=subject,
+                predicate_uri="urn:nyra:predicate:generatedFrom",
+                object_uri=f"urn:nyra:ac:inwardBag:{parent_code}",
+                source_table="trn.customer_order",
+                source_id=source_id,
+            ),
+        )
+    if bag.get("bag_kind"):
+        mes_core_entities.create_triple(
+            db,
+            tenant,
+            TripleCreate(
+                subject_uri=subject,
+                predicate_uri="urn:nyra:predicate:captures",
+                object_uri="urn:nyra:ac:parameter:BAG_KIND",
+                object_literal=str(bag["bag_kind"]),
+                object_datatype="http://www.w3.org/2001/XMLSchema#string",
+                source_table="trn.customer_order",
+                source_id=source_id,
+            ),
+        )
     if bag.get("grade"):
         mes_core_entities.create_triple(
             db,
@@ -555,6 +616,15 @@ def _lab_execution_decision(meta: dict) -> str:
 
 
 def lab_denied(meta: dict) -> bool:
+    repack = _repack_bags(meta)
+    if repack:
+        labs = [row.get("lab_qc") if isinstance(row.get("lab_qc"), dict) else {} for row in repack]
+        if labs and all(
+            str(lab.get("qc_status") or "").upper() in ("FAIL", "QC_FAILED", "REJECTED", "DENIED")
+            for lab in labs
+        ):
+            return True
+        return False
     if meta.get("inbound_lab_denied"):
         return True
     initial = _initial_qc(meta)
@@ -580,22 +650,17 @@ def lab_approved(meta: dict) -> bool:
 
 
 def _assert_initial_qc_ready(meta: dict, order_code: str) -> None:
+    if lab_denied(meta):
+        raise ValidationError(
+            f"Order '{order_code}' was denied in Lab — remaining bags on this inward will not proceed."
+        )
     initial = _initial_qc(meta)
     status = (initial.get("qc_status") or "").upper()
     decision = _lab_execution_decision(meta)
-    if status in ("FAIL", "QC_FAILED", "REJECTED") or decision in ("DENY", "FAIL", "REJECTED"):
-        raise ValidationError(
-            f"Order '{order_code}' was denied in Lab — this inward will not proceed."
-        )
     if status in ("HOLD",) or decision == "HOLD":
         raise ValidationError(
             f"Order '{order_code}' is on hold — approve before splitting into bags."
         )
-    if lab_approved(meta):
-        return
-    raise ValidationError(
-        f"Order '{order_code}' requires Lab approve before RMS inward bags."
-    )
 
 
 def _stage_weight_to_crusher_triples(
@@ -674,6 +739,30 @@ def record_weight_to_crusher(
     return row
 
 
+def _inward_bag_out(order: CustomerOrder, bag: dict) -> AcInwardBagOut:
+    qc = bag.get("kiln_feed_qc") if isinstance(bag.get("kiln_feed_qc"), dict) else None
+    lab = bag.get("lab_qc") if isinstance(bag.get("lab_qc"), dict) else None
+    parents = [str(c) for c in (bag.get("parent_bag_codes") or []) if c]
+    return AcInwardBagOut(
+        bag_id=UUID(str(bag["bag_id"])),
+        bag_code=str(bag["bag_code"]),
+        customer_order_id=order.customer_order_id,
+        order_code=order.order_code,
+        grade=bag.get("grade"),
+        rotary=bag.get("rotary"),
+        weight_kg=Decimal(str(bag.get("weight_kg") or 0)),
+        label=bag.get("label"),
+        status=bag.get("status") or "REGISTERED",
+        created_at=bag.get("created_at"),
+        fed_at=bag.get("fed_at"),
+        created_by=bag.get("created_by") or (qc or {}).get("user_id"),
+        kiln_feed_qc=qc,
+        bag_kind=_bag_kind(bag),
+        parent_bag_codes=parents,
+        lab_qc=lab,
+    )
+
+
 def list_inward_bags(
     db: Session,
     tenant: TenantContext,
@@ -693,24 +782,7 @@ def list_inward_bags(
         if customer_order_id and order.customer_order_id != customer_order_id:
             continue
         for bag in _bags(meta):
-            qc = bag.get("kiln_feed_qc") if isinstance(bag.get("kiln_feed_qc"), dict) else None
-            rows.append(
-                AcInwardBagOut(
-                    bag_id=UUID(str(bag["bag_id"])),
-                    bag_code=str(bag["bag_code"]),
-                    customer_order_id=order.customer_order_id,
-                    order_code=order.order_code,
-                    grade=bag.get("grade"),
-                    rotary=bag.get("rotary"),
-                    weight_kg=Decimal(str(bag.get("weight_kg") or 0)),
-                    label=bag.get("label"),
-                    status=bag.get("status") or "REGISTERED",
-                    created_at=bag.get("created_at"),
-                    fed_at=bag.get("fed_at"),
-                    created_by=bag.get("created_by") or (qc or {}).get("user_id"),
-                    kiln_feed_qc=qc,
-                )
-            )
+            rows.append(_inward_bag_out(order, bag))
     return rows
 
 
@@ -734,7 +806,13 @@ def create_inward_bag(
     weight_kg = Decimal(str(payload.weight_kg))
     if weight_kg <= 0:
         raise ValidationError("Bag quantity must be greater than zero.")
-    if not grade:
+    bag_kind = str(getattr(payload, "bag_kind", None) or "").strip().lower()
+    parents = [str(c).strip() for c in (getattr(payload, "parent_bag_codes", None) or []) if str(c).strip()]
+    if bag_kind == "repack_500":
+        if not parents:
+            raise ValidationError("Select source bags contained in this 500 kg bag.")
+    elif not grade:
+        bag_kind = bag_kind or "rms_500"
         rms_total = sum(Decimal(str(row.get("weight_kg") or 0)) for row in _rms_bags(meta))
         if rms_total + weight_kg > received_kg + Decimal("0.001"):
             remaining = received_kg - rms_total
@@ -759,27 +837,66 @@ def create_inward_bag(
         "label": payload.label or (f"{grade} · {rotary}" if grade and rotary else grade),
         "status": "REGISTERED",
         "created_at": _utcnow_iso(),
+        "bag_kind": bag_kind or ("outward" if grade else "rms_500"),
+        "parent_bag_codes": parents,
     }
     bags.append(bag_row)
     meta["inward_bags"] = bags
-    if not grade and _bag_reconciliation(meta):
+    if not grade and bag_kind != "repack_500" and _bag_reconciliation(meta):
         meta.pop("bag_reconciliation", None)
     order.metadata_ = meta
     flag_modified(order, "metadata_")
     _stage_inward_bag_triples(db, tenant, order, bag_row)
     repo.db.commit()
-    return AcInwardBagOut(
-        bag_id=UUID(bag_row["bag_id"]),
-        bag_code=bag_row["bag_code"],
-        customer_order_id=order.customer_order_id,
-        order_code=order.order_code,
-        grade=grade,
-        rotary=rotary,
-        weight_kg=payload.weight_kg,
-        label=bag_row.get("label"),
-        status="REGISTERED",
-        created_at=bag_row["created_at"],
+    return _inward_bag_out(order, bag_row)
+
+
+def auto_create_rms_bags(
+    db: Session, tenant: TenantContext, customer_order_id: UUID
+) -> list[AcInwardBagOut]:
+    """Split inward weight into 500 kg bags (remainder on the last bag). Idempotent."""
+    order, received_kg = _require_inward_order(db, tenant, customer_order_id)
+    repo = _repo(db, tenant)
+    meta = _meta(order)
+    _assert_initial_qc_ready(meta, order.order_code)
+    existing = _rms_bags(meta)
+    if existing:
+        return [_inward_bag_out(order, row) for row in existing]
+    weights = ac_process_rules.plan_rms_bag_weights(
+        received_kg, ac_process_rules.get_process_rules(db, tenant).get("repack_bag_kg")
     )
+    bags = _bags(meta)
+    created: list[dict] = []
+    for weight_kg in weights:
+        bag_row = {
+            "bag_id": str(uuid4()),
+            "bag_code": _next_bag_code(repo.db, outward=False),
+            "grade": None,
+            "rotary": None,
+            "weight_kg": str(weight_kg),
+            "label": None,
+            "status": "REGISTERED",
+            "created_at": _utcnow_iso(),
+            "bag_kind": "rms_500",
+            "parent_bag_codes": [],
+        }
+        bags.append(bag_row)
+        created.append(bag_row)
+        _stage_inward_bag_triples(db, tenant, order, bag_row)
+    total_kg = sum(weights)
+    meta["inward_bags"] = bags
+    meta["bag_reconciliation"] = {
+        "status": "RECONCILED",
+        "total_kg": str(total_kg),
+        "received_kg": str(received_kg),
+        "variance_kg": str(received_kg - total_kg),
+        "variance_comment": "Automatic 500 kg split",
+        "reconciled_at": _utcnow_iso(),
+    }
+    order.metadata_ = meta
+    flag_modified(order, "metadata_")
+    repo.db.commit()
+    return [_inward_bag_out(order, row) for row in created]
 
 
 def feed_inward_bag_to_crusher(
@@ -789,9 +906,13 @@ def feed_inward_bag_to_crusher(
     repo = _repo(db, tenant)
     meta = _meta(order)
     _assert_initial_qc_ready(meta, order.order_code)
+    if not lab_approved(meta):
+        raise ValidationError(
+            f"Order '{order.order_code}' requires Lab approve before RMS Screen."
+        )
     if not _is_bags_reconciled(meta):
         raise ValidationError(
-            f"Order '{order.order_code}' — complete RMS inward (bag total = inward weight) before crusher feed."
+            f"Order '{order.order_code}' — complete RMS inward before RMS Screen."
         )
     bags = _bags(meta)
     bag_key = str(payload.bag_id)
@@ -803,13 +924,13 @@ def feed_inward_bag_to_crusher(
     if found is None:
         raise ValidationError("Bag not found on this inward order.")
     if found.get("grade"):
-        raise ValidationError("Only RMS inward bags are fed to the crusher.")
+        raise ValidationError("Only RMS 500 kg bags can be loaded to RMS Screen.")
     if (found.get("status") or "").upper() == "FED_TO_CRUSHER":
-        raise ValidationError(f"Bag {found.get('bag_code')} is already fed to the crusher.")
-    nxt = next_rms_bag_to_feed(meta)
+        raise ValidationError(f"Bag {found.get('bag_code')} is already loaded to RMS Screen.")
+    nxt = next_screening_bag_to_feed(meta)
     if nxt and str(nxt.get("bag_id")) != bag_key:
         raise ValidationError(
-            f"Feed RMS bags one by one — next bag is {nxt.get('bag_code')}."
+            f"Feed bags one by one — next bag is {nxt.get('bag_code')}."
         )
     found["status"] = "FED_TO_CRUSHER"
     found["fed_at"] = _utcnow_iso()
@@ -830,19 +951,7 @@ def feed_inward_bag_to_crusher(
         ),
     )
     repo.db.commit()
-    return AcInwardBagOut(
-        bag_id=UUID(str(found["bag_id"])),
-        bag_code=str(found["bag_code"]),
-        customer_order_id=order.customer_order_id,
-        order_code=order.order_code,
-        grade=found.get("grade"),
-        rotary=found.get("rotary"),
-        weight_kg=Decimal(str(found.get("weight_kg") or 0)),
-        label=found.get("label"),
-        status=found.get("status") or "FED_TO_CRUSHER",
-        created_at=found.get("created_at"),
-        fed_at=found.get("fed_at"),
-    )
+    return _inward_bag_out(order, found)
 
 
 def next_rms_bag_to_feed(meta: dict) -> dict | None:
@@ -852,8 +961,15 @@ def next_rms_bag_to_feed(meta: dict) -> dict | None:
     return None
 
 
+def next_screening_bag_to_feed(meta: dict) -> dict | None:
+    for row in _screening_feed_bags(meta):
+        if (row.get("status") or "").upper() != "FED_TO_CRUSHER":
+            return row
+    return None
+
+
 def all_bags_fed_to_crusher(meta: dict) -> bool:
-    bags = _rms_bags(meta)
+    bags = _screening_feed_bags(meta)
     if not bags:
         return False
     return all((row.get("status") or "").upper() == "FED_TO_CRUSHER" for row in bags)
@@ -878,10 +994,10 @@ def reconcile_inward_bags(
         )
     variance_kg = received_kg - total_kg
     comment = (payload.variance_comment or "").strip()
-    if variance_kg > Decimal("0.01") and not comment:
+    if variance_kg > Decimal("0.01") and not payload.short_confirmed:
         raise ValidationError(
-            f"RMS bag total {total_kg} KG is less than inward weight {received_kg} KG "
-            f"(short by {variance_kg} KG) — enter remarks."
+            f"Bag total {total_kg} KG is short of our weight {received_kg} KG "
+            f"by {variance_kg} KG. Add another bag, or confirm to proceed."
         )
     meta["bag_reconciliation"] = {
         "status": "RECONCILED",

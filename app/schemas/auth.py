@@ -11,6 +11,7 @@ class UserContextOut(BaseModel):
     sub: str
     username: str
     email: Optional[str] = None
+    display_name: Optional[str] = None
     tenant_code: Optional[str] = None
     groups: List[str] = Field(default_factory=list)
     roles: List[str] = Field(default_factory=list)

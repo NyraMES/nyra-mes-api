@@ -17,9 +17,12 @@ load_dotenv(ROOT / ".env")
 
 from sqlalchemy import text
 from sqlalchemy.orm import Session
+from sqlalchemy.orm.attributes import flag_modified
 
 from app.core.tenant_context import resolve_tenant
 from app.db.mes_core_database import get_mes_core_engine
+from app.models.mes_core.master import Equipment, Resource
+from app.models.mes_core.platform import Tenant
 from app.services.industry.activated_carbon.codes import (
     AC_SEQUENCE_CODE_SOURCES,
     AC_SHOP_CODE_SEQUENCES,
@@ -27,6 +30,7 @@ from app.services.industry.activated_carbon.codes import (
     _max_numeric_suffix,
     reset_ac_sequences_empty,
 )
+from app.services.industry.activated_carbon.work_orders import META_KEY as WORK_ORDER_META_KEY
 
 TENANT_CODE = "GR_CARBONS"
 WORKSPACE_CODE = "GR_CARBONS_ACTIVATED_CARBON"
@@ -86,6 +90,72 @@ def wipe_tenant_transactions(db: Session, tenant_id: str) -> None:
     db.commit()
 
 
+RESOURCE_TXN_KEYS = (
+    "kiln_feed_events",
+    "kiln_output_bags",
+    "kiln_output_seq",
+    "destoning_loaded_bags",
+    "destoning_output_bags",
+    "destoning_load_events",
+    "active_lot_code",
+    "active_lot_codes",
+    "loaded_kg",
+    "kiln_resource_claimed",
+    "kiln_live_status",
+    "current_work_order_code",
+    "claimed_lot_code",
+    "in_use_count",
+    "active_execution_code",
+)
+
+
+def wipe_shop_floor_metadata(db: Session, tenant_id: str) -> None:
+    """Clear kiln/destoner/post-activation bags on resources. Keep destoner CTC and masters."""
+    resources = db.query(Resource).filter(Resource.tenant_id == tenant_id).all()
+    changed = 0
+    for row in resources:
+        meta = dict(row.metadata_ if isinstance(row.metadata_, dict) else {})
+        dirty = False
+        role = str(meta.get("role") or "").lower()
+        code = str(row.resource_code or "").upper()
+        if role == "post_activation" or code == "RES-POSTACT-01":
+            if meta.get("stations"):
+                meta["stations"] = {}
+                dirty = True
+        for key in RESOURCE_TXN_KEYS:
+            if key in meta:
+                meta.pop(key, None)
+                dirty = True
+        if dirty:
+            row.metadata_ = meta
+            flag_modified(row, "metadata_")
+            changed += 1
+    equipment = db.query(Equipment).filter(Equipment.tenant_id == tenant_id).all()
+    for row in equipment:
+        meta = dict(row.metadata_ if isinstance(row.metadata_, dict) else {})
+        dirty = False
+        for key in ("active_lot_code", "active_execution_code", "in_use_count"):
+            if key in meta:
+                meta.pop(key, None)
+                dirty = True
+        if dirty:
+            row.metadata_ = meta
+            flag_modified(row, "metadata_")
+            changed += 1
+    tenant = db.get(Tenant, tenant_id)
+    if tenant is not None:
+        meta = dict(tenant.metadata_ if isinstance(tenant.metadata_, dict) else {})
+        rows = meta.get(WORK_ORDER_META_KEY)
+        if isinstance(rows, list):
+            count = len([item for item in rows if isinstance(item, dict)])
+            meta[WORK_ORDER_META_KEY] = []
+            tenant.metadata_ = meta
+            flag_modified(tenant, "metadata_")
+            print(f"  deleted {count} work orders")
+    db.commit()
+    print(f"  cleared shop-floor metadata on {changed} resource/equipment rows")
+
+
 def realign_sequences(db: Session, tenant_id: str) -> None:
     """Shop bags start at 1. Shared sequences sit past remaining rows in every tenant."""
     reset_ac_sequences_empty(db)
@@ -142,10 +212,13 @@ def main() -> int:
     _print_counts(db, tid, "Before wipe:")
     print("Wiping GR Carbons transactional rows (masters kept)...")
     wipe_tenant_transactions(db, tid)
+    print("Clearing kiln/destoner bags and work-order loads...")
+    wipe_shop_floor_metadata(db, tid)
     try:
         sam = resolve_tenant(db, "SAM_CARBONS_DEMO", None)
         print("Wiping SAM_CARBONS_DEMO transactional rows (shared AC sequences)...")
         wipe_tenant_transactions(db, str(sam.tenant_id))
+        wipe_shop_floor_metadata(db, sam.tenant_id)
     except Exception as exc:
         print(f"Skip SAM_CARBONS_DEMO wipe: {exc}")
     print("Resetting sequences...")

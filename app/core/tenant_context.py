@@ -51,6 +51,7 @@ class TenantContext:
     icon_name: Optional[str]
     dashboard_component: Optional[str]
     enabled_capabilities: Tuple[str, ...]
+    timezone: str = "UTC"
 
     def has_capability(self, capability_code: str) -> bool:
         return capability_code in self.enabled_capabilities
@@ -158,6 +159,7 @@ def resolve_tenant(db: Session, tenant_code: str, workspace_code: Optional[str] 
         icon_name=template.icon_name,
         dashboard_component=template.dashboard_component,
         enabled_capabilities=enabled,
+        timezone=(tenant.timezone or "UTC").strip() or "UTC",
     )
 
 

@@ -1,5 +1,6 @@
 from app.services.industry.activated_carbon.post_activation import (
     bag_is_available_in_stock,
+    bag_matches_work_order,
     _is_in_stock_destination,
     _normalize_destination_label,
 )
@@ -11,7 +12,9 @@ def test_in_stock_destination_aliases():
     assert _is_in_stock_destination("IN-STOCK")
     assert not _is_in_stock_destination("Screening")
     assert not _is_in_stock_destination("")
+    assert _is_in_stock_destination("Finished Goods")
     assert _normalize_destination_label("In Stock") is None
+    assert _normalize_destination_label("Finished Goods") is None
     assert _normalize_destination_label("Screening") == "screening"
 
 
@@ -61,3 +64,20 @@ def test_post_activation_in_stock_bag():
         },
     }
     assert bag_is_available_in_stock(bag) is True
+    finished = {
+        **bag,
+        "bag_code": "SC_051026_00002",
+        "quality_qc": {
+            "saved_at": "2026-10-05T06:00:00+00:00",
+            "values": {"post_qc_destination": "Finished Goods"},
+        },
+    }
+    assert bag_is_available_in_stock(finished) is True
+
+
+def test_in_stock_bag_matches_work_order():
+    bag = {"bag_code": "SC_1", "work_order_code": "WO-AC-1"}
+    assert bag_matches_work_order(bag, "WO-AC-1")
+    assert not bag_matches_work_order(bag, "WO-AC-2")
+    assert bag_matches_work_order(bag, None)
+    assert bag_matches_work_order(bag, "")

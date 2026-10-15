@@ -631,6 +631,12 @@ def enrich_inward_order_stock(
         if receipt.get("our_weight_kg") is not None
         else qty
     )
+    raw_bags = meta.get("inward_bags") if isinstance(meta.get("inward_bags"), list) else []
+    rms_bags = [row for row in raw_bags if isinstance(row, dict) and not row.get("grade")]
+    rms_bag_weight_kg = sum(
+        (Decimal(str(row.get("weight_kg") or 0)) for row in rms_bags),
+        Decimal("0"),
+    )
     supplier_value_inr = (
         Decimal(str(receipt["supplier_value_inr"]))
         if receipt.get("supplier_value_inr") is not None
@@ -656,9 +662,14 @@ def enrich_inward_order_stock(
             "dc_number": dc_number,
             "supplier_weight_kg": supplier_weight_kg,
             "our_weight_kg": our_weight_kg,
+            "rms_bag_count": len(rms_bags),
+            "rms_bag_weight_kg": rms_bag_weight_kg if rms_bags else None,
             "supplier_value_inr": supplier_value_inr,
             "lab_status": lab_status,
             "lab_at": lab_at,
+            "lab_moisture_pct": initial_qc.get("moisture_pct"),
+            "lab_dust_pct": initial_qc.get("dust_pct"),
+            "lab_volatility": initial_qc.get("volatility"),
             "rms_inward_status": rms_status,
             "rms_inward_at": rms_at,
             "rm_outward_status": out_status,
@@ -697,8 +708,8 @@ def allocate_raw_from_inward(
         raise ValidationError("Release quantity must be greater than zero")
     if qty > available:
         raise ValidationError(
-            f"Only {available} KG available on this inward receipt "
-            f"({line_qty} KG received, {allocated} KG already released to production)"
+            f"This inward already released {allocated} KG to production. "
+            f"Only {available} KG can still be released."
         )
     meta = {
         **meta,

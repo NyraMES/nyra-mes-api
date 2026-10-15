@@ -25,6 +25,7 @@ MES_PLANNER = "MES_Planner"
 MES_OPERATOR = "MES_Operator"
 MES_QUALITY = "MES_Quality"
 MES_RMS = "MES_RMS"
+MES_SECURITY = "MES_Security"
 MES_ACTIVATION = "MES_Activation"
 MES_POST_ACTIVATION = "MES_PostActivation"
 MES_VIEWER = "MES_Viewer"
@@ -38,6 +39,7 @@ ALL_MES_ROLES: Set[str] = {
     MES_OPERATOR,
     MES_QUALITY,
     MES_RMS,
+    MES_SECURITY,
     MES_ACTIVATION,
     MES_POST_ACTIVATION,
     MES_VIEWER,
@@ -374,14 +376,14 @@ def require_tenant_admin():
 
 
 def require_plant_admin():
-    """Users screen — Administrator may create plant users."""
+    """Admin — Users, suppliers, destoning CTC, work orders."""
 
     def _dependency(user: UserContext = Depends(get_current_user)) -> UserContext:
-        if user.is_plant_admin() or user.is_nyra_services():
+        if user.is_plant_admin() or user.has_any_role({MES_MANAGER, MES_PLANNER}):
             return user
         raise ForbiddenError(
-            "Only an Administrator may create users.",
-            details={"required_roles": [MES_ADMIN], "your_roles": user.roles},
+            "Admin access is required.",
+            details={"required_roles": [MES_ADMIN, MES_MANAGER], "your_roles": user.roles},
         )
 
     return Depends(_dependency)

@@ -9,7 +9,10 @@ if [[ ! -d "$STAGING" ]]; then
   exit 1
 fi
 
-mkdir -p "$UI_DIR"
-rsync -a --delete "$STAGING"/ "$UI_DIR"/
+mkdir -p "$UI_DIR" "$UI_DIR/assets"
+# Replace index.html and root files, but keep older hashed files in assets/.
+# A tab opened before this deploy still imports the previous chunk names.
+rsync -a --delete --exclude '/assets/' "$STAGING"/ "$UI_DIR"/
+rsync -a "$STAGING/assets"/ "$UI_DIR/assets"/
 echo "UI synced to $UI_DIR"
 ls -la "$UI_DIR" | head -n 10

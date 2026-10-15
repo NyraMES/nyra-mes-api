@@ -163,24 +163,12 @@ def validate_outward_kg_within_inward(outward_kg, inward_kg) -> None:
 
 
 def validate_rm_outward_splits(cleaned: list[dict]) -> None:
-    """One rotary is enough: that rotary must have a grade value plus Stones and Unburnt."""
-    if not cleaned:
-        raise ValidationError("Enter RM outward split weights and bags.")
-    if any(not str(row.get("rotary") or "").strip() for row in cleaned):
+    """At least one outward bag. A grade, Unburnt, or Stones each counts."""
+    rows = [row for row in (cleaned or []) if str(row.get("grade_label") or "").strip()]
+    if not rows:
+        raise ValidationError("Enter at least one RMS outward bag.")
+    if any(not str(row.get("rotary") or "").strip() for row in rows):
         raise ValidationError("Select Rotary A or Rotary B for every outward bag.")
-    by_rotary: dict[str, set[str]] = {}
-    for row in cleaned:
-        rotary = str(row.get("rotary") or "").strip()
-        by_rotary.setdefault(rotary, set()).add(
-            _canonical_outward_grade(row.get("grade_label") or "")
-        )
-    for grades in by_rotary.values():
-        has_value = any(grade and grade not in OUTWARD_BYPRODUCT_GRADES for grade in grades)
-        if has_value and "Unburnt" in grades and "Stones" in grades:
-            return
-    raise ValidationError(
-        "Choose Rotary A or Rotary B and add a grade value plus Stones and Unburnt on that rotary."
-    )
 
 
 def is_allowed_outward_grade(db: Session, tenant: TenantContext, label: str) -> bool:

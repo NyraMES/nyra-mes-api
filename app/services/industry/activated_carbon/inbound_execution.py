@@ -22,6 +22,7 @@ from app.schemas.mes_core.schemas import (
 from app.services.industry.activated_carbon.raw_material_types import get_raw_material_type
 from app.services.industry.activated_carbon import inbound_admin as ac_inbound_admin
 from app.services.industry.activated_carbon import inbound_workflow as ac_inbound_workflow
+from app.services.industry.activated_carbon import process_rules as ac_process_rules
 from app.services.industry.activated_carbon import triplet_capture
 from app.services.mes_core import entities as mes_core_entities
 from app.services.mes_core.base import TenantRepository
@@ -52,10 +53,8 @@ def _json_val(value: Any) -> Any:
 
 def resolve_inbound_operations(material_type: AcRawMaterialTypeOut) -> list[dict]:
     ops = material_type.inbound_operations or []
-    return sorted(
-        [dict(op) if isinstance(op, dict) else op.model_dump() for op in ops],
-        key=lambda o: int(o.get("operation_sequence") or 0),
-    )
+    rows = [dict(op) if isinstance(op, dict) else op.model_dump() for op in ops]
+    return ac_process_rules.normalized_inbound_operations(rows)
 
 
 def _step_storage_key(op: dict) -> str:
@@ -97,6 +96,14 @@ def _is_lab_operation(op: dict) -> bool:
 
 def inbound_step_completed(meta: dict, op: dict) -> bool:
     if ac_inbound_workflow.lab_denied(meta) and _is_lab_operation(op):
+        return False
+    code = str(op.get("operation_code") or "").strip().upper()
+    if code == ac_process_rules.INBOUND_DRYING_CODE:
+        if ac_process_rules.drying_completed(meta):
+            return True
+        moisture = ac_process_rules.latest_moisture_pct(meta)
+        if not ac_process_rules.moisture_requires_drying(moisture):
+            return True
         return False
     row = _step_record(meta, op)
     return str(row.get("status") or "").upper() == "COMPLETED"
@@ -264,6 +271,61 @@ def _stage_inbound_step_triples(
             source_id=source_id,
         ),
     )
+    bag_code = str(payload.get("bag_code") or payload.get("inward_bag_code") or "").strip()
+    if payload.get("volatility") not in (None, ""):
+        vol_subject = f"urn:nyra:ac:inwardBag:{bag_code}" if bag_code else subject
+        lab_object = f"urn:nyra:ac:labResult:{bag_code}" if bag_code else f"urn:nyra:ac:labResult:{order.order_code}"
+        mes_core_entities.create_triple(
+            db,
+            tenant,
+            TripleCreate(
+                subject_uri=vol_subject,
+                predicate_uri="urn:nyra:predicate:testedBy",
+                object_uri=lab_object,
+                source_table="trn.customer_order",
+                source_id=source_id,
+            ),
+        )
+        mes_core_entities.create_triple(
+            db,
+            tenant,
+            TripleCreate(
+                subject_uri=vol_subject,
+                predicate_uri="urn:nyra:predicate:captures",
+                object_uri=ac_process_rules.VOLATILITY_URI,
+                object_literal=str(payload.get("volatility")),
+                object_datatype="http://www.w3.org/2001/XMLSchema#decimal",
+                source_table="trn.customer_order",
+                source_id=source_id,
+            ),
+        )
+    if step == "DRYING":
+        mes_core_entities.create_triple(
+            db,
+            tenant,
+            TripleCreate(
+                subject_uri=subject,
+                predicate_uri="urn:nyra:predicate:captures",
+                object_uri=f"urn:nyra:ac:drying:{order.order_code}",
+                source_table="trn.customer_order",
+                source_id=source_id,
+            ),
+        )
+        for parent in payload.get("output_bag_codes") or []:
+            parent_code = str(parent).strip()
+            if not parent_code:
+                continue
+            mes_core_entities.create_triple(
+                db,
+                tenant,
+                TripleCreate(
+                    subject_uri=f"urn:nyra:ac:inwardBag:{parent_code}",
+                    predicate_uri="urn:nyra:predicate:generatedFrom",
+                    object_uri=f"urn:nyra:ac:drying:{order.order_code}",
+                    source_table="trn.customer_order",
+                    source_id=source_id,
+                ),
+            )
     if material_type is not None:
         triplet_capture.stage_inbound_step_captures(
             db,
@@ -323,29 +385,42 @@ def _apply_step_domain_rules(
             raise ValidationError(
                 "Enter remarks when denying this inward. The record will stop here."
             )
-        meta["initial_qc"] = {
+        for raw, label in (
+            (params.get("moisture_pct"), "Moisture"),
+            (params.get("dust_pct"), "Dust"),
+            (params.get("volatility"), "Volatility"),
+        ):
+            if raw in (None, ""):
+                continue
+            try:
+                pct = Decimal(str(raw))
+            except Exception as exc:
+                raise ValidationError(f"{label} must be a number (%).") from exc
+            if pct < 0 or pct > 100:
+                raise ValidationError(f"{label} must be between 0 and 100 %.")
+        lab_row = {
             "qc_status": mapped,
             "moisture_pct": params.get("moisture_pct"),
             "dust_pct": params.get("dust_pct"),
+            "volatility": params.get("volatility"),
             "ad_value": params.get("ad_value"),
             "remarks": remarks or None,
             "qc_at": datetime.now(timezone.utc).isoformat(),
             "source": "inbound_execution_lab",
         }
+        meta["initial_qc"] = lab_row
+        meta["inbound_lab_denied"] = mapped == "FAIL"
         if mapped == "FAIL":
-            meta["inbound_lab_denied"] = True
             meta.setdefault("raw_material_qc", {})
             if isinstance(meta["raw_material_qc"], dict):
                 meta["raw_material_qc"] = {
                     **meta["raw_material_qc"],
                     "qc_status": "QC_FAILED",
                     "operator_remarks": remarks,
-                    "qc_at": meta["initial_qc"]["qc_at"],
+                    "qc_at": lab_row["qc_at"],
                     "source": "inbound_execution_lab_deny",
                 }
             order.status = "QC_FAILED"
-        else:
-            meta["inbound_lab_denied"] = False
         return
 
     if code == "IN-RMS-BAG":
@@ -354,31 +429,39 @@ def _apply_step_domain_rules(
         )
         bags = ac_inbound_workflow._rms_bags(meta)
         if not bags:
-            raise ValidationError("Create RMS bags before completing RMS inward.")
+            raise ValidationError(
+                "Generate bags before proceeding to Lab — enter each bag weight and click Generate bag."
+            )
         total_kg = sum(Decimal(str(row.get("weight_kg") or 0)) for row in bags)
         variance_kg = received_kg - total_kg
         remark = str(params.get("variance_comment") or params.get("remarks") or "").strip()
         if total_kg > received_kg + Decimal("0.01"):
             raise ValidationError(
-                f"RMS bag total {total_kg} KG exceeds inward weight {received_kg} KG."
+                f"Bag total {total_kg} KG exceeds our weight {received_kg} KG."
             )
-        if variance_kg > Decimal("0.01") and not remark:
+        confirmed_short = str(params.get("short_confirmed") or "").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+        }
+        if variance_kg > Decimal("0.01") and not confirmed_short:
             raise ValidationError(
-                f"RMS bag total {total_kg} KG is less than inward weight {received_kg} KG — enter remarks."
+                f"Bag total {total_kg} KG is short of our weight {received_kg} KG "
+                f"by {variance_kg} KG. Add another bag, or confirm to proceed."
             )
         meta["bag_reconciliation"] = {
             "status": "RECONCILED",
             "total_kg": str(total_kg),
             "received_kg": str(received_kg),
             "variance_kg": str(variance_kg),
-            "variance_comment": remark or None,
+            "variance_comment": remark or "User-generated bags",
             "reconciled_at": datetime.now(timezone.utc).isoformat(),
         }
         return
 
     if code == "IN-CRUSHER":
         if not ac_inbound_workflow.all_bags_fed_to_crusher(meta):
-            raise ValidationError("Feed every RMS bag to the crusher before recording performance.")
+            raise ValidationError("Load every 500 kg bag to RMS Screen first.")
         rotary = str(params.get("rotary") or "").strip()
         allowed = ac_inbound_admin.rotary_names(db, tenant)
         if rotary not in allowed:
@@ -394,8 +477,6 @@ def _apply_step_domain_rules(
             if params.get("moisture_pct") not in (None, "")
             else params.get("moisture_after_crush_pct")
         )
-        if dust in (None, "") or moisture in (None, ""):
-            raise ValidationError("Enter dust (%) and moisture (%).")
         crusher_output = {
             "rotary": rotary,
             "dust_pct": dust,
@@ -419,6 +500,15 @@ def _apply_step_domain_rules(
             crusher_output[field] = str(pct)
             params[field] = str(pct)
         meta["crusher_output"] = crusher_output
+        meta.setdefault("raw_material_qc", {})
+        if isinstance(meta["raw_material_qc"], dict):
+            meta["raw_material_qc"] = {
+                **meta["raw_material_qc"],
+                "qc_status": "QC_PASSED",
+                "qc_at": crusher_output["completed_at"],
+                "source": "rms_screen_complete",
+            }
+        order.status = "QC_PASSED"
         return
 
     if code == "IN-RM-OUT":
@@ -447,7 +537,7 @@ def _apply_step_domain_rules(
                 }
             )
         if not cleaned:
-            raise ValidationError("Enter RM outward split weights and bags.")
+            raise ValidationError("Enter at least one RMS outward bag.")
         ac_inbound_admin.validate_rm_outward_splits(cleaned)
         _, received_kg = ac_inbound_workflow._require_inward_order(
             db, tenant, order.customer_order_id
@@ -468,6 +558,41 @@ def _apply_step_domain_rules(
                 "source": "inbound_prep_complete",
             }
         order.status = "QC_PASSED"
+        return
+
+    if code == ac_process_rules.INBOUND_REPACK_CODE:
+        repack = ac_inbound_workflow._repack_bags(meta)
+        if not repack:
+            raise ValidationError("Create 500 kg bags from 25 kg source bags before completing repack.")
+        params["bag_count"] = len(repack)
+        params["bag_total_kg"] = str(
+            sum(Decimal(str(row.get("weight_kg") or 0)) for row in repack)
+        )
+        return
+
+    if code == ac_process_rules.INBOUND_DRYING_CODE:
+        moisture = ac_process_rules.latest_moisture_pct(meta)
+        rules = ac_process_rules.default_process_rules()
+        if not ac_process_rules.moisture_requires_drying(moisture, rules["moisture_dry_threshold_pct"]):
+            meta["drying"] = {
+                "status": "COMPLETED",
+                "skipped": True,
+                "moisture_pct": str(moisture) if moisture is not None else None,
+                "completed_at": datetime.now(timezone.utc).isoformat(),
+            }
+            return
+        dried_kg = params.get("dried_kg") or params.get("output_kg")
+        if dried_kg in (None, ""):
+            raise ValidationError("Enter dried weight (KG) after drying and rebag.")
+        meta["drying"] = {
+            "status": "COMPLETED",
+            "skipped": False,
+            "moisture_pct": str(moisture) if moisture is not None else None,
+            "dried_kg": str(dried_kg),
+            "output_bag_codes": params.get("output_bag_codes") or [],
+            "completed_at": datetime.now(timezone.utc).isoformat(),
+        }
+        return
 
 
 def complete_inbound_step(
@@ -512,11 +637,20 @@ def complete_inbound_step(
     _apply_step_domain_rules(db, tenant, order, meta, target_op, params)
     now_iso = datetime.now(timezone.utc).isoformat()
     denied = _is_lab_operation(target_op) and ac_inbound_workflow.lab_denied(meta)
+    lab_pending = _is_lab_operation(target_op) and any(
+        not isinstance(row.get("lab_qc"), dict) for row in ac_inbound_workflow._repack_bags(meta)
+    )
+    if denied:
+        step_status = "DENIED"
+    elif lab_pending:
+        step_status = "IN_PROGRESS"
+    else:
+        step_status = "COMPLETED"
     record = {
         k: _json_val(v)
         for k, v in {
             **params,
-            "status": "DENIED" if denied else "COMPLETED",
+            "status": step_status,
             "completed_at": now_iso,
             "process_step": step,
             "operation_code": target_op.get("operation_code"),

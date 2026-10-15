@@ -47,6 +47,8 @@ class DispatchOut(ORMModel):
     dispatch_id: str
     customer_id: Optional[str] = None
     order_id: Optional[str] = None
+    work_order_code: Optional[str] = None
+    quantity_kg: Decimal = Decimal("0")
     dispatch_date: Optional[datetime] = None
     vehicle_number: Optional[str] = None
     transporter_name: Optional[str] = None
