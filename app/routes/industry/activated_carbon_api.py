@@ -77,6 +77,8 @@ from app.schemas.mes_core.schemas import (
     AcKilnOut,
     AcPlantResourceOut,
     AcKilnParametersCreate,
+    AcKilnReadingApproval,
+    AcKilnReadingBoardOut,
     AcKilnParameterReadingOut,
     AcMastersOut,
     AcMaterialTraceOptionsOut,
@@ -94,6 +96,7 @@ from app.schemas.mes_core.schemas import (
     AcStockedLotOut,
     AcTenantUserCreate,
     AcTenantUserCreateResponse,
+    AcTenantUserUpdate,
     AcTenantUserNicknameSave,
     AcTenantUserOut,
     AcUserNicknameOut,
@@ -1569,10 +1572,46 @@ def create_kiln_parameters(
     payload: AcKilnParametersCreate,
     db: Session = Depends(get_mes_core_db),
     tenant: TenantContext = Depends(_AC_KILN_PARAMS),
-    _user=require_ac_activation_run(),
+    user: UserContext = require_ac_activation_run(),
 ):
     try:
-        return ac_adapter.create_kiln_parameters(db, tenant, payload)
+        return ac_adapter.create_kiln_parameters(db, tenant, payload, user=user)
+    except ValueError as exc:
+        raise ValidationError(str(exc)) from exc
+
+
+@router.get(
+    "/kiln-parameters/board",
+    response_model=AcKilnReadingBoardOut,
+    summary="Current 30-minute kiln reading and any locked intervals",
+)
+def kiln_parameter_board(
+    kiln_resource_code: str = Query(..., min_length=1),
+    db: Session = Depends(get_mes_core_db),
+    tenant: TenantContext = Depends(_AC_KILN_PARAMS),
+    _user: UserContext = require_ac_activation_run(),
+):
+    return ac_adapter.kiln_reading_board(db, tenant, kiln_resource_code)
+
+
+@router.post(
+    "/kiln-parameters/approve",
+    response_model=AcKilnReadingBoardOut,
+    summary="Plant manager approves a missed 30-minute kiln reading",
+)
+def approve_kiln_parameter_slot(
+    payload: AcKilnReadingApproval,
+    db: Session = Depends(get_mes_core_db),
+    tenant: TenantContext = Depends(_AC_KILN_PARAMS),
+    user: UserContext = Depends(get_current_user),
+):
+    from app.core.auth import MES_ADMIN, MES_MANAGER, MES_PLANNER, MES_SUPER_ADMIN
+    from app.core.exceptions import ForbiddenError
+
+    if not user.has_any_role({MES_MANAGER, MES_PLANNER, MES_ADMIN, MES_SUPER_ADMIN}) and not user.is_nyra_services():
+        raise ForbiddenError("A plant manager approves a missed kiln reading.")
+    try:
+        return ac_adapter.approve_kiln_reading(db, tenant, payload, user=user)
     except ValueError as exc:
         raise ValidationError(str(exc)) from exc
 
@@ -1772,7 +1811,33 @@ def ac_create_user(
         email=payload.email,
         display_name=payload.display_name,
         role_code=payload.role_code,
+        role_codes=payload.role_codes,
         password=payload.password,
+    )
+
+
+@router.put(
+    "/users/{user_id}",
+    response_model=AcTenantUserOut,
+    summary="Edit a plant user's nickname, email, and roles",
+)
+def ac_update_user(
+    user_id: UUID,
+    payload: AcTenantUserUpdate,
+    db: Session = Depends(get_mes_core_db),
+    tenant: TenantContext = Depends(get_tenant_context),
+    user: UserContext = require_plant_admin(),
+):
+    return ac_users.update_tenant_user(
+        db,
+        tenant,
+        user,
+        user_id,
+        display_name=payload.display_name,
+        email=payload.email,
+        role_code=payload.role_code,
+        role_codes=payload.role_codes,
+        is_active=payload.is_active,
     )
 
 

@@ -50,6 +50,14 @@ def get_mes_core_engine() -> Optional[Engine]:
     return _mes_core_engine
 
 
+def open_mes_core_session() -> Optional[Session]:
+    """A short-lived session, or None when nyra_mes_core is not configured."""
+    get_mes_core_engine()
+    if _MesCoreSessionLocal is None:
+        return None
+    return _MesCoreSessionLocal()
+
+
 def get_mes_core_db() -> Generator[Session, None, None]:
     """FastAPI dependency — yields a session bound to nyra_mes_core."""
     engine = get_mes_core_engine()

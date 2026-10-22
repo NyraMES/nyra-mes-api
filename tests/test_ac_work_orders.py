@@ -36,6 +36,22 @@ def test_kiln_stays_on_one_work_order_until_output_catches_feed():
     assert_kiln_accepts_work_order(meta, "WO-AC-1", incoming=_wo("WO-AC-1"), lookup=lookup)
 
 
+def test_kiln_accepts_another_work_order_when_grade_differs_and_ctc_matches():
+    meta = {
+        "kiln_feed_events": [
+            {"work_order_code": "WO-AC-1", "kg": 500},
+        ],
+        "kiln_output_bags": [],
+    }
+    lookup = {
+        "WO-AC-1": _wo("WO-AC-1", "Grade 1st stage", "40"),
+        "WO-AC-2": _wo("WO-AC-2", "-20 1st Stage", "40"),
+    }.get
+    assert_kiln_accepts_work_order(
+        meta, "WO-AC-2", incoming=_wo("WO-AC-2", "-20 1st Stage", "40"), lookup=lookup
+    )
+
+
 def test_kiln_accepts_another_work_order_when_grade_and_ctc_match():
     meta = {
         "kiln_feed_events": [

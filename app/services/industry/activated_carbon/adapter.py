@@ -66,7 +66,11 @@ from app.schemas.mes_core.schemas import (
     AcKilnOut,
     AcPlantResourceOut,
     AcKilnParametersCreate,
+    AcKilnParameterDefinition,
     AcKilnParameterReadingOut,
+    AcKilnReadingApproval,
+    AcKilnReadingBoardOut,
+    AcKilnReadingSlotOut,
     AcKilnStatusOut,
     AcMastersOut,
     AcProcessStepOut,
@@ -1188,7 +1192,7 @@ def assert_rms_outward_before_release(meta: dict, order_code: str) -> None:
     separation = meta.get("grade_separation") if isinstance(meta.get("grade_separation"), dict) else {}
     if str(separation.get("status") or "").upper() != "COMPLETED":
         raise ValidationError(
-            f"Complete RMS outward on {order_code} before release to production."
+            f"Complete GRN on {order_code} before release to production."
         )
 
 
@@ -1918,6 +1922,14 @@ _KILN_READING_META = "kiln_parameter_readings"
 
 
 def _kiln_reading_values(payload: AcKilnParametersCreate) -> dict[str, Any]:
+    from app.services.industry.activated_carbon.kiln_readings import READING_KEYS
+
+    interval = {
+        key: getattr(payload, key, None)
+        for key in READING_KEYS
+    }
+    if any(value is not None and value != "" for value in interval.values()):
+        return interval
     return {
         k: v
         for k, v in {
@@ -1952,12 +1964,16 @@ def list_kiln_parameters(
         for row in meta.get(_KILN_READING_META) or []:
             if not isinstance(row, dict):
                 continue
+            recorded = _parse_reading_at(row.get("recorded_at"))
+            slot_raw = row.get("slot_start")
             out.append(
                 AcKilnParameterReadingOut(
                     reading_id=str(row.get("reading_id") or uuid4()),
                     kiln_resource_code=str(row.get("kiln_resource_code") or kiln.resource_code),
-                    recorded_at=_parse_reading_at(row.get("recorded_at")),
+                    recorded_at=recorded,
                     readings=row.get("readings") if isinstance(row.get("readings"), dict) else {},
+                    slot_start=_parse_reading_at(slot_raw) if slot_raw else recorded,
+                    late=bool(row.get("late")),
                 )
             )
     if not out:
@@ -5682,13 +5698,6 @@ def create_kiln_feed_lot(
             except ValidationError:
                 return None
 
-        output_so_far = ac_work_orders.work_order_output_kg_across_kilns(db, tenant, wo_code)
-        if ac_work_orders.work_order_kiln_output_done(
-            work_order.get("quantity_kg"), output_so_far, work_order.get("status")
-        ):
-            raise ValidationError(
-                f"Kiln output for work order {wo_code} is complete. Choose another work order."
-            )
         ac_work_orders.assert_kiln_accepts_work_order(
             kiln_meta,
             wo_code,
@@ -5713,17 +5722,15 @@ def create_kiln_feed_lot(
                 )
             )
         else:
-            remaining = lot_qty - loaded_kg
-            if remaining <= 0:
-                raise WorkflowError(f"Lot '{lot.lot_code}' is already fully loaded into the kiln")
-            feed_kg = Decimal(str(payload.quantity_kg or remaining))
+            feed_kg = Decimal(str(payload.quantity_kg or 0))
+            if feed_kg <= 0:
+                remaining = lot_qty - loaded_kg
+                feed_kg = remaining if remaining > 0 else Decimal("0")
             bag_code = (payload.bag_code or lot_meta.get("crusher_bag_code") or "").strip() or None
 
         _assert_bag_not_already_in_kiln(db, tenant, bag_code)
         if feed_kg <= 0:
             raise ValidationError("Load quantity must be greater than zero")
-        if lot_qty > 0 and loaded_kg + feed_kg > lot_qty + Decimal("0.001"):
-            raise ValidationError("Load would exceed the lot quantity")
         from app.services.industry.activated_carbon import process_rules as ac_process_rules
 
         ac_process_rules.assert_drying_before_kiln(
@@ -5931,41 +5938,275 @@ def create_kiln_feed_lot(
     return mes_core_entities.get_production_lot(db, tenant, lot.production_lot_id)
 
 
-def create_kiln_parameters(
-    db: Session, tenant: TenantContext, payload: AcKilnParametersCreate
-) -> AcKilnParameterReadingOut:
+_KILN_READING_APPROVALS = "kiln_reading_approvals"
+
+
+def _kiln_by_code(db: Session, tenant: TenantContext, kiln_code: str):
     kilns = _list_tenant_kiln_resources(db, tenant)
-    kiln_code = (payload.kiln_resource_code or "").strip()
-    kiln = next((row for row in kilns if row.resource_code == kiln_code), None)
-    if kiln is None and kilns:
-        kiln = kilns[0]
+    code = (kiln_code or "").strip()
+    kiln = next((row for row in kilns if row.resource_code == code), None)
     if kiln is None:
-        raise ValidationError("No kiln found. Add a kiln in Masters.")
-    readings = _kiln_reading_values(payload)
-    if not readings:
-        raise ValidationError("Enter at least one kiln reading.")
-    recorded_at = payload.recorded_at or datetime.now(timezone.utc)
-    if recorded_at.tzinfo is None:
-        recorded_at = recorded_at.replace(tzinfo=timezone.utc)
+        raise ValidationError("Select a kiln.")
+    return kiln
+
+
+def _reading_history(kiln) -> list[dict]:
+    meta = kiln.metadata_ if isinstance(kiln.metadata_, dict) else {}
+    return [row for row in (meta.get(_KILN_READING_META) or []) if isinstance(row, dict)]
+
+
+def _reading_approvals(kiln) -> list[dict]:
+    meta = kiln.metadata_ if isinstance(kiln.metadata_, dict) else {}
+    return [row for row in (meta.get(_KILN_READING_APPROVALS) or []) if isinstance(row, dict)]
+
+
+def _stage_kiln_reading_triples(
+    db: Session,
+    tenant: TenantContext,
+    *,
+    kiln_code: str,
+    reading_id: str,
+    readings: dict[str, Any],
+) -> None:
+    subject = f"urn:nyra:ac:kilnReading:{reading_id}"
+    _stage_triple(
+        db,
+        tenant,
+        TripleCreate(
+            subject_uri=subject,
+            predicate_uri="urn:nyra:predicate:usedEquipment",
+            object_uri=f"urn:nyra:ac:kiln:{kiln_code}",
+            source_table="cfg.resource",
+            source_id=None,
+        ),
+    )
+    for key, value in readings.items():
+        if value is None:
+            continue
+        _stage_triple(
+            db,
+            tenant,
+            TripleCreate(
+                subject_uri=subject,
+                predicate_uri="urn:nyra:predicate:captures",
+                object_uri=f"urn:nyra:ac:parameter:{key}",
+                object_literal=str(value),
+                object_datatype="http://www.w3.org/2001/XMLSchema#decimal",
+                source_table="cfg.resource",
+                source_id=None,
+            ),
+        )
+
+
+def kiln_reading_board(
+    db: Session, tenant: TenantContext, kiln_code: str
+) -> AcKilnReadingBoardOut:
+    from app.services.industry.activated_carbon.codes import plant_now
+    from app.services.industry.activated_carbon.kiln_readings import (
+        READING_FIELDS,
+        approved_slot_keys,
+        floor_slot,
+        missed_slots,
+        saved_slot_keys,
+        slot_end,
+        slot_key,
+        slot_label,
+    )
+
+    kiln = _kiln_by_code(db, tenant, kiln_code)
+    now = plant_now(tenant.timezone)
+    current = floor_slot(now)
+    history = _reading_history(kiln)
+    saved = saved_slot_keys(history)
+    approved = approved_slot_keys(_reading_approvals(kiln))
+    locked = []
+    for start in missed_slots(now, saved):
+        status = "approved" if slot_key(start) in approved else "locked"
+        locked.append(
+            AcKilnReadingSlotOut(
+                slot_start=start,
+                slot_end=slot_end(start),
+                label=slot_label(start),
+                status=status,
+            )
+        )
+    readings = [
+        row
+        for row in list_kiln_parameters(db, tenant)
+        if row.kiln_resource_code == kiln.resource_code
+    ]
+    return AcKilnReadingBoardOut(
+        kiln_resource_code=kiln.resource_code,
+        current_slot_start=current,
+        current_slot_end=slot_end(current),
+        current_label=slot_label(current),
+        fields=[
+            AcKilnParameterDefinition(key=key, label=label, unit=unit or None)
+            for key, label, unit in READING_FIELDS
+        ],
+        locked_slots=locked,
+        readings=readings[:24],
+    )
+
+
+def approve_kiln_reading(
+    db: Session,
+    tenant: TenantContext,
+    payload: AcKilnReadingApproval,
+    user: Any = None,
+) -> AcKilnReadingBoardOut:
+    from app.services.industry.activated_carbon.codes import plant_now
+    from app.services.industry.activated_carbon.kiln_readings import (
+        approved_slot_keys,
+        assert_slot_needs_approval,
+        saved_slot_keys,
+        slot_key,
+    )
+
+    kiln = _kiln_by_code(db, tenant, payload.kiln_resource_code)
+    now = plant_now(tenant.timezone)
+    history = _reading_history(kiln)
+    target = assert_slot_needs_approval(now, saved_slot_keys(history), payload.slot_start)
+    key = slot_key(target)
+    approvals = _reading_approvals(kiln)
+    if key not in approved_slot_keys(approvals):
+        approver = None
+        if user is not None:
+            approver = getattr(user, "username", None) or getattr(user, "email", None)
+        approvals.insert(
+            0,
+            {
+                "slot_start": target.astimezone(timezone.utc).isoformat(),
+                "approved_at": datetime.now(timezone.utc).isoformat(),
+                "approved_by": approver,
+                "used": False,
+            },
+        )
+        meta = dict(kiln.metadata_ if isinstance(kiln.metadata_, dict) else {})
+        meta[_KILN_READING_APPROVALS] = approvals[:200]
+        kiln.metadata_ = meta
+        flag_modified(kiln, "metadata_")
+        _stage_triple(
+            db,
+            tenant,
+            TripleCreate(
+                subject_uri=f"urn:nyra:ac:kiln:{kiln.resource_code}",
+                predicate_uri="urn:nyra:predicate:captures",
+                object_uri=f"urn:nyra:ac:kilnReadingApproval:{key}",
+                object_literal=str(approver or ""),
+                object_datatype="http://www.w3.org/2001/XMLSchema#string",
+                source_table="cfg.resource",
+                source_id=None,
+            ),
+        )
+        db.commit()
+    return kiln_reading_board(db, tenant, kiln.resource_code)
+
+
+def create_kiln_parameters(
+    db: Session,
+    tenant: TenantContext,
+    payload: AcKilnParametersCreate,
+    user: Any = None,
+) -> AcKilnParameterReadingOut:
+    from app.services.industry.activated_carbon.codes import plant_now
+    from app.services.industry.activated_carbon.kiln_readings import (
+        READING_KEYS,
+        approved_slot_keys,
+        required_readings,
+        resolve_slot,
+        saved_slot_keys,
+        slot_key,
+    )
+
+    kiln_code = (payload.kiln_resource_code or "").strip()
+    if not kiln_code:
+        raise ValidationError("Select a kiln.")
+    kiln = _kiln_by_code(db, tenant, kiln_code)
+    raw_values = _kiln_reading_values(payload)
+    uses_interval = any(key in raw_values for key in READING_KEYS)
+    if uses_interval:
+        try:
+            readings = required_readings(raw_values)
+        except ValueError as exc:
+            raise ValidationError(str(exc)) from exc
+    else:
+        readings = {key: value for key, value in raw_values.items() if value is not None}
+        if not readings:
+            raise ValidationError("Enter at least one kiln reading.")
+    now = plant_now(tenant.timezone)
+    history = _reading_history(kiln)
+    approvals = _reading_approvals(kiln)
+    late = False
+    if uses_interval:
+        try:
+            slot = resolve_slot(
+                now,
+                saved_slot_keys(history),
+                approved_slot_keys(approvals),
+                payload.slot_start,
+            )
+        except ValueError as exc:
+            raise ValidationError(str(exc)) from exc
+        late = slot_key(slot) != slot_key(floor_slot_local(now))
+    else:
+        slot = now
+    recorded_at = datetime.now(timezone.utc)
+    recorded_by = None
+    if user is not None:
+        recorded_by = getattr(user, "username", None) or getattr(user, "email", None)
     entry = {
         "reading_id": str(uuid4()),
         "recorded_at": recorded_at.isoformat(),
+        "slot_start": slot.astimezone(timezone.utc).isoformat(),
         "kiln_resource_code": kiln.resource_code,
         "readings": readings,
+        "late": late,
+        "recorded_by": recorded_by,
     }
+    if late:
+        key = slot_key(slot)
+        for row in approvals:
+            raw = row.get("slot_start")
+            if not raw:
+                continue
+            try:
+                parsed = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+            except ValueError:
+                continue
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            if slot_key(parsed) == key:
+                row["used"] = True
     meta = dict(kiln.metadata_ if isinstance(kiln.metadata_, dict) else {})
-    history = [row for row in (meta.get(_KILN_READING_META) or []) if isinstance(row, dict)]
     history.insert(0, entry)
     meta[_KILN_READING_META] = history[:200]
+    if late:
+        meta[_KILN_READING_APPROVALS] = approvals
     kiln.metadata_ = meta
     flag_modified(kiln, "metadata_")
+    _stage_kiln_reading_triples(
+        db,
+        tenant,
+        kiln_code=kiln.resource_code,
+        reading_id=entry["reading_id"],
+        readings=readings,
+    )
     db.commit()
     return AcKilnParameterReadingOut(
         reading_id=entry["reading_id"],
         kiln_resource_code=kiln.resource_code,
         recorded_at=recorded_at,
         readings=readings,
+        slot_start=slot,
+        late=late,
     )
+
+
+def floor_slot_local(moment: datetime) -> datetime:
+    from app.services.industry.activated_carbon.kiln_readings import floor_slot
+
+    return floor_slot(moment)
 
 
 def _stage_screening_triples(

@@ -13,7 +13,9 @@ from typing import List
 
 from dotenv import load_dotenv
 
-load_dotenv(override=True)
+from app.core.dotenv_lock import load_dotenv_locked
+
+load_dotenv_locked()
 # Optional isolated demo env (see scripts/run_video_demo.ps1)
 if os.getenv("NYRA_USE_DEMO_ENV", "").lower() in ("1", "true", "yes"):
     load_dotenv(".env.demo", override=True)

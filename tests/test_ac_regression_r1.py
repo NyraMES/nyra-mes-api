@@ -91,7 +91,7 @@ def test_dispatch_cannot_exceed_the_selected_bag():
 
 
 def test_release_requires_rms_outward_complete():
-    with pytest.raises(ValidationError, match="RMS outward"):
+    with pytest.raises(ValidationError, match="GRN"):
         assert_rms_outward_before_release({}, "ORD-AC-6")
     assert_rms_outward_before_release({"grade_separation": {"status": "COMPLETED"}}, "ORD-AC-6") is None
 

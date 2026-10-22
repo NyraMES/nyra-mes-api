@@ -299,6 +299,42 @@ def _dev_user() -> UserContext:
     )
 
 
+def _with_directory_roles(user: UserContext) -> UserContext:
+    """Add the roles saved on the plant user so every selected role is in effect."""
+    if not settings.auth_enabled or not settings.mes_core_enabled:
+        return user
+    try:
+        from app.db.mes_core_database import open_mes_core_session
+        from app.services.industry.activated_carbon.users import directory_login_state
+    except Exception:
+        return user
+    db = open_mes_core_session()
+    if db is None:
+        return user
+    try:
+        directory, active = directory_login_state(db, user)
+    except Exception:
+        return user
+    finally:
+        db.close()
+    if active is False:
+        raise UnauthorizedError("This account is inactive. Ask a plant manager to activate it.")
+    if not directory:
+        return user
+    if user.is_nyra_services() or user.is_super_admin():
+        groups = list(dict.fromkeys([*user.groups, *directory]))
+    else:
+        kept = [group for group in user.groups if group not in ALL_MES_ROLES]
+        groups = list(dict.fromkeys([*kept, *directory]))
+    return UserContext(
+        sub=user.sub,
+        username=user.username,
+        email=user.email,
+        tenant_code=user.tenant_code,
+        groups=groups,
+    )
+
+
 def get_current_user(
     credentials: Optional[HTTPAuthorizationCredentials] = Depends(_bearer),
 ) -> UserContext:
@@ -308,7 +344,7 @@ def get_current_user(
     if not credentials or credentials.scheme.lower() != "bearer":
         raise UnauthorizedError("Missing bearer token")
 
-    return decode_cognito_token(credentials.credentials)
+    return _with_directory_roles(decode_cognito_token(credentials.credentials))
 
 
 def require_router_access(domain: str):

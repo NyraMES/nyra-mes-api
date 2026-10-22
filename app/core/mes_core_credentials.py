@@ -18,9 +18,9 @@ from dataclasses import dataclass
 from functools import lru_cache
 from typing import Any, Mapping, Optional
 
-from dotenv import load_dotenv
+from app.core.dotenv_lock import load_dotenv_locked
 
-load_dotenv(override=True)
+load_dotenv_locked()
 
 
 @dataclass(frozen=True)

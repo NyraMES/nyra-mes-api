@@ -157,6 +157,41 @@ def assert_actor_may_assign_role(actor: UserContext, role_code: str) -> str:
     return code
 
 
+def normalize_assigned_roles(
+    actor: UserContext,
+    role_code: str | None = None,
+    role_codes: list[str] | None = None,
+) -> list[str]:
+    """Roles selected on the Users screen. One person may hold more than one."""
+    raw: list[str] = []
+    for code in role_codes or []:
+        text = str(code or "").strip()
+        if text and text not in raw:
+            raw.append(text)
+    primary = str(role_code or "").strip()
+    if primary and primary not in raw:
+        raw.insert(0, primary)
+    if not raw:
+        raise ValidationError("Select at least one role.")
+    return [assert_actor_may_assign_role(actor, code) for code in raw]
+
+
+def role_codes_on_user(user: AppUser, access: UserTenantAccess | None = None) -> list[str]:
+    meta = user.metadata_ if isinstance(user.metadata_, dict) else {}
+    codes = [
+        str(code).strip()
+        for code in (meta.get("role_codes") or [])
+        if str(code).strip() in ALL_MES_ROLES
+    ]
+    if not codes and access is not None and access.role_code in ALL_MES_ROLES:
+        codes = [access.role_code]
+    seen: list[str] = []
+    for code in codes:
+        if code not in seen:
+            seen.append(code)
+    return seen
+
+
 def list_tenant_users(db: Session, tenant: TenantContext) -> list[dict[str, Any]]:
     rows = (
         db.query(AppUser, UserTenantAccess)
@@ -236,10 +271,12 @@ def create_tenant_user(
     username: str,
     email: str,
     display_name: Optional[str] = None,
-    role_code: str,
+    role_code: str | None = None,
+    role_codes: list[str] | None = None,
     password: str,
 ) -> dict[str, Any]:
-    role = assert_actor_may_assign_role(actor, role_code)
+    roles = normalize_assigned_roles(actor, role_code, role_codes)
+    role = roles[0]
     chosen_password = validate_plant_password(password)
     login_username = normalize_login_username(username, tenant.tenant_code)
     if login_username.split("@", 1)[0] == "nyraservices":
@@ -286,6 +323,7 @@ def create_tenant_user(
         is_default=True,
     )
     db.add(access)
+    _set_role_codes(user, access, roles)
     _ensure_workspace_access(db, tenant, user.user_id, role)
     db.commit()
     db.refresh(user)
@@ -295,6 +333,7 @@ def create_tenant_user(
         username=login_username,
         email=normalized_email,
         role_code=role,
+        role_codes=roles,
         tenant_code=tenant.tenant_code,
         password=chosen_password,
     )
@@ -390,6 +429,98 @@ def update_tenant_user_nickname(
     return _user_out(user, access)
 
 
+def update_tenant_user(
+    db: Session,
+    tenant: TenantContext,
+    actor: UserContext,
+    user_id: UUID,
+    *,
+    display_name: str,
+    email: str,
+    role_code: str | None = None,
+    role_codes: list[str] | None = None,
+    is_active: bool = True,
+) -> dict[str, Any]:
+    roles = normalize_assigned_roles(actor, role_code, role_codes)
+    access = (
+        db.query(UserTenantAccess)
+        .filter(
+            UserTenantAccess.user_id == user_id,
+            UserTenantAccess.tenant_id == tenant.tenant_id,
+        )
+        .first()
+    )
+    if access is None:
+        raise ValidationError("That user is not on this plant.")
+    user = db.query(AppUser).filter(AppUser.user_id == user_id).first()
+    if user is None or _is_nyra_services_login(user):
+        raise ValidationError("That user is not on this plant.")
+    normalized_email = _normalize_email(email)
+    taken = (
+        db.query(AppUser)
+        .filter(func.lower(AppUser.email) == normalized_email, AppUser.user_id != user.user_id)
+        .first()
+    )
+    if taken is not None:
+        raise ConflictError(f"Email {normalized_email} is already used.")
+    user.display_name = _assert_nickname_available(
+        db, tenant, display_name, except_user_id=user.user_id
+    )
+    user.email = normalized_email
+    user.is_active = bool(is_active)
+    _set_role_codes(user, access, roles)
+    _set_workspace_role(db, tenant, user.user_id, roles[0])
+    db.commit()
+    db.refresh(user)
+    db.refresh(access)
+    meta = user.metadata_ if isinstance(user.metadata_, dict) else {}
+    login_username = str(meta.get("login_username") or "").strip()
+    cognito = _sync_cognito_roles(
+        username=login_username,
+        email=normalized_email,
+        role_codes=roles,
+        tenant_code=tenant.tenant_code,
+        enabled=bool(is_active),
+    )
+    out = _user_out(user, access)
+    out["cognito_message"] = cognito.get("message")
+    return out
+
+
+def directory_login_state(db: Session, user: UserContext) -> tuple[list[str], bool | None]:
+    """Roles and active flag for this sign-in. Active is None when they are not on the plant."""
+    row = None
+    sub = (user.sub or "").strip()
+    if sub and sub != "dev-user":
+        row = db.query(AppUser).filter(AppUser.cognito_sub == sub).first()
+    email = (user.email or "").strip().lower()
+    if row is None and email:
+        row = db.query(AppUser).filter(func.lower(AppUser.email) == email).first()
+    username = (user.username or "").strip().lower()
+    if row is None and username:
+        for candidate in db.query(AppUser).all():
+            meta = candidate.metadata_ if isinstance(candidate.metadata_, dict) else {}
+            login = str(meta.get("login_username") or "").strip().lower()
+            mail = (candidate.email or "").strip().lower()
+            if username in {login, mail}:
+                row = candidate
+                break
+    if row is None:
+        return [], None
+    access = (
+        db.query(UserTenantAccess)
+        .filter(UserTenantAccess.user_id == row.user_id)
+        .first()
+    )
+    return role_codes_on_user(row, access), bool(row.is_active)
+
+
+def role_codes_for_session(db: Session, user: UserContext) -> list[str]:
+    """Plant roles saved for this sign-in, so every selected role opens its screens."""
+    codes, _active = directory_login_state(db, user)
+    return codes
+
+
 def list_plant_nicknames(db: Session, tenant: TenantContext) -> list[dict[str, str]]:
     rows = (
         db.query(AppUser)
@@ -450,13 +581,17 @@ def _is_nyra_services_login(user: AppUser) -> bool:
 
 def _user_out(user: AppUser, access: UserTenantAccess) -> dict[str, Any]:
     meta = user.metadata_ if isinstance(user.metadata_, dict) else {}
+    codes = role_codes_on_user(user, access)
+    primary = codes[0] if codes else access.role_code
     return {
         "user_id": user.user_id,
         "username": meta.get("login_username") or "",
         "email": user.email,
         "display_name": user.display_name,
-        "role_code": access.role_code,
-        "role_label": ROLE_LABELS.get(access.role_code, access.role_code),
+        "role_code": primary,
+        "role_label": ROLE_LABELS.get(primary, primary),
+        "role_codes": codes,
+        "role_labels": [ROLE_LABELS.get(code, code) for code in codes],
         "is_active": bool(user.is_active),
         "cognito_linked": bool(user.cognito_sub) or bool(meta.get("is_nyra_test")),
         "created_at": user.created_at,
@@ -475,6 +610,31 @@ def _normalize_email(email: str) -> str:
     if not local:
         raise ValidationError("Enter a valid email address.")
     return value
+
+
+def _set_role_codes(user: AppUser, access: UserTenantAccess, role_codes: list[str]) -> None:
+    meta = dict(user.metadata_ or {})
+    meta["role_codes"] = list(role_codes)
+    user.metadata_ = meta
+    flag_modified(user, "metadata_")
+    access.role_code = role_codes[0]
+
+
+def _set_workspace_role(db: Session, tenant: TenantContext, user_id: UUID, role_code: str) -> None:
+    if not tenant.workspace_id:
+        return
+    existing = (
+        db.query(UserProjectAccess)
+        .filter(
+            UserProjectAccess.user_id == user_id,
+            UserProjectAccess.workspace_id == tenant.workspace_id,
+        )
+        .first()
+    )
+    if existing is None:
+        _ensure_workspace_access(db, tenant, user_id, role_code)
+        return
+    existing.role_code = role_code
 
 
 def _set_login_username(user: AppUser, login_username: str, *, nyra_test: bool = False) -> None:
@@ -530,6 +690,72 @@ def _ensure_workspace_access(
     )
 
 
+def _sync_cognito_roles(
+    *,
+    username: str,
+    email: str,
+    role_codes: list[str],
+    tenant_code: str,
+    enabled: bool = True,
+) -> dict[str, Any]:
+    pool_id = (settings.cognito_user_pool_id or "").strip()
+    region = (settings.cognito_region or "").strip()
+    if not settings.auth_enabled or not pool_id or not region or not username:
+        return {"synced": False, "message": ""}
+    try:
+        import boto3
+        from botocore.exceptions import ClientError
+    except ImportError:
+        return {"synced": False, "message": ""}
+    client = boto3.client("cognito-idp", region_name=region)
+    try:
+        client.admin_update_user_attributes(
+            UserPoolId=pool_id,
+            Username=username,
+            UserAttributes=[
+                {"Name": "email", "Value": email},
+                {"Name": "email_verified", "Value": "true"},
+                {"Name": "custom:tenant_code", "Value": tenant_code},
+            ],
+        )
+        _assign_cognito_groups(client, pool_id, username, role_codes)
+        if enabled:
+            client.admin_enable_user(UserPoolId=pool_id, Username=username)
+        else:
+            client.admin_disable_user(UserPoolId=pool_id, Username=username)
+    except ClientError as exc:
+        return {
+            "synced": False,
+            "message": f"User saved. Sign-in roles could not be updated: {exc}",
+        }
+    return {"synced": True, "message": "User saved. Their screens follow the selected roles."}
+
+
+def _assign_cognito_groups(client: Any, pool_id: str, username: str, role_codes: list[str]) -> None:
+    from botocore.exceptions import ClientError
+
+    wanted = [code for code in role_codes if code]
+    for code in wanted:
+        _ensure_cognito_group(client, pool_id, code)
+        client.admin_add_user_to_group(
+            UserPoolId=pool_id,
+            Username=username,
+            GroupName=code,
+        )
+    listed = client.admin_list_groups_for_user(UserPoolId=pool_id, Username=username)
+    for group in listed.get("Groups") or []:
+        name = str(group.get("GroupName") or "")
+        if name in ALL_MES_ROLES and name not in wanted:
+            try:
+                client.admin_remove_user_from_group(
+                    UserPoolId=pool_id,
+                    Username=username,
+                    GroupName=name,
+                )
+            except ClientError:
+                continue
+
+
 def _provision_cognito_login(
     *,
     username: str,
@@ -537,6 +763,7 @@ def _provision_cognito_login(
     role_code: str,
     tenant_code: str,
     password: str,
+    role_codes: list[str] | None = None,
 ) -> dict[str, Any]:
     pool_id = (settings.cognito_user_pool_id or "").strip()
     region = (settings.cognito_region or "").strip()
@@ -651,13 +878,9 @@ def _provision_cognito_login(
                 f"They sign in as {username} and set a new password."
             )
 
+    groups = [code for code in (role_codes or [role_code]) if code]
     try:
-        _ensure_cognito_group(client, pool_id, role_code)
-        client.admin_add_user_to_group(
-            UserPoolId=pool_id,
-            Username=username,
-            GroupName=role_code,
-        )
+        _assign_cognito_groups(client, pool_id, username, groups)
     except ClientError as exc:
         return {
             "provisioned": created,

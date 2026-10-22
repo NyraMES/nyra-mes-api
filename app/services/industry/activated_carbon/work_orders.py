@@ -273,14 +273,13 @@ def kiln_output_target_work_order(kiln_meta: dict | None, quantity_kg: Any) -> s
     return kiln_current_work_order_code(kiln_meta)
 
 
-def _work_order_grade_ctc(row: dict | None) -> tuple[str, str] | None:
+def _work_order_ctc_key(row: dict | None) -> str | None:
     if not isinstance(row, dict):
         return None
-    grade = ac_inbound_admin._canonical_outward_grade(row.get("grade") or "")
     ctc = ac_process_rules.round_ctc(row.get("ctc"))
-    if not grade or ctc is None:
+    if ctc is None:
         return None
-    return grade, str(ctc)
+    return str(ctc)
 
 
 def assert_kiln_accepts_work_order(
@@ -290,7 +289,7 @@ def assert_kiln_accepts_work_order(
     incoming: dict | None = None,
     lookup=None,
 ) -> None:
-    """Allow another WO on the same kiln only when grade and CTC match the open ones."""
+    """Allow another WO on the same kiln when CTC matches. Grade is not checked."""
     wanted = (work_order_code or "").strip()
     open_codes = kiln_open_work_order_codes(kiln_meta)
     if not open_codes or wanted in open_codes:
@@ -298,7 +297,7 @@ def assert_kiln_accepts_work_order(
     incoming_row = incoming
     if incoming_row is None and callable(lookup):
         incoming_row = lookup(wanted)
-    incoming_key = _work_order_grade_ctc(incoming_row)
+    incoming_ctc = _work_order_ctc_key(incoming_row)
 
     def _open_row(code: str) -> dict | None:
         if callable(lookup):
@@ -310,14 +309,13 @@ def assert_kiln_accepts_work_order(
 
     for code in open_codes:
         open_row = _open_row(code)
-        open_key = _work_order_grade_ctc(open_row)
-        if incoming_key and open_key and incoming_key == open_key:
+        open_ctc = _work_order_ctc_key(open_row)
+        if incoming_ctc and open_ctc and incoming_ctc == open_ctc:
             continue
-        grade = (open_row or {}).get("grade") or "—"
         ctc = (open_row or {}).get("ctc") or "—"
         raise ValidationError(
-            f"Kiln is running work order {code} ({grade} · CTC {ctc}). "
-            f"Load {wanted} only when it has the same grade and CTC."
+            f"Kiln is running work order {code} (CTC {ctc}). "
+            f"Load {wanted} only when it has the same CTC."
         )
 
 
@@ -480,12 +478,7 @@ def record_work_order_load(
     if found is None:
         raise ValidationError(f"Work order '{wanted}' was not found.")
     qty = Decimal(str(found.get("quantity_kg") or 0))
-    loaded = Decimal(str(found.get("loaded_kg") or 0))
-    if loaded + feed_kg > qty + Decimal("0.001"):
-        raise ValidationError(
-            f"Load would exceed work order {wanted} quantity ({qty} KG)."
-        )
-    loaded = loaded + feed_kg
+    loaded = Decimal(str(found.get("loaded_kg") or 0)) + feed_kg
     loads = list(found.get("loads") or [])
     loads.append(
         {

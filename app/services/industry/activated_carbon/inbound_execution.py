@@ -537,7 +537,7 @@ def _apply_step_domain_rules(
                 }
             )
         if not cleaned:
-            raise ValidationError("Enter at least one RMS outward bag.")
+            raise ValidationError("Enter at least one GRN bag.")
         ac_inbound_admin.validate_rm_outward_splits(cleaned)
         _, received_kg = ac_inbound_workflow._require_inward_order(
             db, tenant, order.customer_order_id

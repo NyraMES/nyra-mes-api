@@ -796,7 +796,7 @@ def create_inward_bag(
     grade = (payload.grade or "").strip() or None
     if _bag_reconciliation(meta).get("status") == "RECONCILED" and not grade:
         raise ValidationError(
-            f"Order '{order.order_code}' RMS bags are reconciled — add RM outward bags with a split grade."
+            f"Order '{order.order_code}' RMS bags are reconciled — add GRN bags with a split grade."
         )
     if grade and not ac_inbound_admin.is_allowed_outward_grade(db, tenant, grade) and grade not in BAG_GRADES:
         raise ValidationError(
@@ -1304,7 +1304,7 @@ def _find_outward_bag(
         for bag in _outward_bags(meta):
             if str(bag.get("bag_code") or "") == code:
                 return order, meta, bag
-    raise ValidationError(f"RM outward bag '{code}' was not found.")
+    raise ValidationError(f"GRN bag '{code}' was not found.")
 
 
 def save_kiln_feed_bag_qc(

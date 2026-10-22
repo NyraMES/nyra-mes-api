@@ -534,7 +534,8 @@ def build() -> Path:
     story.append(_p("Kiln parameters", styles["h2"]))
     story.append(
         _p(
-            "On Activation, Kiln Parameters is where the shift records the hourly readings. "
+            "On Activation, Kiln Parameters is where the engineer records T1, T2, T3, Main Damper (MD %), Boiler Damper (BD %), Induced Draft (ID %), and Boiler Pressure every 30 minutes. A missed interval stays locked until a plant manager approves it. "
+            "A missed interval is locked until a plant manager approves it, and then the values can be entered. "
             "The standing settings (residence time, temperatures, steam, oxygen, pressure) are kept under Admin → Kiln parameters. "
             "Those settings stay until someone changes them. They are not entered again every day. "
             "Each save is kept in the change log, with who saved it and when. "

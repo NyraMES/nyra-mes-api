@@ -1604,6 +1604,7 @@ class AcKilnParametersCreate(BaseModel):
     kiln_resource_code: Optional[str] = Field(None, max_length=64)
     production_lot_id: Optional[UUID] = None
     recorded_at: Optional[datetime] = None
+    slot_start: Optional[datetime] = None
     zone1_temp_c: Optional[float] = None
     zone2_temp_c: Optional[float] = None
     steam_flow_kg_h: Optional[float] = None
@@ -1611,6 +1612,13 @@ class AcKilnParametersCreate(BaseModel):
     o2_pct: Optional[float] = None
     kiln_temp_c: Optional[float] = None
     pressure_bar: Optional[float] = None
+    t1: Optional[float] = None
+    t2: Optional[float] = None
+    t3: Optional[float] = None
+    main_damper: Optional[float] = None
+    boiler_damper: Optional[float] = None
+    induced_draft: Optional[float] = None
+    boiler_pressure: Optional[float] = None
 
 
 class AcKilnParameterReadingOut(BaseModel):
@@ -1618,6 +1626,31 @@ class AcKilnParameterReadingOut(BaseModel):
     kiln_resource_code: str
     recorded_at: datetime
     readings: dict[str, Any] = Field(default_factory=dict)
+    slot_start: Optional[datetime] = None
+    late: bool = False
+
+
+class AcKilnReadingSlotOut(BaseModel):
+    slot_start: datetime
+    slot_end: datetime
+    label: str
+    status: str
+
+
+class AcKilnReadingBoardOut(BaseModel):
+    kiln_resource_code: str
+    interval_minutes: int = 30
+    current_slot_start: datetime
+    current_slot_end: datetime
+    current_label: str
+    fields: list[AcKilnParameterDefinition] = Field(default_factory=list)
+    locked_slots: list[AcKilnReadingSlotOut] = Field(default_factory=list)
+    readings: list[AcKilnParameterReadingOut] = Field(default_factory=list)
+
+
+class AcKilnReadingApproval(BaseModel):
+    kiln_resource_code: str = Field(..., min_length=1, max_length=64)
+    slot_start: datetime
 
 
 class AcScreeningCreate(BaseModel):
@@ -2140,17 +2173,29 @@ class AcTenantUserOut(BaseModel):
     display_name: Optional[str] = None
     role_code: str
     role_label: str
+    role_codes: list[str] = Field(default_factory=list)
+    role_labels: list[str] = Field(default_factory=list)
     is_active: bool = True
     cognito_linked: bool = False
     created_at: Optional[datetime] = None
+    cognito_message: Optional[str] = None
 
 
 class AcTenantUserCreate(BaseModel):
     username: str = Field(..., min_length=1, max_length=128)
     email: str = Field(..., min_length=3, max_length=320)
     display_name: str = Field(..., min_length=1, max_length=64)
-    role_code: str = Field(..., min_length=3, max_length=64)
+    role_code: Optional[str] = Field(None, min_length=3, max_length=64)
+    role_codes: list[str] = Field(default_factory=list)
     password: str = Field(..., min_length=8, max_length=128)
+
+
+class AcTenantUserUpdate(BaseModel):
+    email: str = Field(..., min_length=3, max_length=320)
+    display_name: str = Field(..., min_length=1, max_length=64)
+    role_code: Optional[str] = Field(None, min_length=3, max_length=64)
+    role_codes: list[str] = Field(default_factory=list)
+    is_active: bool = True
 
 
 class AcTenantUserNicknameSave(BaseModel):

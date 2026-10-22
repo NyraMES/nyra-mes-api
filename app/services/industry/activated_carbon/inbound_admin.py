@@ -158,7 +158,7 @@ def validate_outward_kg_within_inward(outward_kg, inward_kg) -> None:
     inn = Decimal(str(inward_kg or 0))
     if out > inn + Decimal("0.001"):
         raise ValidationError(
-            f"RMS outward total {out} KG cannot exceed inward weight {inn} KG."
+            f"GRN total {out} KG cannot exceed inward weight {inn} KG."
         )
 
 
@@ -166,7 +166,7 @@ def validate_rm_outward_splits(cleaned: list[dict]) -> None:
     """At least one outward bag. A grade, Unburnt, or Stones each counts."""
     rows = [row for row in (cleaned or []) if str(row.get("grade_label") or "").strip()]
     if not rows:
-        raise ValidationError("Enter at least one RMS outward bag.")
+        raise ValidationError("Enter at least one GRN bag.")
     if any(not str(row.get("rotary") or "").strip() for row in rows):
         raise ValidationError("Select Rotary A or Rotary B for every outward bag.")
 

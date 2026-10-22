@@ -1,0 +1,72 @@
+# GR Carbons plant host. DNS already points *.nyraservices-testbed.net at this server.
+# Append to /home/ubuntu/testbed/nginx/testbed_06Apr2026.conf
+# Certificate: certbot certonly --webroot -w /var/www/certbot -d gr.nyraservices-testbed.net
+
+server {
+    listen 80;
+    server_name gr.nyraservices-testbed.net;
+
+    location ^~ /.well-known/acme-challenge/ {
+        root /var/www/certbot;
+    }
+
+    location / {
+        return 301 https://$host$request_uri;
+    }
+}
+
+server {
+    listen 443 ssl;
+    server_name gr.nyraservices-testbed.net;
+
+    ssl_certificate     /etc/letsencrypt/live/gr.nyraservices-testbed.net/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/gr.nyraservices-testbed.net/privkey.pem;
+
+    location = / { return 301 /mes/; }
+    location = /mes { return 301 /mes/; }
+
+    location /mes/api/ {
+        rewrite ^/mes/api/auth/(.*)$ /auth/$1 break;
+        rewrite ^/mes/api/health$ /health break;
+        rewrite ^/mes/api/docs$ /docs break;
+        rewrite ^/mes/api/redoc$ /redoc break;
+        rewrite ^/mes/api/openapi\.json$ /openapi.json break;
+        rewrite ^/mes/api/$ / break;
+        rewrite ^/mes/api/(.*)$ /api/$1 break;
+        proxy_pass http://172.17.0.1:8010;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+
+    location /mes/modbus/api/ {
+        proxy_pass http://172.17.0.1:8020/;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+
+    location ^~ /mes/assets/ {
+        root /usr/share/nginx/html;
+        try_files $uri =404;
+        expires 365d;
+        add_header Cache-Control "public, immutable";
+    }
+
+    location = /mes/index.html {
+        root /usr/share/nginx/html;
+        add_header Cache-Control "no-cache, no-store, must-revalidate";
+        add_header Pragma "no-cache";
+        add_header Expires "0";
+    }
+
+    location ^~ /mes/ {
+        root /usr/share/nginx/html;
+        index index.html;
+        try_files $uri $uri/ /mes/index.html;
+    }
+}
